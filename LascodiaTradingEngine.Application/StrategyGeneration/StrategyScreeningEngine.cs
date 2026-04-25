@@ -121,7 +121,8 @@ public class StrategyScreeningEngine
             string reason,
             BacktestResult? train = null,
             BacktestResult? oos = null)
-            => ScreeningOutcome.Failed(
+        {
+            var failed = ScreeningOutcome.Failed(
                 tempStrategy,
                 train,
                 oos,
@@ -131,6 +132,32 @@ public class StrategyScreeningEngine
                 failure,
                 outcome,
                 reason);
+            double qualityScore = ScreeningQualityScorer.ComputeScore(train, oos);
+            bool isNearMiss = ScreeningQualityScorer.IsNearMiss(failed);
+
+            return failed with
+            {
+                Metrics = failed.Metrics with
+                {
+                    IsWinRate = train is null ? 0 : (double)train.WinRate,
+                    IsProfitFactor = train is null ? 0 : (double)train.ProfitFactor,
+                    IsSharpeRatio = train is null ? 0 : (double)train.SharpeRatio,
+                    IsMaxDrawdownPct = train is null ? 0 : (double)train.MaxDrawdownPct,
+                    IsTotalTrades = train?.TotalTrades ?? 0,
+                    OosWinRate = oos is null ? 0 : (double)oos.WinRate,
+                    OosProfitFactor = oos is null ? 0 : (double)oos.ProfitFactor,
+                    OosSharpeRatio = oos is null ? 0 : (double)oos.SharpeRatio,
+                    OosMaxDrawdownPct = oos is null ? 0 : (double)oos.MaxDrawdownPct,
+                    OosTotalTrades = oos?.TotalTrades ?? 0,
+                    QualityScore = qualityScore,
+                    QualityScoreRaw = qualityScore,
+                    QualityCalibrationMultiplier = 1.0,
+                    QualityBand = ScreeningQualityScorer.ComputeBand(qualityScore),
+                    IsNearMiss = isNearMiss,
+                    GateTrace = gateTrace.ToList(),
+                },
+            };
+        }
 
         // ── In-sample backtest ──
         BacktestResult trainResult;
@@ -368,10 +395,12 @@ public class StrategyScreeningEngine
         // ── Walk-forward mini-validation (#10: anchored-forward windows) ──
         int walkForwardPassed = 0;
         int walkForwardMask = 0;
+        int? walkForwardRequiredForScore = null;
         if (allCandles.Count >= 200)
         {
             (walkForwardPassed, walkForwardMask) = await RunWalkForwardMiniValidationAsync(
                 tempStrategy, allCandles, screeningOptions, config, thresholds, ct);
+            walkForwardRequiredForScore = config.WalkForwardWindowCount;
 
             if (walkForwardPassed < config.WalkForwardMinWindowsPass)
             {
@@ -474,21 +503,21 @@ public class StrategyScreeningEngine
             enrichedParams,
             allCandles,
             utcNow);
-        double pValue = 0;
+        double? pValue = null;
         if (config.MonteCarloEnabled && combinedTrades.Count >= 10)
         {
             pValue = RunMonteCarloPermutationTest(
                 combinedTrades, config.ScreeningInitialBalance,
                 config.MonteCarloPermutations, monteCarloSeed);
 
-            if (pValue > config.MonteCarloMinPValue)
+            if (pValue.Value > config.MonteCarloMinPValue)
             {
                 gateTrace.Add(new("MonteCarloSignFlip", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("monte_carlo_signflip");
                 return BuildFailedOutcome(
                     ScreeningFailureReason.MonteCarloSignFlip,
                     "MonteCarloRejected",
-                    $"{strategyType} on {symbol}/{timeframe} p={pValue:F3} > {config.MonteCarloMinPValue:F2}",
+                    $"{strategyType} on {symbol}/{timeframe} p={pValue.Value:F3} > {config.MonteCarloMinPValue:F2}",
                     trainResult,
                     oosResult);
             }
@@ -500,21 +529,21 @@ public class StrategyScreeningEngine
         // ── Monte Carlo shuffle test (#2: complementary null hypothesis) ──
         // Permutes trade ordering to test whether Sharpe depends on sequence.
         // A strategy that passes sign-flip but fails shuffle has serial autocorrelation.
-        double shufflePValue = 0;
+        double? shufflePValue = null;
         if (config.MonteCarloShuffleEnabled && combinedTrades.Count >= 10)
         {
             shufflePValue = RunMonteCarloShuffleTest(
                 combinedTrades, config.ScreeningInitialBalance,
                 config.EffectiveShufflePermutations, monteCarloSeed + 1);
 
-            if (shufflePValue > config.EffectiveShuffleMinPValue)
+            if (shufflePValue.Value > config.EffectiveShuffleMinPValue)
             {
                 gateTrace.Add(new("MonteCarloShuffle", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("monte_carlo_shuffle");
                 return BuildFailedOutcome(
                     ScreeningFailureReason.MonteCarloShuffle,
                     "MonteCarloShuffleRejected",
-                    $"{strategyType} on {symbol}/{timeframe} shuffle p={shufflePValue:F3} > {config.EffectiveShuffleMinPValue:F2}",
+                    $"{strategyType} on {symbol}/{timeframe} shuffle p={shufflePValue.Value:F3} > {config.EffectiveShuffleMinPValue:F2}",
                     trainResult,
                     oosResult);
             }
@@ -706,6 +735,7 @@ public class StrategyScreeningEngine
             pValue,
             shufflePValue,
             walkForwardPassed,
+            walkForwardRequiredForScore,
             walkForwardMask,
             maxConcentration,
             targetRegime,
@@ -1049,6 +1079,106 @@ public class StrategyScreeningEngine
 
         double finalDD = ComputeCombinedDrawdown(working, initialBalance);
         return (working, finalDD, removedCount);
+    }
+
+    /// <summary>
+    /// Greedily keeps the highest-quality pending candidates while enforcing symbol capacity and
+    /// base/quote currency exposure caps against the existing active portfolio.
+    /// </summary>
+    internal static (List<ScreeningOutcome> Survivors, int RemovedCount) RunPortfolioExposureFilter(
+        List<ScreeningOutcome> candidates,
+        IReadOnlyDictionary<string, CurrencyPair> pairDataBySymbol,
+        IReadOnlyDictionary<string, int> activeCountBySymbol,
+        int maxActivePerSymbol,
+        double maxSymbolWeightPct,
+        double maxCurrencyExposurePct)
+    {
+        if (candidates.Count == 0)
+            return (candidates, 0);
+
+        int existingActiveCount = activeCountBySymbol.Values.Sum();
+        int capacityBase = Math.Max(1, existingActiveCount + candidates.Count);
+        int symbolWeightCap = maxSymbolWeightPct >= 1.0
+            ? int.MaxValue
+            : Math.Max(1, (int)Math.Floor(capacityBase * Math.Clamp(maxSymbolWeightPct, 0.01, 1.0)));
+        int currencyExposureCap = maxCurrencyExposurePct >= 1.0
+            ? int.MaxValue
+            : Math.Max(1, (int)Math.Floor(capacityBase * Math.Clamp(maxCurrencyExposurePct, 0.01, 1.0)));
+
+        var symbolCounts = activeCountBySymbol.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+        var currencyCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (symbol, count) in activeCountBySymbol)
+        {
+            var (baseCurrency, quoteCurrency) = ResolveCurrencyExposure(symbol, pairDataBySymbol);
+            AddCurrencyExposure(baseCurrency, count);
+            AddCurrencyExposure(quoteCurrency, count);
+        }
+
+        var survivors = new List<ScreeningOutcome>(candidates.Count);
+        foreach (var candidate in candidates
+                     .OrderByDescending(PortfolioExposureSelectionScore)
+                     .ThenBy(c => c.Strategy.Name, StringComparer.Ordinal))
+        {
+            string symbol = candidate.Strategy.Symbol;
+            int projectedSymbolCount = symbolCounts.GetValueOrDefault(symbol) + 1;
+            if (projectedSymbolCount > maxActivePerSymbol || projectedSymbolCount > symbolWeightCap)
+                continue;
+
+            var (baseCurrency, quoteCurrency) = ResolveCurrencyExposure(symbol, pairDataBySymbol);
+            if (WouldBreachCurrencyExposure(baseCurrency) || WouldBreachCurrencyExposure(quoteCurrency))
+                continue;
+
+            survivors.Add(candidate);
+            symbolCounts[symbol] = projectedSymbolCount;
+            AddCurrencyExposure(baseCurrency, 1);
+            AddCurrencyExposure(quoteCurrency, 1);
+        }
+
+        // Preserve the original candidate order for downstream persistence determinism.
+        var survivorSet = survivors.ToHashSet();
+        var orderedSurvivors = candidates.Where(survivorSet.Contains).ToList();
+        return (orderedSurvivors, candidates.Count - orderedSurvivors.Count);
+
+        bool WouldBreachCurrencyExposure(string currency)
+            => !string.IsNullOrWhiteSpace(currency)
+               && currencyCounts.GetValueOrDefault(currency) + 1 > currencyExposureCap;
+
+        void AddCurrencyExposure(string currency, int count)
+        {
+            if (string.IsNullOrWhiteSpace(currency) || count <= 0)
+                return;
+            currencyCounts[currency] = currencyCounts.GetValueOrDefault(currency) + count;
+        }
+    }
+
+    private static double PortfolioExposureSelectionScore(ScreeningOutcome candidate)
+    {
+        double qualityScore = candidate.Metrics?.QualityScore > 0 ? candidate.Metrics.QualityScore : 50.0;
+        double selectionScore = candidate.Metrics?.SelectionScore ?? 0.0;
+        double oosSharpe = (double)(candidate.OosResult?.SharpeRatio ?? 0m);
+        return qualityScore * 10.0 + selectionScore * 0.01 + oosSharpe;
+    }
+
+    private static (string BaseCurrency, string QuoteCurrency) ResolveCurrencyExposure(
+        string symbol,
+        IReadOnlyDictionary<string, CurrencyPair> pairDataBySymbol)
+    {
+        CurrencyPair? pair = null;
+        if (pairDataBySymbol.TryGetValue(symbol, out var direct))
+            pair = direct;
+        else
+        {
+            var match = pairDataBySymbol.FirstOrDefault(kv => string.Equals(kv.Key, symbol, StringComparison.OrdinalIgnoreCase));
+            pair = match.Value;
+        }
+
+        if (pair != null)
+            return (pair.BaseCurrency ?? string.Empty, pair.QuoteCurrency ?? string.Empty);
+
+        string normalized = symbol.ToUpperInvariant();
+        if (normalized.Length >= 6)
+            return (normalized[..3], normalized[3..6]);
+        return (normalized, string.Empty);
     }
 
     /// <summary>Computes average Pearson correlation between a candidate's equity curve and each other.</summary>

@@ -1,225 +1,668 @@
+using System.Data;
+using System.Diagnostics;
+using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Computes split conformal prediction calibration for each newly activated ML model,
-/// producing statistically guaranteed coverage sets at inference time (Rec #16).
+/// Computes live split-conformal calibration records for active ML models whose serving
+/// snapshots do not yet have a usable persisted calibration row.
 /// </summary>
 /// <remarks>
-/// Uses the hold-out calibration split (10 % of training data) that was already
-/// separated during training.  For each calibration sample, the nonconformity score is:
-///   α_i = 1 − ŷ_{y_i}  (1 minus the predicted probability of the true label)
-/// The coverage threshold τ at level 1-α is the ⌈(n+1)(1-α)/n⌉-th quantile.
-/// At inference: if (1 − ŷ_Buy) ≤ τ the prediction set includes Buy, similarly for Sell.
-/// When both are included → "Ambiguous".
+/// The worker runs on the authoritative write side so calibration existence, prediction
+/// logs, and snapshot writes are observed consistently. It calibrates from resolved logs
+/// produced after model activation, writes the same threshold to the global and per-class
+/// snapshot fields consumed by the scorer, and keeps the persisted calibration row aligned
+/// with that snapshot threshold.
 /// </remarks>
 public sealed class MLConformalCalibrationWorker : BackgroundService
 {
+    internal const string WorkerName = nameof(MLConformalCalibrationWorker);
+
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
+    private const string DistributedLockKey = "workers:ml-conformal-calibration:cycle";
+    private const double ProbabilityEpsilon = 1e-9;
+
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IMemoryCache _cache;
     private readonly ILogger<MLConformalCalibrationWorker> _logger;
-    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
+    private readonly MLConformalCalibrationOptions _options;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
 
-    /// <summary>
-    /// Initialises the worker with its required dependencies.
-    /// </summary>
-    /// <param name="scopeFactory">Creates scoped DI scopes per polling cycle.</param>
-    /// <param name="cache">Shared snapshot cache used by the live scorer.</param>
-    /// <param name="logger">Structured logger for conformal calibration events.</param>
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
+
+    internal readonly record struct MLConformalCalibrationWorkerSettings(
+        TimeSpan InitialDelay,
+        TimeSpan PollInterval,
+        int PollJitterSeconds,
+        int MaxLogs,
+        int MinLogs,
+        int MaxLogAgeDays,
+        int MaxCalibrationAgeDays,
+        double TargetCoverage,
+        int ModelBatchSize,
+        int MaxCycleModels,
+        int LockTimeoutSeconds,
+        bool RequirePostActivationLogs);
+
+    internal readonly record struct MLConformalCalibrationCycleResult(
+        MLConformalCalibrationWorkerSettings Settings,
+        string? SkippedReason,
+        int CandidateModelCount,
+        int EvaluatedModelCount,
+        int CalibrationsWritten,
+        int SkippedAlreadyCalibratedCount,
+        int SkippedInvalidSnapshotCount,
+        int SkippedInsufficientLogsCount,
+        int SkippedPersistenceRaceCount)
+    {
+        public static MLConformalCalibrationCycleResult Skipped(
+            MLConformalCalibrationWorkerSettings settings,
+            string reason)
+            => new(settings, reason, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    private readonly record struct ActiveModelCandidate(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        DateTime TrainedAt,
+        DateTime? ActivatedAt,
+        byte[]? ModelBytes);
+
+    private readonly record struct CalibrationObservation(
+        double Score,
+        double BuyProbability,
+        TradeDirection ActualDirection,
+        DateTime OutcomeRecordedAt);
+
+    private readonly record struct CalibrationComputation(
+        IReadOnlyList<double> SortedScores,
+        int SampleCount,
+        double Threshold,
+        double TargetCoverage,
+        double EmpiricalCoverage,
+        double AmbiguousRate);
+
     public MLConformalCalibrationWorker(
         IServiceScopeFactory scopeFactory,
         IMemoryCache cache,
-        ILogger<MLConformalCalibrationWorker> logger)
+        ILogger<MLConformalCalibrationWorker> logger,
+        MLConformalCalibrationOptions? options = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
         _scopeFactory = scopeFactory;
-        _cache        = cache;
-        _logger       = logger;
+        _cache = cache;
+        _logger = logger;
+        _options = options ?? new MLConformalCalibrationOptions();
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
-    /// <summary>
-    /// Main hosted-service loop. Polls every 30 minutes, checking for newly active models
-    /// that do not yet have a <see cref="MLConformalCalibration"/> record and computing
-    /// one for each. Models that already have a calibration record are skipped — recalibration
-    /// of existing records is handled by <see cref="MLConformalRecalibrationWorker"/>.
-    /// </summary>
-    /// <param name="stoppingToken">Signals graceful shutdown requested by the host.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLConformalCalibrationWorker started.");
-        while (!stoppingToken.IsCancellationRequested)
+        _logger.LogInformation("{Worker} started.", WorkerName);
+
+        var initialSettings = BuildSettings(_options);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Builds persisted conformal calibration records and aligns serving snapshots for active ML models.",
+            initialSettings.PollInterval);
+
+        try
         {
-            try { await RunAsync(stoppingToken); }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            { _logger.LogError(ex, "MLConformalCalibrationWorker error"); }
-            await Task.Delay(TimeSpan.FromMinutes(30), stoppingToken);
+            var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName) + initialSettings.InitialDelay;
+            if (initialDelay > TimeSpan.Zero)
+                await Task.Delay(initialDelay, _timeProvider, stoppingToken);
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var started = Stopwatch.GetTimestamp();
+
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                    var result = await RunCycleAsync(stoppingToken);
+
+                    long durationMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.CandidateModelCount);
+                    _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _consecutiveFailures = 0;
+                    }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _metrics?.WorkerErrors.Add(
+                        1,
+                        new KeyValuePair<string, object?>("worker", WorkerName));
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                var currentSettings = BuildSettings(_options);
+                await Task.Delay(
+                    CalculateDelay(GetIntervalWithJitter(currentSettings), _consecutiveFailures),
+                    _timeProvider,
+                    stoppingToken);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("{Worker} stopping.", WorkerName);
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
         }
     }
 
-    /// <summary>
-    /// Core calibration routine. For each active base model without a conformal record:
-    /// <list type="number">
-    ///   <item>Loads up to 500 recent resolved prediction logs as the calibration set.</item>
-    ///   <item>Computes a nonconformity score for each log:
-    ///         <c>α_i = 1 − P(true class)</c>, i.e. 1 minus the predicted probability that
-    ///         the model assigned to the label that actually occurred.</item>
-    ///   <item>Sorts scores ascending and takes the empirical quantile at level
-    ///         <c>⌈(n+1)(1−α)/n⌉</c> as the coverage threshold τ (at 90 % nominal coverage).</item>
-    ///   <item>Computes empirical coverage on the same calibration set (an upper bound on
-    ///         true coverage — the test-set coverage guarantee requires a held-out set).</item>
-    ///   <item>Computes the ambiguous-prediction rate: fraction of logs where both Buy and Sell
-    ///         pass the threshold simultaneously, meaning the model cannot confidently distinguish.</item>
-    ///   <item>Persists an <see cref="MLConformalCalibration"/> record with all diagnostics.</item>
-    /// </list>
-    ///
-    /// Meta-learner and MAML-initializer models are excluded as they do not produce
-    /// direct trade signals and their confidence scores are not interpretable in this framework.
-    /// </summary>
-    /// <param name="ct">Cooperative cancellation token.</param>
-    private async Task RunAsync(CancellationToken ct)
+    internal Task<MLConformalCalibrationCycleResult> RunAsync(CancellationToken ct)
+        => RunCycleAsync(ct);
+
+    internal async Task<MLConformalCalibrationCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        using var scope  = _scopeFactory.CreateScope();
-        var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var readDb   = readCtx.GetDbContext();
-        var writeDb  = writeCtx.GetDbContext();
+        var settings = BuildSettings(_options);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var writeDb = writeContext.GetDbContext();
 
-        // Find active base models that do not yet have a conformal calibration record.
-        // Meta-learners and MAML initializers are excluded (their scores are not direct probabilities).
-        var modelsToCalibrate = await readDb.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted && !m.IsMetaLearner && !m.IsMamlInitializer)
-            .ToListAsync(ct);
-
-        foreach (var model in modelsToCalibrate)
+        IAsyncDisposable? cycleLock = null;
+        if (_distributedLock is null)
         {
-            // Skip models that already have a calibration record — handled by MLConformalRecalibrationWorker.
-            bool alreadyCalibrated = await readDb.Set<MLConformalCalibration>()
-                .AnyAsync(c => c.MLModelId == model.Id && !c.IsDeleted, ct);
-            if (alreadyCalibrated) continue;
+            _metrics?.MLConformalCalibrationLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "unavailable"));
 
-            // Skip models without serialised model weights (not yet fully trained).
-            if (model.ModelBytes == null) continue;
+            if (!_missingDistributedLockWarningEmitted)
+            {
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate calibration cycles are possible in multi-instance deployments.",
+                    WorkerName);
+                _missingDistributedLockWarningEmitted = true;
+            }
+        }
+        else
+        {
+            cycleLock = await _distributedLock.TryAcquireAsync(
+                DistributedLockKey,
+                TimeSpan.FromSeconds(settings.LockTimeoutSeconds),
+                ct);
 
+            if (cycleLock is null)
+            {
+                _metrics?.MLConformalCalibrationLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "busy"));
+                _metrics?.MLConformalCalibrationCyclesSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "lock_busy"));
+                return MLConformalCalibrationCycleResult.Skipped(settings, "lock_busy");
+            }
+
+            _metrics?.MLConformalCalibrationLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "acquired"));
+        }
+
+        await using (cycleLock)
+        {
+            await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
             try
             {
-                var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
-                if (snap is null || !HasModelWeights(snap)) continue;
-                double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
-
-                // Use recent resolved prediction logs as the conformal calibration set.
-                // Up to 500 logs are loaded; at least 50 are required for a meaningful quantile.
-                var calLogs = await readDb.Set<MLModelPredictionLog>()
-                    .Where(l => l.MLModelId == model.Id
-                             && !l.IsDeleted
-                             && l.ActualDirection.HasValue
-                             && l.DirectionCorrect.HasValue
-                             && l.OutcomeRecordedAt != null
-                             && (l.ConfidenceScore > 0
-                                 || l.ServedCalibratedProbability != null
-                                 || l.CalibratedProbability != null
-                                 || l.RawProbability != null))
-                    .OrderByDescending(l => l.OutcomeRecordedAt)
-                    .ThenByDescending(l => l.Id)
-                    .Take(500)
-                    .ToListAsync(ct);
-
-                if (calLogs.Count < 50) continue;
-
-                // Compute nonconformity scores: α_i = 1 − P(true class).
-                // For each prediction log:
-                //   pBuy  = ConfidenceScore (probability assigned to Buy)
-                //   pSell = 1 − pBuy        (probability assigned to Sell, assumes binary sum = 1)
-                //   pTrue = probability assigned to the class that actually occurred
-                //   score = 1 − pTrue  (how nonconformant the prediction is: 0 = perfect, 1 = worst)
-                var scores = new List<double>(calLogs.Count);
-                foreach (var log in calLogs)
-                {
-                    double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, decisionThreshold);
-                    double pTrue = log.ActualDirection == Domain.Enums.TradeDirection.Buy
-                        ? pBuy
-                        : 1.0 - pBuy;
-                    scores.Add(1.0 - pTrue);
-                }
-                scores.Sort(); // Sorted ascending for quantile lookup.
-
-                // Split-conformal coverage threshold τ at 90 % coverage (α = 0.10).
-                // Formula: τ = scores[⌈(n+1)(1−α)⌉ − 1]
-                // This is the finite-sample correction for the empirical quantile that provides
-                // the marginal coverage guarantee P(Y ∈ C(X)) ≥ 1 − α.
-                double alpha      = 0.10;   // mis-coverage rate (10 % of predictions may fall outside the set)
-                int    n          = scores.Count;
-                int    qIdx       = (int)Math.Ceiling((n + 1) * (1 - alpha)) - 1;
-                qIdx              = Math.Clamp(qIdx, 0, n - 1); // guard against out-of-range index
-                double threshold  = scores[qIdx]; // τ: the coverage threshold
-
-                // Empirical coverage on the same calibration set.
-                // Note: this is an upper bound because the calibration set was used to select τ.
-                // True held-out coverage guarantees require a separate test set.
-                // Coverage check: the model's prediction set at threshold τ covers the true label
-                // when the nonconformity score of the true label ≤ τ.
-                int covered = calLogs.Count(l =>
-                {
-                    double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(l, decisionThreshold);
-                    double pSell = 1.0 - pBuy;
-                    // Prediction set membership: include Buy if (1 − pBuy) ≤ τ, Sell if (1 − pSell) ≤ τ.
-                    bool   inBuy  = (1 - pBuy)  <= threshold;
-                    bool   inSell = (1 - pSell)  <= threshold;
-                    // The true label is covered when its corresponding prediction set member is included.
-                    return (l.ActualDirection!.Value == Domain.Enums.TradeDirection.Buy && inBuy)
-                        || (l.ActualDirection!.Value == Domain.Enums.TradeDirection.Sell && inSell);
-                });
-                double empCoverage  = (double)covered / calLogs.Count;
-
-                // Ambiguous prediction rate: fraction where both Buy and Sell are in the prediction set.
-                // A high ambiguous rate means τ is too loose — the model is too uncertain to distinguish.
-                // (1 − p) ≤ τ AND p ≤ τ  ⟺  (1 − τ) ≤ p ≤ τ  ⟺  the probability is near 0.5.
-                int    ambiguousN   = calLogs.Count(l =>
-                {
-                    double p = MLFeatureHelper.ResolveLoggedServedBuyProbability(l, decisionThreshold);
-                    return (1 - p) <= threshold && p <= threshold;
-                });
-
-                var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
-                    .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
-                if (writeModel == null || latestSnap == null) continue;
-
-                latestSnap.ConformalQHat = threshold;
-                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
-
-                // Persist the calibration record with all computed diagnostics.
-                writeDb.Set<MLConformalCalibration>().Add(new MLConformalCalibration
-                {
-                    MLModelId                = model.Id,
-                    Symbol                   = model.Symbol,
-                    Timeframe                = model.Timeframe,
-                    // Store the full sorted nonconformity score array for future recalibration.
-                    NonConformityScoresJson  = JsonSerializer.Serialize(scores),
-                    CalibrationSamples       = n,
-                    TargetCoverage            = 1 - alpha,    // nominal coverage level = 0.90
-                    CoverageThreshold        = threshold,    // τ: the quantile threshold
-                    EmpiricalCoverage        = empCoverage,
-                    AmbiguousRate            = (double)ambiguousN / calLogs.Count,
-                    CalibratedAt             = DateTime.UtcNow
-                });
-
-                await writeDb.SaveChangesAsync(ct);
-                _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
-                _logger.LogInformation(
-                    "Conformal calibration: model {Id} τ={T:F4} coverage={C:P1} ambiguous={A:P1}",
-                    model.Id, threshold, empCoverage, (double)ambiguousN / calLogs.Count);
+                return await RunCycleCoreAsync(writeDb, settings, ct);
             }
-            catch (Exception ex)
+            finally
             {
-                _logger.LogWarning(ex, "Conformal calibration failed for model {Id}", model.Id);
+                WorkerBulkhead.MLMonitoring.Release();
             }
+        }
+    }
+
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+            return baseInterval <= TimeSpan.Zero ? TimeSpan.FromMinutes(30) : baseInterval;
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private async Task<MLConformalCalibrationCycleResult> RunCycleCoreAsync(
+        DbContext writeDb,
+        MLConformalCalibrationWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var cycleStart = Stopwatch.GetTimestamp();
+        DateTime nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        var candidates = await writeDb.Set<MLModel>()
+            .AsNoTracking()
+            .Where(m => m.IsActive
+                        && !m.IsDeleted
+                        && !m.IsMetaLearner
+                        && !m.IsMamlInitializer
+                        && m.ModelBytes != null)
+            .OrderBy(m => m.Id)
+            .Take(settings.MaxCycleModels)
+            .Select(m => new ActiveModelCandidate(
+                m.Id,
+                m.Symbol,
+                m.Timeframe,
+                m.TrainedAt,
+                m.ActivatedAt,
+                m.ModelBytes))
+            .ToListAsync(ct);
+
+        _healthMonitor?.RecordBacklogDepth(WorkerName, candidates.Count);
+
+        if (candidates.Count == 0)
+        {
+            _metrics?.MLConformalCalibrationCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "no_candidate_models"));
+            return MLConformalCalibrationCycleResult.Skipped(settings, "no_candidate_models");
+        }
+
+        int evaluated = 0;
+        int written = 0;
+        int skippedAlreadyCalibrated = 0;
+        int skippedInvalidSnapshot = 0;
+        int skippedInsufficientLogs = 0;
+        int skippedPersistenceRace = 0;
+
+        foreach (var batch in candidates.Chunk(settings.ModelBatchSize))
+        {
+            var batchCandidates = batch.ToArray();
+            var modelIds = batchCandidates.Select(m => m.Id).ToArray();
+
+            var existingCalibrations = await writeDb.Set<MLConformalCalibration>()
+                .AsNoTracking()
+                .Where(c => modelIds.Contains(c.MLModelId) && !c.IsDeleted)
+                .OrderByDescending(c => c.CalibratedAt)
+                .ThenByDescending(c => c.Id)
+                .ToListAsync(ct);
+
+            var existingByModelId = existingCalibrations
+                .GroupBy(c => c.MLModelId)
+                .ToDictionary(g => g.Key, g => g.ToArray());
+
+            foreach (var model in batchCandidates)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                existingByModelId.TryGetValue(model.Id, out var modelCalibrations);
+                if (modelCalibrations is not null
+                    && modelCalibrations.Any(c => IsUsableCalibration(c, model, settings, nowUtc)))
+                {
+                    skippedAlreadyCalibrated++;
+                    RecordSkip("already_calibrated", model);
+                    continue;
+                }
+
+                if (!TryDeserializeSnapshot(model.ModelBytes, out var snapshot) || !HasModelWeights(snapshot))
+                {
+                    skippedInvalidSnapshot++;
+                    RecordSkip("invalid_snapshot", model);
+                    continue;
+                }
+
+                double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snapshot);
+                DateTime evidenceCutoff = GetEvidenceCutoff(model, settings, nowUtc);
+                var modelLogs = await LoadRecentResolvedLogsAsync(writeDb, model, settings, nowUtc, ct);
+                var observations = BuildObservations(modelLogs, model, evidenceCutoff, decisionThreshold);
+
+                if (observations.Count < settings.MinLogs)
+                {
+                    skippedInsufficientLogs++;
+                    RecordSkip("insufficient_logs", model);
+                    continue;
+                }
+
+                evaluated++;
+                _metrics?.MLConformalCalibrationModelsEvaluated.Add(
+                    1,
+                    new("symbol", model.Symbol),
+                    new("timeframe", model.Timeframe.ToString()));
+
+                var calibration = ComputeCalibration(observations, settings.TargetCoverage);
+                bool persisted = await PersistCalibrationAsync(
+                    writeDb,
+                    model,
+                    calibration,
+                    settings,
+                    ct);
+
+                if (!persisted)
+                {
+                    skippedPersistenceRace++;
+                    RecordSkip("already_calibrated_after_recheck", model);
+                    continue;
+                }
+
+                written++;
+                _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
+
+                _metrics?.MLConformalCalibrationWritten.Add(
+                    1,
+                    new("symbol", model.Symbol),
+                    new("timeframe", model.Timeframe.ToString()));
+                _metrics?.MLConformalCalibrationSamples.Record(
+                    calibration.SampleCount,
+                    new("symbol", model.Symbol),
+                    new("timeframe", model.Timeframe.ToString()));
+                _metrics?.MLConformalCalibrationEmpiricalCoverage.Record(
+                    calibration.EmpiricalCoverage,
+                    new("symbol", model.Symbol),
+                    new("timeframe", model.Timeframe.ToString()));
+                _metrics?.MLConformalCalibrationAmbiguousRate.Record(
+                    calibration.AmbiguousRate,
+                    new("symbol", model.Symbol),
+                    new("timeframe", model.Timeframe.ToString()));
+
+                _logger.LogInformation(
+                    "{Worker}: calibrated model {ModelId} {Symbol}/{Timeframe} qHat={Threshold:F4} coverage={Coverage:P1} ambiguous={Ambiguous:P1} samples={Samples}.",
+                    WorkerName,
+                    model.Id,
+                    model.Symbol,
+                    model.Timeframe,
+                    calibration.Threshold,
+                    calibration.EmpiricalCoverage,
+                    calibration.AmbiguousRate,
+                    calibration.SampleCount);
+            }
+        }
+
+        double durationMs = Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds;
+        _metrics?.MLConformalCalibrationCycleDurationMs.Record(durationMs);
+        _metrics?.WorkerCycleDurationMs.Record(
+            durationMs,
+            new KeyValuePair<string, object?>("worker", WorkerName));
+
+        _logger.LogInformation(
+            "{Worker}: cycle complete. candidates={Candidates} evaluated={Evaluated} written={Written} skippedAlready={SkippedAlready} skippedInvalidSnapshot={SkippedInvalidSnapshot} skippedInsufficient={SkippedInsufficient} skippedRace={SkippedRace}",
+            WorkerName,
+            candidates.Count,
+            evaluated,
+            written,
+            skippedAlreadyCalibrated,
+            skippedInvalidSnapshot,
+            skippedInsufficientLogs,
+            skippedPersistenceRace);
+
+        return new MLConformalCalibrationCycleResult(
+            settings,
+            SkippedReason: null,
+            CandidateModelCount: candidates.Count,
+            EvaluatedModelCount: evaluated,
+            CalibrationsWritten: written,
+            SkippedAlreadyCalibratedCount: skippedAlreadyCalibrated,
+            SkippedInvalidSnapshotCount: skippedInvalidSnapshot,
+            SkippedInsufficientLogsCount: skippedInsufficientLogs,
+            SkippedPersistenceRaceCount: skippedPersistenceRace);
+    }
+
+    private async Task<bool> PersistCalibrationAsync(
+        DbContext writeDb,
+        ActiveModelCandidate model,
+        CalibrationComputation calibration,
+        MLConformalCalibrationWorkerSettings settings,
+        CancellationToken ct)
+    {
+        bool persisted = false;
+        var strategy = writeDb.Database.CreateExecutionStrategy();
+
+        await strategy.ExecuteAsync(async token =>
+        {
+            await using var transaction = await writeDb.Database.BeginTransactionAsync(IsolationLevel.Serializable, token);
+
+            var latestCalibration = await writeDb.Set<MLConformalCalibration>()
+                .Where(c => c.MLModelId == model.Id && !c.IsDeleted)
+                .OrderByDescending(c => c.CalibratedAt)
+                .ThenByDescending(c => c.Id)
+                .FirstOrDefaultAsync(token);
+
+            DateTime nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            if (latestCalibration is not null && IsUsableCalibration(latestCalibration, model, settings, nowUtc))
+            {
+                await transaction.CommitAsync(token);
+                persisted = false;
+                return;
+            }
+
+            var (writeModel, latestSnapshot) = await MLModelSnapshotWriteHelper
+                .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, token);
+            if (writeModel is null || latestSnapshot is null || !HasModelWeights(latestSnapshot))
+            {
+                await transaction.CommitAsync(token);
+                persisted = false;
+                return;
+            }
+
+            latestSnapshot.ConformalQHat = calibration.Threshold;
+            latestSnapshot.ConformalQHatBuy = calibration.Threshold;
+            latestSnapshot.ConformalQHatSell = calibration.Threshold;
+            latestSnapshot.ConformalCoverage = calibration.TargetCoverage;
+            writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnapshot);
+
+            writeDb.Set<MLConformalCalibration>().Add(new MLConformalCalibration
+            {
+                MLModelId = model.Id,
+                Symbol = model.Symbol,
+                Timeframe = model.Timeframe,
+                NonConformityScoresJson = JsonSerializer.Serialize(calibration.SortedScores),
+                CalibrationSamples = calibration.SampleCount,
+                TargetCoverage = calibration.TargetCoverage,
+                CoverageThreshold = calibration.Threshold,
+                EmpiricalCoverage = calibration.EmpiricalCoverage,
+                AmbiguousRate = calibration.AmbiguousRate,
+                CalibratedAt = nowUtc
+            });
+
+            await writeDb.SaveChangesAsync(token);
+            await transaction.CommitAsync(token);
+            writeDb.ChangeTracker.Clear();
+            persisted = true;
+        }, ct);
+
+        return persisted;
+    }
+
+    private static async Task<List<MLModelPredictionLog>> LoadRecentResolvedLogsAsync(
+        DbContext db,
+        ActiveModelCandidate model,
+        MLConformalCalibrationWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        DateTime oldestAllowed = nowUtc.AddDays(-settings.MaxLogAgeDays);
+        return await db.Set<MLModelPredictionLog>()
+            .AsNoTracking()
+            .Where(l => l.MLModelId == model.Id
+                        && !l.IsDeleted
+                        && l.Symbol == model.Symbol
+                        && l.Timeframe == model.Timeframe
+                        && l.ActualDirection.HasValue
+                        && l.OutcomeRecordedAt.HasValue
+                        && l.OutcomeRecordedAt >= oldestAllowed
+                        && (l.ServedCalibratedProbability.HasValue
+                            || l.CalibratedProbability.HasValue
+                            || l.RawProbability.HasValue
+                            || l.ConfidenceScore > 0m))
+            .OrderByDescending(l => l.OutcomeRecordedAt)
+            .ThenByDescending(l => l.Id)
+            .Take(settings.MaxLogs)
+            .ToListAsync(ct);
+    }
+
+    private static List<CalibrationObservation> BuildObservations(
+        IReadOnlyCollection<MLModelPredictionLog> logs,
+        ActiveModelCandidate model,
+        DateTime evidenceCutoff,
+        double decisionThreshold)
+    {
+        var observations = new List<CalibrationObservation>(logs.Count);
+        foreach (var log in logs)
+        {
+            if (!string.Equals(log.Symbol?.Trim(), model.Symbol?.Trim(), StringComparison.OrdinalIgnoreCase)
+                || log.Timeframe != model.Timeframe
+                || !log.ActualDirection.HasValue
+                || !log.OutcomeRecordedAt.HasValue)
+            {
+                continue;
+            }
+
+            DateTime outcomeAt = NormalizeUtc(log.OutcomeRecordedAt.Value);
+            if (outcomeAt < evidenceCutoff)
+                continue;
+
+            double buyProbability = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, decisionThreshold);
+            if (!IsFiniteProbability(buyProbability))
+                continue;
+
+            double trueProbability = log.ActualDirection.Value == TradeDirection.Buy
+                ? buyProbability
+                : 1.0 - buyProbability;
+            double score = 1.0 - trueProbability;
+            if (!IsFiniteProbability(score))
+                continue;
+
+            observations.Add(new CalibrationObservation(
+                score,
+                buyProbability,
+                log.ActualDirection.Value,
+                outcomeAt));
+        }
+
+        return observations;
+    }
+
+    private static CalibrationComputation ComputeCalibration(
+        IReadOnlyCollection<CalibrationObservation> observations,
+        double targetCoverage)
+    {
+        var scores = observations
+            .Select(o => o.Score)
+            .OrderBy(s => s)
+            .ToArray();
+
+        double threshold = ComputeConformalQuantile(scores, targetCoverage);
+        int covered = observations.Count(o => o.Score <= threshold + ProbabilityEpsilon);
+        int ambiguous = observations.Count(o =>
+            (1.0 - o.BuyProbability) <= threshold + ProbabilityEpsilon
+            && o.BuyProbability <= threshold + ProbabilityEpsilon);
+
+        return new CalibrationComputation(
+            scores,
+            scores.Length,
+            threshold,
+            targetCoverage,
+            covered / (double)scores.Length,
+            ambiguous / (double)scores.Length);
+    }
+
+    internal static double ComputeConformalQuantile(
+        IReadOnlyList<double> sortedScores,
+        double targetCoverage)
+    {
+        if (sortedScores.Count == 0)
+            return 0.5;
+
+        int index = (int)Math.Ceiling(targetCoverage * (sortedScores.Count + 1)) - 1;
+        index = Math.Clamp(index, 0, sortedScores.Count - 1);
+        return Math.Clamp(sortedScores[index], 0.0, 1.0);
+    }
+
+    private static bool IsUsableCalibration(
+        MLConformalCalibration calibration,
+        ActiveModelCandidate model,
+        MLConformalCalibrationWorkerSettings settings,
+        DateTime nowUtc)
+    {
+        if (calibration.IsDeleted
+            || calibration.MLModelId != model.Id
+            || calibration.CalibrationSamples < settings.MinLogs
+            || !IsStrictProbability(calibration.TargetCoverage)
+            || !IsFiniteProbability(calibration.CoverageThreshold)
+            || Math.Abs(calibration.TargetCoverage - settings.TargetCoverage) > 0.000001
+            || !string.Equals(calibration.Symbol?.Trim(), model.Symbol?.Trim(), StringComparison.OrdinalIgnoreCase)
+            || calibration.Timeframe != model.Timeframe)
+        {
+            return false;
+        }
+
+        if (calibration.CalibratedAt < nowUtc.AddDays(-settings.MaxCalibrationAgeDays))
+            return false;
+
+        if (settings.RequirePostActivationLogs && calibration.CalibratedAt < GetEvidenceCutoff(model, settings, calibration.CalibratedAt))
+            return false;
+
+        return true;
+    }
+
+    private void RecordSkip(string reason, ActiveModelCandidate model)
+    {
+        _metrics?.MLConformalCalibrationModelsSkipped.Add(
+            1,
+            new("reason", reason),
+            new("symbol", model.Symbol),
+            new("timeframe", model.Timeframe.ToString()));
+    }
+
+    private static bool TryDeserializeSnapshot(byte[]? modelBytes, out ModelSnapshot snapshot)
+    {
+        snapshot = new ModelSnapshot();
+        if (modelBytes is null || modelBytes.Length == 0)
+            return false;
+
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<ModelSnapshot>(modelBytes);
+            if (parsed is null)
+                return false;
+
+            snapshot = parsed;
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 
@@ -231,4 +674,62 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
         !string.IsNullOrEmpty(snap.FtTransformerAdditionalLayersJson) ||
         snap.FtTransformerAdditionalLayersBytes is { Length: > 0 } ||
         !string.IsNullOrEmpty(snap.RotationForestJson);
+
+    private static DateTime GetEvidenceCutoff(
+        ActiveModelCandidate model,
+        MLConformalCalibrationWorkerSettings settings,
+        DateTime nowUtc)
+    {
+        DateTime oldestAllowed = nowUtc.AddDays(-settings.MaxLogAgeDays);
+        if (!settings.RequirePostActivationLogs)
+            return oldestAllowed;
+
+        DateTime servingStart = NormalizeUtc(model.ActivatedAt ?? model.TrainedAt);
+        return servingStart > oldestAllowed ? servingStart : oldestAllowed;
+    }
+
+    private static bool IsStrictProbability(double value)
+        => double.IsFinite(value) && value > 0.0 && value < 1.0;
+
+    private static bool IsFiniteProbability(double value)
+        => double.IsFinite(value) && value >= 0.0 && value <= 1.0;
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+        };
+
+    private static MLConformalCalibrationWorkerSettings BuildSettings(MLConformalCalibrationOptions options)
+    {
+        int minLogs = ClampInt(options.MinLogs, 50, 10, 100_000);
+        int modelBatchSize = ClampInt(options.ModelBatchSize, 100, 1, 10_000);
+
+        return new MLConformalCalibrationWorkerSettings(
+            InitialDelay: TimeSpan.FromMinutes(ClampInt(options.InitialDelayMinutes, 20, 0, 24 * 60)),
+            PollInterval: TimeSpan.FromMinutes(ClampInt(options.PollIntervalMinutes, 30, 1, 7 * 24 * 60)),
+            PollJitterSeconds: ClampInt(options.PollJitterSeconds, 300, 0, 24 * 60 * 60),
+            MaxLogs: Math.Max(minLogs, ClampInt(options.MaxLogs, 500, minLogs, 100_000)),
+            MinLogs: minLogs,
+            MaxLogAgeDays: ClampInt(options.MaxLogAgeDays, 30, 1, 3650),
+            MaxCalibrationAgeDays: ClampInt(options.MaxCalibrationAgeDays, 30, 1, 3650),
+            TargetCoverage: ClampDouble(options.TargetCoverage, 0.90, 0.50, 0.999999),
+            ModelBatchSize: modelBatchSize,
+            MaxCycleModels: Math.Max(modelBatchSize, ClampInt(options.MaxCycleModels, 10_000, modelBatchSize, 100_000)),
+            LockTimeoutSeconds: ClampInt(options.LockTimeoutSeconds, 5, 0, 300),
+            RequirePostActivationLogs: options.RequirePostActivationLogs);
+    }
+
+    private static int ClampInt(int value, int defaultValue, int min, int max)
+        => value < min || value > max ? defaultValue : value;
+
+    private static double ClampDouble(double value, double defaultValue, double min, double max)
+        => !double.IsFinite(value) || value < min || value > max ? defaultValue : value;
+
+    private static TimeSpan GetIntervalWithJitter(MLConformalCalibrationWorkerSettings settings)
+        => settings.PollJitterSeconds == 0
+            ? settings.PollInterval
+            : settings.PollInterval + TimeSpan.FromSeconds(Random.Shared.Next(0, settings.PollJitterSeconds + 1));
 }

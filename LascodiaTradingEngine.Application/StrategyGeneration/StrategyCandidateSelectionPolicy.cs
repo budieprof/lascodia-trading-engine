@@ -50,6 +50,9 @@ public sealed record CandidateSelectionScoreBreakdown
     [JsonPropertyName("walkForwardContribution")]
     public double WalkForwardContribution { get; init; }
 
+    [JsonPropertyName("qualityScoreContribution")]
+    public double QualityScoreContribution { get; init; }
+
     [JsonPropertyName("oosDrawdownPenalty")]
     public double OosDrawdownPenalty { get; init; }
 
@@ -112,6 +115,21 @@ public sealed class StrategyCandidateSelectionPolicy : IStrategyCandidateSelecti
         double isWinRateContribution = (double)candidate.TrainResult.WinRate * 10d;
         double equityCurveContribution = (metrics?.EquityCurveR2 ?? -1.0) * 25d;
         double walkForwardContribution = (metrics?.WalkForwardWindowsPassed ?? 0) * 5d;
+        double qualityScore = metrics?.QualityScore > 0
+            ? metrics.QualityScore
+            : ScreeningQualityScorer.ComputeScore(
+                candidate.TrainResult,
+                candidate.OosResult,
+                metrics?.EquityCurveR2,
+                metrics?.WalkForwardWindowsPassed,
+                null,
+                metrics?.MonteCarloPValue,
+                metrics?.ShufflePValue,
+                metrics?.MaxTradeTimeConcentration,
+                metrics?.MarginalSharpeContribution,
+                metrics?.KellySharpeRatio,
+                metrics?.FixedLotSharpeRatio);
+        double qualityScoreContribution = qualityScore * 5d;
         double oosDrawdownPenalty = (double)candidate.OosResult.MaxDrawdownPct * 100d;
         double isDrawdownPenalty = (double)candidate.TrainResult.MaxDrawdownPct * 50d;
 
@@ -125,6 +143,7 @@ public sealed class StrategyCandidateSelectionPolicy : IStrategyCandidateSelecti
             IsWinRateContribution = isWinRateContribution,
             EquityCurveContribution = equityCurveContribution,
             WalkForwardContribution = walkForwardContribution,
+            QualityScoreContribution = qualityScoreContribution,
             OosDrawdownPenalty = oosDrawdownPenalty,
             IsDrawdownPenalty = isDrawdownPenalty,
             TotalScore = oosSharpeContribution
@@ -135,6 +154,7 @@ public sealed class StrategyCandidateSelectionPolicy : IStrategyCandidateSelecti
                 + isWinRateContribution
                 + equityCurveContribution
                 + walkForwardContribution
+                + qualityScoreContribution
                 - oosDrawdownPenalty
                 - isDrawdownPenalty,
         };

@@ -99,6 +99,123 @@ public sealed class TradingMetrics
     public Counter<long>     MLArchitectureSelected { get; }
     public Counter<long>     MLSelectorFallbackDepth { get; }
     public Counter<long>     MLSelectorTrendPenalty  { get; }
+    public Counter<long>     MLAdwinModelsEvaluated { get; }
+    public Counter<long>     MLAdwinModelsSkipped { get; }
+    public Counter<long>     MLAdwinDriftsDetected { get; }
+    public Counter<long>     MLAdwinRetrainingQueued { get; }
+    public Counter<long>     MLAdwinFlagsCleared { get; }
+    public Counter<long>     MLAdwinLockAttempts { get; }
+    public Counter<long>     MLAdwinCyclesSkipped { get; }
+    public Histogram<double> MLAdwinDetectedAccuracyDrop { get; }
+    public Histogram<double> MLAdwinCycleDurationMs { get; }
+    public Counter<long>     MLAdwinAlertsDispatched { get; }
+    public Counter<long>     MLAdwinRetrainCooldownSkipped { get; }
+    public Histogram<double> MLAdwinTimeSinceLastSuccessSec { get; }
+    public Counter<long>     SlippageDriftCyclesSkipped { get; }
+    public Counter<long>     SlippageDriftLockAttempts { get; }
+    public Counter<long>     SlippageDriftsDetected { get; }
+    public Counter<long>     SlippageDriftAlertsDispatched { get; }
+    public Histogram<double> SlippageDriftRatio { get; }
+    public Histogram<double> SlippageDriftCycleDurationMs { get; }
+    public Histogram<double> SlippageDriftTimeSinceLastSuccessSec { get; }
+    public Counter<long>     MLDriftAgreementCyclesSkipped { get; }
+    public Counter<long>     MLDriftAgreementLockAttempts { get; }
+    public Counter<long>     MLDriftAgreementAlertsDispatched { get; }
+    public Histogram<double> MLDriftAgreementCounted { get; }
+    public Histogram<double> MLDriftAgreementCycleDurationMs { get; }
+    public Histogram<double> MLDriftAgreementTimeSinceLastSuccessSec { get; }
+    public Counter<long>     MLCusumModelsEvaluated { get; }
+    public Counter<long>     MLCusumModelsSkipped { get; }
+    public Counter<long>     MLCusumDriftsDetected { get; }
+    public Counter<long>     MLCusumRetrainingQueued { get; }
+    public Counter<long>     MLCusumRetrainCooldownSkipped { get; }
+    public Counter<long>     MLCusumLockAttempts { get; }
+    public Counter<long>     MLCusumCyclesSkipped { get; }
+    public Counter<long>     MLCusumAlertsDispatched { get; }
+    public Histogram<double> MLCusumCycleDurationMs { get; }
+    public Histogram<double> MLCusumTimeSinceLastSuccessSec { get; }
+    public Counter<long>     MLMultiScaleModelsEvaluated { get; }
+    public Counter<long>     MLMultiScaleModelsSkipped { get; }
+    public Counter<long>     MLMultiScaleSuddenDrifts { get; }
+    public Counter<long>     MLMultiScaleGradualDrifts { get; }
+    public Counter<long>     MLMultiScaleRetrainingQueued { get; }
+    public Counter<long>     MLMultiScaleRetrainCooldownSkipped { get; }
+    public Counter<long>     MLMultiScaleLockAttempts { get; }
+    public Counter<long>     MLMultiScaleCyclesSkipped { get; }
+    public Counter<long>     MLMultiScaleAlertsDispatched { get; }
+    public Histogram<double> MLMultiScaleCycleDurationMs { get; }
+    public Histogram<double> MLMultiScaleTimeSinceLastSuccessSec { get; }
+    public Counter<long>     MLDriftMonitorLockAttempts { get; }
+    public Counter<long>     MLDriftMonitorCyclesSkipped { get; }
+    public Histogram<double> MLDriftMonitorCycleDurationMs { get; }
+    public Counter<long>     MLAdaptiveThresholdModelsEvaluated { get; }
+    public Counter<long>     MLAdaptiveThresholdModelsUpdated { get; }
+    public Counter<long>     MLAdaptiveThresholdModelsSkipped { get; }
+    public Counter<long>     MLAdaptiveThresholdRegimeThresholdsPruned { get; }
+    public Counter<long>     MLAdaptiveThresholdLockAttempts { get; }
+    public Counter<long>     MLAdaptiveThresholdCyclesSkipped { get; }
+    public Histogram<double> MLAdaptiveThresholdAppliedDrift { get; }
+    public Histogram<double> MLAdaptiveThresholdCycleDurationMs { get; }
+    public Counter<long>     MLAlertFatigueEvaluations { get; }
+    public Counter<long>     MLAlertFatigueAlertTransitions { get; }
+    public Counter<long>     MLAlertFatigueLockAttempts { get; }
+    public Counter<long>     MLAlertFatigueCyclesSkipped { get; }
+    public Histogram<double> MLAlertFatigueTriggeredAlerts { get; }
+    public Histogram<double> MLAlertFatigueActiveAlerts { get; }
+    public Histogram<double> MLAlertFatigueRemediatedRatio { get; }
+    public Histogram<double> MLAlertFatigueCycleDurationMs { get; }
+    public Counter<long>     MLCausalFeatureModelsEvaluated { get; }
+    public Counter<long>     MLCausalFeatureModelsSkipped { get; }
+    public Counter<long>     MLCausalFeatureAuditsWritten { get; }
+    public Counter<long>     MLCausalFeatureLockAttempts { get; }
+    public Counter<long>     MLCausalFeatureCyclesSkipped { get; }
+    public Histogram<double> MLCausalFeatureCausalFeatures { get; }
+    public Histogram<double> MLCausalFeatureResolvedSamples { get; }
+    public Histogram<double> MLCausalFeatureCycleDurationMs { get; }
+    public Counter<long>     MLCalibrationMonitorModelsEvaluated { get; }
+    public Counter<long>     MLCalibrationMonitorModelsSkipped { get; }
+    public Counter<long>     MLCalibrationMonitorAlertsDispatched { get; }
+    public Counter<long>     MLCalibrationMonitorAlertTransitions { get; }
+    public Counter<long>     MLCalibrationMonitorRetrainingQueued { get; }
+    public Counter<long>     MLCalibrationMonitorLockAttempts { get; }
+    public Counter<long>     MLCalibrationMonitorCyclesSkipped { get; }
+    public Histogram<double> MLCalibrationMonitorCurrentEce { get; }
+    public Histogram<double> MLCalibrationMonitorEceDelta { get; }
+    public Histogram<double> MLCalibrationMonitorResolvedSamples { get; }
+    public Histogram<double> MLCalibrationMonitorCycleDurationMs { get; }
+    public Counter<long>     MLCalibratedEdgeModelsEvaluated { get; }
+    public Counter<long>     MLCalibratedEdgeModelsSkipped { get; }
+    public Counter<long>     MLCalibratedEdgeAlertsDispatched { get; }
+    public Counter<long>     MLCalibratedEdgeAlertTransitions { get; }
+    public Counter<long>     MLCalibratedEdgeRetrainingQueued { get; }
+    public Counter<long>     MLCalibratedEdgeLockAttempts { get; }
+    public Counter<long>     MLCalibratedEdgeCyclesSkipped { get; }
+    public Histogram<double> MLCalibratedEdgeExpectedValuePips { get; }
+    public Histogram<double> MLCalibratedEdgeResolvedSamples { get; }
+    public Histogram<double> MLCalibratedEdgeCycleDurationMs { get; }
+    public Counter<long>     MLAverageWeightInitSourceModelsEvaluated { get; }
+    public Counter<long>     MLAverageWeightInitInitializersWritten { get; }
+    public Counter<long>     MLAverageWeightInitInitializersSkipped { get; }
+    public Counter<long>     MLAverageWeightInitLockAttempts { get; }
+    public Counter<long>     MLAverageWeightInitCyclesSkipped { get; }
+    public Histogram<double> MLAverageWeightInitSourceModelsPerInitializer { get; }
+    public Histogram<double> MLAverageWeightInitCycleDurationMs { get; }
+    public Counter<long>     MLArchitectureRotationContextsEvaluated { get; }
+    public Counter<long>     MLArchitectureRotationRunsQueued { get; }
+    public Counter<long>     MLArchitectureRotationArchitecturesSkipped { get; }
+    public Counter<long>     MLArchitectureRotationLockAttempts { get; }
+    public Counter<long>     MLArchitectureRotationCyclesSkipped { get; }
+    public Histogram<double> MLArchitectureRotationQueuedRunsPerCycle { get; }
+    public Histogram<double> MLArchitectureRotationCycleDurationMs { get; }
+    public Counter<long>     MLConformalCalibrationModelsEvaluated { get; }
+    public Counter<long>     MLConformalCalibrationModelsSkipped { get; }
+    public Counter<long>     MLConformalCalibrationWritten { get; }
+    public Counter<long>     MLConformalCalibrationLockAttempts { get; }
+    public Counter<long>     MLConformalCalibrationCyclesSkipped { get; }
+    public Histogram<double> MLConformalCalibrationSamples { get; }
+    public Histogram<double> MLConformalCalibrationEmpiricalCoverage { get; }
+    public Histogram<double> MLConformalCalibrationAmbiguousRate { get; }
+    public Histogram<double> MLConformalCalibrationCycleDurationMs { get; }
     public Counter<long>     MLConformalBreakerModelsEvaluated { get; }
     public Counter<long>     MLConformalBreakerModelsSkipped { get; }
     public Counter<long>     MLConformalBreakerTrips { get; }
@@ -108,9 +225,11 @@ public sealed class TradingMetrics
     public Counter<long>     MLConformalBreakerDuplicateRepairs { get; }
     public Counter<long>     MLConformalBreakerAlertsDispatched { get; }
     public Counter<long>     MLConformalBreakerAlertDispatchFailures { get; }
+    public Counter<long>     MLConformalBreakerCyclesSkipped { get; }
     public Histogram<double> MLConformalBreakerThresholdMismatchRate { get; }
     public Histogram<double> MLConformalBreakerEmpiricalCoverage { get; }
     public Histogram<double> MLConformalBreakerActive { get; }
+    public Histogram<double> MLConformalBreakerCycleDurationMs { get; }
     public Counter<long>     MLCorrelatedFailureModelsEvaluated { get; }
     public Counter<long>     MLCorrelatedFailureModelsFailing { get; }
     public Counter<long>     MLCorrelatedFailureModelsSkipped { get; }
@@ -118,8 +237,17 @@ public sealed class TradingMetrics
     public Counter<long>     MLCorrelatedFailurePauseRecoveries { get; }
     public Counter<long>     MLCorrelatedFailureLockAttempts { get; }
     public Counter<long>     MLCorrelatedFailureCooldownSkips { get; }
+    public Counter<long>     MLCorrelatedFailureCyclesSkipped { get; }
     public Histogram<double> MLCorrelatedFailureRatio { get; }
     public Histogram<double> MLCorrelatedFailureAffectedSymbols { get; }
+    public Histogram<double> MLCorrelatedFailureCycleDurationMs { get; }
+    public Counter<long>     MLCorrelatedSignalConflictConflictsDetected { get; }
+    public Counter<long>     MLCorrelatedSignalConflictAlertsUpserted { get; }
+    public Counter<long>     MLCorrelatedSignalConflictAlertsResolved { get; }
+    public Counter<long>     MLCorrelatedSignalConflictSignalsRejected { get; }
+    public Counter<long>     MLCorrelatedSignalConflictCyclesSkipped { get; }
+    public Counter<long>     MLCorrelatedSignalConflictLockAttempts { get; }
+    public Histogram<double> MLCorrelatedSignalConflictCycleDurationMs { get; }
     public Counter<long>     MLErgodicityModelsEvaluated { get; }
     public Counter<long>     MLErgodicityModelsSkipped { get; }
     public Counter<long>     MLErgodicityLogsWritten { get; }
@@ -255,6 +383,7 @@ public sealed class TradingMetrics
     public Counter<long>     StrategyGenFeedbackBoosted         { get; }
     public Counter<long>     StrategyGenMonteCarloRejected      { get; }
     public Counter<long>     StrategyGenPortfolioDrawdownFiltered { get; }
+    public Counter<long>     StrategyGenPortfolioExposureFiltered { get; }
     public Counter<long>     StrategyGenAdaptiveThresholdsApplied { get; }
     public Counter<long>     StrategyGenWeekendSkipped           { get; }
     public Counter<long>     StrategyGenOosDrawdownDegraded      { get; }
@@ -465,6 +594,123 @@ public sealed class TradingMetrics
         MLArchitectureSelected  = _meter.CreateCounter<long>("trading.ml.architecture_selected", "selections", "ML architecture selections by TrainerSelector");
         MLSelectorFallbackDepth = _meter.CreateCounter<long>("trading.ml.selector_fallback_depth", "selections", "TrainerSelector fallback depth reached per selection");
         MLSelectorTrendPenalty  = _meter.CreateCounter<long>("trading.ml.selector_trend_penalty", "penalties", "Architecture score penalised due to declining performance trend");
+        MLAdwinModelsEvaluated = _meter.CreateCounter<long>("trading.ml.adwin.models_evaluated", "models", "Active ML models evaluated by MLAdwinDriftWorker.");
+        MLAdwinModelsSkipped = _meter.CreateCounter<long>("trading.ml.adwin.models_skipped", "models", "ML models skipped by MLAdwinDriftWorker, tagged by reason.");
+        MLAdwinDriftsDetected = _meter.CreateCounter<long>("trading.ml.adwin.drifts_detected", "drifts", "Statistically significant degrading ADWIN drift detections.");
+        MLAdwinRetrainingQueued = _meter.CreateCounter<long>("trading.ml.adwin.retraining_queued", "runs", "Retraining runs queued by MLAdwinDriftWorker.");
+        MLAdwinFlagsCleared = _meter.CreateCounter<long>("trading.ml.adwin.flags_cleared", "flags", "ADWIN drift flags expired or cleared after healthy evaluations.");
+        MLAdwinLockAttempts = _meter.CreateCounter<long>("trading.ml.adwin.lock_attempts", "cycles", "Distributed-lock attempts by MLAdwinDriftWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLAdwinCyclesSkipped = _meter.CreateCounter<long>("trading.ml.adwin.cycles_skipped", "cycles", "MLAdwinDriftWorker cycles skipped without processing, tagged by reason={disabled|lock_busy}.");
+        MLAdwinDetectedAccuracyDrop = _meter.CreateHistogram<double>("trading.ml.adwin.detected_accuracy_drop", "ratio", "Accuracy drop observed on degrading ADWIN detections.");
+        MLAdwinAlertsDispatched = _meter.CreateCounter<long>("trading.ml.adwin.alerts_dispatched", "alerts", "ADWIN drift alerts dispatched via IAlertDispatcher (post-dedupe).");
+        MLAdwinRetrainCooldownSkipped = _meter.CreateCounter<long>("trading.ml.adwin.retrain_cooldown_skipped", "decisions", "Retrain attempts suppressed because the model was retrained within the cooldown window.");
+        MLAdwinTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.adwin.time_since_last_success_seconds", "s", "Seconds since the last successful MLAdwinDriftWorker cycle, recorded each cycle attempt.");
+        SlippageDriftCyclesSkipped = _meter.CreateCounter<long>("trading.slippage_drift.cycles_skipped", "cycles", "SlippageDriftWorker cycles skipped, tagged by reason={disabled|lock_busy}.");
+        SlippageDriftLockAttempts = _meter.CreateCounter<long>("trading.slippage_drift.lock_attempts", "cycles", "Distributed-lock attempts by SlippageDriftWorker, tagged by outcome=acquired|busy|unavailable.");
+        SlippageDriftsDetected = _meter.CreateCounter<long>("trading.slippage_drift.detected", "drifts", "Per-symbol slippage drift detections beyond the configured threshold.");
+        SlippageDriftAlertsDispatched = _meter.CreateCounter<long>("trading.slippage_drift.alerts_dispatched", "alerts", "Slippage drift alerts dispatched via IAlertDispatcher (post-dedupe).");
+        SlippageDriftRatio = _meter.CreateHistogram<double>("trading.slippage_drift.ratio", "ratio", "Per-cycle recent/baseline slippage ratio per symbol.");
+        SlippageDriftCycleDurationMs = _meter.CreateHistogram<double>("trading.slippage_drift.cycle_duration_ms", "ms", "SlippageDriftWorker cycle duration.");
+        SlippageDriftTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.slippage_drift.time_since_last_success_seconds", "s", "Seconds since the last successful SlippageDriftWorker cycle, recorded each cycle attempt.");
+        MLDriftAgreementCyclesSkipped = _meter.CreateCounter<long>("trading.ml.drift_agreement.cycles_skipped", "cycles", "MLDriftAgreementWorker cycles skipped, tagged by reason={disabled|lock_busy}.");
+        MLDriftAgreementLockAttempts = _meter.CreateCounter<long>("trading.ml.drift_agreement.lock_attempts", "cycles", "Distributed-lock attempts by MLDriftAgreementWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLDriftAgreementAlertsDispatched = _meter.CreateCounter<long>("trading.ml.drift_agreement.alerts_dispatched", "alerts", "Drift-agreement alerts dispatched, tagged by kind=consensus|anomaly.");
+        MLDriftAgreementCounted = _meter.CreateHistogram<double>("trading.ml.drift_agreement.counted", "detectors", "Number of agreeing drift detectors per (symbol, timeframe) per cycle.");
+        MLDriftAgreementCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.drift_agreement.cycle_duration_ms", "ms", "MLDriftAgreementWorker cycle duration.");
+        MLDriftAgreementTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.drift_agreement.time_since_last_success_seconds", "s", "Seconds since last successful MLDriftAgreementWorker cycle.");
+        MLCusumModelsEvaluated = _meter.CreateCounter<long>("trading.ml.cusum.models_evaluated", "models", "Active ML models evaluated by MLCusumDriftWorker.");
+        MLCusumModelsSkipped = _meter.CreateCounter<long>("trading.ml.cusum.models_skipped", "models", "ML models skipped by MLCusumDriftWorker, tagged by reason.");
+        MLCusumDriftsDetected = _meter.CreateCounter<long>("trading.ml.cusum.drifts_detected", "drifts", "CUSUM degradation drifts detected.");
+        MLCusumRetrainingQueued = _meter.CreateCounter<long>("trading.ml.cusum.retraining_queued", "runs", "Retraining runs queued by MLCusumDriftWorker.");
+        MLCusumRetrainCooldownSkipped = _meter.CreateCounter<long>("trading.ml.cusum.retrain_cooldown_skipped", "decisions", "CUSUM retrain attempts suppressed by cooldown window.");
+        MLCusumLockAttempts = _meter.CreateCounter<long>("trading.ml.cusum.lock_attempts", "cycles", "Distributed-lock attempts by MLCusumDriftWorker.");
+        MLCusumCyclesSkipped = _meter.CreateCounter<long>("trading.ml.cusum.cycles_skipped", "cycles", "MLCusumDriftWorker cycles skipped, tagged by reason.");
+        MLCusumAlertsDispatched = _meter.CreateCounter<long>("trading.ml.cusum.alerts_dispatched", "alerts", "CUSUM drift alerts dispatched (post-dedupe).");
+        MLCusumCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.cusum.cycle_duration_ms", "ms", "MLCusumDriftWorker cycle duration.");
+        MLCusumTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.cusum.time_since_last_success_seconds", "s", "Seconds since last successful MLCusumDriftWorker cycle.");
+        MLMultiScaleModelsEvaluated = _meter.CreateCounter<long>("trading.ml.multiscale.models_evaluated", "models", "Active ML models evaluated by MLMultiScaleDriftWorker.");
+        MLMultiScaleModelsSkipped = _meter.CreateCounter<long>("trading.ml.multiscale.models_skipped", "models", "ML models skipped by MLMultiScaleDriftWorker, tagged by reason.");
+        MLMultiScaleSuddenDrifts = _meter.CreateCounter<long>("trading.ml.multiscale.sudden_drifts", "drifts", "Sudden multi-scale drifts detected.");
+        MLMultiScaleGradualDrifts = _meter.CreateCounter<long>("trading.ml.multiscale.gradual_drifts", "drifts", "Gradual multi-scale drifts detected.");
+        MLMultiScaleRetrainingQueued = _meter.CreateCounter<long>("trading.ml.multiscale.retraining_queued", "runs", "Retraining runs queued by MLMultiScaleDriftWorker.");
+        MLMultiScaleRetrainCooldownSkipped = _meter.CreateCounter<long>("trading.ml.multiscale.retrain_cooldown_skipped", "decisions", "Multi-scale retrain attempts suppressed by cooldown window.");
+        MLMultiScaleLockAttempts = _meter.CreateCounter<long>("trading.ml.multiscale.lock_attempts", "cycles", "Distributed-lock attempts by MLMultiScaleDriftWorker.");
+        MLMultiScaleCyclesSkipped = _meter.CreateCounter<long>("trading.ml.multiscale.cycles_skipped", "cycles", "MLMultiScaleDriftWorker cycles skipped, tagged by reason.");
+        MLMultiScaleAlertsDispatched = _meter.CreateCounter<long>("trading.ml.multiscale.alerts_dispatched", "alerts", "Multi-scale drift alerts dispatched (post-dedupe).");
+        MLMultiScaleCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.multiscale.cycle_duration_ms", "ms", "MLMultiScaleDriftWorker cycle duration.");
+        MLMultiScaleTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.multiscale.time_since_last_success_seconds", "s", "Seconds since last successful MLMultiScaleDriftWorker cycle.");
+        MLDriftMonitorLockAttempts = _meter.CreateCounter<long>("trading.ml.drift_monitor.lock_attempts", "cycles", "Distributed-lock attempts by MLDriftMonitorWorker.");
+        MLDriftMonitorCyclesSkipped = _meter.CreateCounter<long>("trading.ml.drift_monitor.cycles_skipped", "cycles", "MLDriftMonitorWorker cycles skipped, tagged by reason.");
+        MLDriftMonitorCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.drift_monitor.cycle_duration_ms", "ms", "MLDriftMonitorWorker cycle duration.");
+        MLAdwinCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.adwin.cycle_duration_ms", "ms", "MLAdwinDriftWorker cycle duration.");
+        MLAdaptiveThresholdModelsEvaluated = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_evaluated", "models", "ML models evaluated by MLAdaptiveThresholdWorker.");
+        MLAdaptiveThresholdModelsUpdated = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_updated", "models", "ML models whose adaptive-threshold snapshot was updated.");
+        MLAdaptiveThresholdModelsSkipped = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_skipped", "models", "ML models skipped by MLAdaptiveThresholdWorker, tagged by reason.");
+        MLAdaptiveThresholdRegimeThresholdsPruned = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.regime_thresholds_pruned", "thresholds", "Stale or invalid regime-specific thresholds removed by MLAdaptiveThresholdWorker.");
+        MLAdaptiveThresholdLockAttempts = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.lock_attempts", "cycles", "Distributed-lock attempts by MLAdaptiveThresholdWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLAdaptiveThresholdCyclesSkipped = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.cycles_skipped", "cycles", "MLAdaptiveThresholdWorker cycles skipped without processing, tagged by reason={disabled|lock_busy}.");
+        MLAdaptiveThresholdAppliedDrift = _meter.CreateHistogram<double>("trading.ml.adaptive_threshold.applied_drift", "threshold", "Absolute threshold drift applied by MLAdaptiveThresholdWorker, tagged by scope={global|regime}.");
+        MLAdaptiveThresholdCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.adaptive_threshold.cycle_duration_ms", "ms", "MLAdaptiveThresholdWorker cycle duration.");
+        MLAlertFatigueEvaluations = _meter.CreateCounter<long>("trading.ml.alert_fatigue.evaluations", "cycles", "MLAlertFatigueWorker evaluation cycles that processed a recent ML degradation alert window.");
+        MLAlertFatigueAlertTransitions = _meter.CreateCounter<long>("trading.ml.alert_fatigue.alert_transitions", "alerts", "ML alert-fatigue alert transitions, tagged by transition={dispatched|resolved}.");
+        MLAlertFatigueLockAttempts = _meter.CreateCounter<long>("trading.ml.alert_fatigue.lock_attempts", "cycles", "Distributed-lock attempts by MLAlertFatigueWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLAlertFatigueCyclesSkipped = _meter.CreateCounter<long>("trading.ml.alert_fatigue.cycles_skipped", "cycles", "MLAlertFatigueWorker cycles skipped without processing, tagged by reason={disabled|lock_busy}.");
+        MLAlertFatigueTriggeredAlerts = _meter.CreateHistogram<double>("trading.ml.alert_fatigue.triggered_alerts", "alerts", "Recently triggered ML degradation alerts inside the fatigue analysis window.");
+        MLAlertFatigueActiveAlerts = _meter.CreateHistogram<double>("trading.ml.alert_fatigue.active_alerts", "alerts", "Recent ML degradation alerts still active inside the fatigue analysis window.");
+        MLAlertFatigueRemediatedRatio = _meter.CreateHistogram<double>("trading.ml.alert_fatigue.remediated_ratio", "ratio", "Remediated / triggered ratio for recent ML degradation alerts.");
+        MLAlertFatigueCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.alert_fatigue.cycle_duration_ms", "ms", "MLAlertFatigueWorker cycle duration.");
+        MLCausalFeatureModelsEvaluated = _meter.CreateCounter<long>("trading.ml.causal_feature.models_evaluated", "models", "Active ML models evaluated by MLCausalFeatureWorker.");
+        MLCausalFeatureModelsSkipped = _meter.CreateCounter<long>("trading.ml.causal_feature.models_skipped", "models", "Active ML models skipped by MLCausalFeatureWorker. Tagged with reason.");
+        MLCausalFeatureAuditsWritten = _meter.CreateCounter<long>("trading.ml.causal_feature.audits_written", "audits", "MLCausalFeatureAudit rows written by MLCausalFeatureWorker.");
+        MLCausalFeatureLockAttempts = _meter.CreateCounter<long>("trading.ml.causal_feature.lock_attempts", "cycles", "Distributed-lock attempts by MLCausalFeatureWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLCausalFeatureCyclesSkipped = _meter.CreateCounter<long>("trading.ml.causal_feature.cycles_skipped", "cycles", "MLCausalFeatureWorker cycles skipped without processing, tagged by reason={disabled|lock_busy|no_active_models}.");
+        MLCausalFeatureCausalFeatures = _meter.CreateHistogram<double>("trading.ml.causal_feature.causal_features", "features", "Count of features classified as Granger-causal in a single MLCausalFeatureWorker audit.");
+        MLCausalFeatureResolvedSamples = _meter.CreateHistogram<double>("trading.ml.causal_feature.resolved_samples", "samples", "Resolved prediction-log rows contributing to a single MLCausalFeatureWorker audit.");
+        MLCausalFeatureCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.causal_feature.cycle_duration_ms", "ms", "MLCausalFeatureWorker cycle duration.");
+        MLCalibrationMonitorModelsEvaluated = _meter.CreateCounter<long>("trading.ml.calibration_monitor.models_evaluated", "models", "Active ML models evaluated by MLCalibrationMonitorWorker. Tagged with state={healthy|warning|critical}.");
+        MLCalibrationMonitorModelsSkipped = _meter.CreateCounter<long>("trading.ml.calibration_monitor.models_skipped", "models", "Active ML models skipped by MLCalibrationMonitorWorker. Tagged with reason.");
+        MLCalibrationMonitorAlertsDispatched = _meter.CreateCounter<long>("trading.ml.calibration_monitor.alerts_dispatched", "alerts", "Calibration-monitor alerts dispatched successfully. Tagged with state={warning|critical}.");
+        MLCalibrationMonitorAlertTransitions = _meter.CreateCounter<long>("trading.ml.calibration_monitor.alert_transitions", "alerts", "Calibration-monitor alert transitions, tagged with transition={dispatched|resolved}.");
+        MLCalibrationMonitorRetrainingQueued = _meter.CreateCounter<long>("trading.ml.calibration_monitor.retraining_queued", "runs", "Auto-degrading retraining runs queued by MLCalibrationMonitorWorker.");
+        MLCalibrationMonitorLockAttempts = _meter.CreateCounter<long>("trading.ml.calibration_monitor.lock_attempts", "cycles", "Distributed-lock attempts by MLCalibrationMonitorWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLCalibrationMonitorCyclesSkipped = _meter.CreateCounter<long>("trading.ml.calibration_monitor.cycles_skipped", "cycles", "MLCalibrationMonitorWorker cycles skipped without processing, tagged by reason={disabled|lock_busy|no_active_models}.");
+        MLCalibrationMonitorCurrentEce = _meter.CreateHistogram<double>("trading.ml.calibration_monitor.current_ece", "ece", "Live Expected Calibration Error recorded by MLCalibrationMonitorWorker. Tagged with state={healthy|warning|critical}.");
+        MLCalibrationMonitorEceDelta = _meter.CreateHistogram<double>("trading.ml.calibration_monitor.ece_delta", "ece", "ECE delta recorded by MLCalibrationMonitorWorker. Tagged with source={trend|baseline}.");
+        MLCalibrationMonitorResolvedSamples = _meter.CreateHistogram<double>("trading.ml.calibration_monitor.resolved_samples", "samples", "Resolved prediction count contributing to a single MLCalibrationMonitorWorker evaluation.");
+        MLCalibrationMonitorCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.calibration_monitor.cycle_duration_ms", "ms", "MLCalibrationMonitorWorker cycle duration.");
+        MLCalibratedEdgeModelsEvaluated = _meter.CreateCounter<long>("trading.ml.calibrated_edge.models_evaluated", "models", "Active ML models evaluated by MLCalibratedEdgeWorker. Tagged with state={healthy|warning|critical}.");
+        MLCalibratedEdgeModelsSkipped = _meter.CreateCounter<long>("trading.ml.calibrated_edge.models_skipped", "models", "Active ML models skipped by MLCalibratedEdgeWorker. Tagged with reason.");
+        MLCalibratedEdgeAlertsDispatched = _meter.CreateCounter<long>("trading.ml.calibrated_edge.alerts_dispatched", "alerts", "Calibrated-edge degradation alerts dispatched successfully. Tagged with state={warning|critical}.");
+        MLCalibratedEdgeAlertTransitions = _meter.CreateCounter<long>("trading.ml.calibrated_edge.alert_transitions", "alerts", "Calibrated-edge alert transitions, tagged with transition={dispatched|resolved}.");
+        MLCalibratedEdgeRetrainingQueued = _meter.CreateCounter<long>("trading.ml.calibrated_edge.retraining_queued", "runs", "Auto-degrading retraining runs queued by MLCalibratedEdgeWorker.");
+        MLCalibratedEdgeLockAttempts = _meter.CreateCounter<long>("trading.ml.calibrated_edge.lock_attempts", "cycles", "Distributed-lock attempts by MLCalibratedEdgeWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLCalibratedEdgeCyclesSkipped = _meter.CreateCounter<long>("trading.ml.calibrated_edge.cycles_skipped", "cycles", "MLCalibratedEdgeWorker cycles skipped without processing, tagged by reason={disabled|lock_busy|no_active_models}.");
+        MLCalibratedEdgeExpectedValuePips = _meter.CreateHistogram<double>("trading.ml.calibrated_edge.expected_value_pips", "pips", "Live realized calibrated edge recorded by MLCalibratedEdgeWorker. Tagged with state={healthy|warning|critical}.");
+        MLCalibratedEdgeResolvedSamples = _meter.CreateHistogram<double>("trading.ml.calibrated_edge.resolved_samples", "samples", "Informative resolved prediction-log count contributing to one calibrated-edge evaluation.");
+        MLCalibratedEdgeCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.calibrated_edge.cycle_duration_ms", "ms", "MLCalibratedEdgeWorker cycle duration.");
+        MLAverageWeightInitSourceModelsEvaluated = _meter.CreateCounter<long>("trading.ml.avg_weight_init.source_models_evaluated", "models", "Qualified source models evaluated by MLAverageWeightInitWorker.");
+        MLAverageWeightInitInitializersWritten = _meter.CreateCounter<long>("trading.ml.avg_weight_init.initializers_written", "models", "Average-weight initializer models written by MLAverageWeightInitWorker.");
+        MLAverageWeightInitInitializersSkipped = _meter.CreateCounter<long>("trading.ml.avg_weight_init.initializers_skipped", "initializers", "Average-weight initializer candidates skipped by MLAverageWeightInitWorker, tagged by reason.");
+        MLAverageWeightInitLockAttempts = _meter.CreateCounter<long>("trading.ml.avg_weight_init.lock_attempts", "cycles", "Distributed-lock attempts by MLAverageWeightInitWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLAverageWeightInitCyclesSkipped = _meter.CreateCounter<long>("trading.ml.avg_weight_init.cycles_skipped", "cycles", "MLAverageWeightInitWorker cycles skipped without processing, tagged by reason={disabled|lock_busy|no_qualified_sources|no_compatible_sources|no_initializer_clusters}.");
+        MLAverageWeightInitSourceModelsPerInitializer = _meter.CreateHistogram<double>("trading.ml.avg_weight_init.source_models_per_initializer", "models", "Compatible source model count used for a single average-weight initializer.");
+        MLAverageWeightInitCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.avg_weight_init.cycle_duration_ms", "ms", "MLAverageWeightInitWorker cycle duration.");
+        MLArchitectureRotationContextsEvaluated = _meter.CreateCounter<long>("trading.ml.architecture_rotation.contexts_evaluated", "contexts", "Active symbol/timeframe contexts evaluated by MLArchitectureRotationWorker.");
+        MLArchitectureRotationRunsQueued = _meter.CreateCounter<long>("trading.ml.architecture_rotation.runs_queued", "runs", "Scheduled rotation training runs queued by MLArchitectureRotationWorker.");
+        MLArchitectureRotationArchitecturesSkipped = _meter.CreateCounter<long>("trading.ml.architecture_rotation.architectures_skipped", "architectures", "Architecture evaluation skips inside MLArchitectureRotationWorker, tagged by reason.");
+        MLArchitectureRotationLockAttempts = _meter.CreateCounter<long>("trading.ml.architecture_rotation.lock_attempts", "cycles", "Distributed-lock attempts by MLArchitectureRotationWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLArchitectureRotationCyclesSkipped = _meter.CreateCounter<long>("trading.ml.architecture_rotation.cycles_skipped", "cycles", "MLArchitectureRotationWorker cycles skipped without processing, tagged by reason={disabled|lock_busy|no_active_contexts|no_eligible_architectures}.");
+        MLArchitectureRotationQueuedRunsPerCycle = _meter.CreateHistogram<double>("trading.ml.architecture_rotation.queued_runs_per_cycle", "runs", "Rotation training runs queued in a single MLArchitectureRotationWorker cycle.");
+        MLArchitectureRotationCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.architecture_rotation.cycle_duration_ms", "ms", "MLArchitectureRotationWorker cycle duration.");
+        MLConformalCalibrationModelsEvaluated = _meter.CreateCounter<long>("trading.ml.conformal_calibration.models_evaluated", "models", "Active ML models evaluated by MLConformalCalibrationWorker.");
+        MLConformalCalibrationModelsSkipped = _meter.CreateCounter<long>("trading.ml.conformal_calibration.models_skipped", "models", "ML models skipped by MLConformalCalibrationWorker, tagged by reason.");
+        MLConformalCalibrationWritten = _meter.CreateCounter<long>("trading.ml.conformal_calibration.written", "calibrations", "Persisted conformal calibration rows written by MLConformalCalibrationWorker.");
+        MLConformalCalibrationLockAttempts = _meter.CreateCounter<long>("trading.ml.conformal_calibration.lock_attempts", "cycles", "Distributed-lock attempts by MLConformalCalibrationWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLConformalCalibrationCyclesSkipped = _meter.CreateCounter<long>("trading.ml.conformal_calibration.cycles_skipped", "cycles", "MLConformalCalibrationWorker cycles skipped without processing, tagged by reason={lock_busy|no_candidate_models}.");
+        MLConformalCalibrationSamples = _meter.CreateHistogram<double>("trading.ml.conformal_calibration.samples", "samples", "Resolved prediction logs used for one conformal calibration.");
+        MLConformalCalibrationEmpiricalCoverage = _meter.CreateHistogram<double>("trading.ml.conformal_calibration.empirical_coverage", "ratio", "Empirical coverage observed on the calibration evidence set.");
+        MLConformalCalibrationAmbiguousRate = _meter.CreateHistogram<double>("trading.ml.conformal_calibration.ambiguous_rate", "ratio", "Share of calibration evidence whose conformal set would include both Buy and Sell.");
+        MLConformalCalibrationCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.conformal_calibration.cycle_duration_ms", "ms", "MLConformalCalibrationWorker cycle duration.");
         MLConformalBreakerModelsEvaluated = _meter.CreateCounter<long>("trading.ml.conformal_breaker.models_evaluated", "models", "Active ML models evaluated by the conformal breaker");
         MLConformalBreakerModelsSkipped = _meter.CreateCounter<long>("trading.ml.conformal_breaker.models_skipped", "models", "ML models skipped by the conformal breaker, tagged by reason");
         MLConformalBreakerTrips = _meter.CreateCounter<long>("trading.ml.conformal_breaker.trips", "breakers", "Conformal breaker suppressions, tagged by trip reason");
@@ -474,9 +720,11 @@ public sealed class TradingMetrics
         MLConformalBreakerDuplicateRepairs = _meter.CreateCounter<long>("trading.ml.conformal_breaker.duplicate_repairs", "breakers", "Duplicate active conformal breaker rows deactivated by repair logic");
         MLConformalBreakerAlertsDispatched = _meter.CreateCounter<long>("trading.ml.conformal_breaker.alerts_dispatched", "alerts", "Conformal breaker alerts dispatched successfully");
         MLConformalBreakerAlertDispatchFailures = _meter.CreateCounter<long>("trading.ml.conformal_breaker.alert_dispatch_failures", "alerts", "Conformal breaker alert dispatch failures after state persistence");
+        MLConformalBreakerCyclesSkipped = _meter.CreateCounter<long>("trading.ml.conformal_breaker.cycles_skipped", "cycles", "Conformal breaker cycles skipped without processing, tagged by reason={lock_busy|no_active_models}.");
         MLConformalBreakerThresholdMismatchRate = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.threshold_mismatch_rate", "ratio", "Share of evaluated logs whose served conformal threshold differs from the current calibration threshold");
         MLConformalBreakerEmpiricalCoverage = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.empirical_coverage", "ratio", "Empirical conformal coverage observed by the breaker");
         MLConformalBreakerActive = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.active", "breakers", "Active conformal breaker count");
+        MLConformalBreakerCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.cycle_duration_ms", "ms", "MLConformalBreakerWorker cycle duration.");
         MLCorrelatedFailureModelsEvaluated = _meter.CreateCounter<long>("trading.ml.correlated_failure.models_evaluated", "models", "Active ML models with enough outcomes evaluated for systemic correlated failure");
         MLCorrelatedFailureModelsFailing = _meter.CreateCounter<long>("trading.ml.correlated_failure.models_failing", "models", "Evaluated ML models below the configured drift accuracy threshold");
         MLCorrelatedFailureModelsSkipped = _meter.CreateCounter<long>("trading.ml.correlated_failure.models_skipped", "models", "Active ML models skipped by correlated failure evaluation, tagged by reason");
@@ -484,8 +732,17 @@ public sealed class TradingMetrics
         MLCorrelatedFailurePauseRecoveries = _meter.CreateCounter<long>("trading.ml.correlated_failure.pause_recoveries", "recoveries", "Systemic ML training pause recoveries");
         MLCorrelatedFailureLockAttempts = _meter.CreateCounter<long>("trading.ml.correlated_failure.lock_attempts", "cycles", "Correlated failure distributed-lock attempts, tagged by outcome=acquired|busy|unavailable");
         MLCorrelatedFailureCooldownSkips = _meter.CreateCounter<long>("trading.ml.correlated_failure.cooldown_skips", "cycles", "Correlated failure state changes skipped because the state-change cooldown is active");
+        MLCorrelatedFailureCyclesSkipped = _meter.CreateCounter<long>("trading.ml.correlated_failure.cycles_skipped", "cycles", "Correlated failure cycles skipped without state evaluation or state change, tagged by reason");
         MLCorrelatedFailureRatio = _meter.CreateHistogram<double>("trading.ml.correlated_failure.failure_ratio", "ratio", "Share of evaluated ML models classified as failing");
         MLCorrelatedFailureAffectedSymbols = _meter.CreateHistogram<double>("trading.ml.correlated_failure.affected_symbols", "symbols", "Number of distinct symbols affected by failing ML models");
+        MLCorrelatedFailureCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.correlated_failure.cycle_duration_ms", "ms", "MLCorrelatedFailureWorker cycle duration");
+        MLCorrelatedSignalConflictConflictsDetected = _meter.CreateCounter<long>("trading.ml.correlated_signal_conflict.conflicts_detected", "conflicts", "Correlated approved-signal conflicts detected across configured pairs");
+        MLCorrelatedSignalConflictAlertsUpserted = _meter.CreateCounter<long>("trading.ml.correlated_signal_conflict.alerts_upserted", "alerts", "Pair-specific correlated signal conflict alerts created or refreshed");
+        MLCorrelatedSignalConflictAlertsResolved = _meter.CreateCounter<long>("trading.ml.correlated_signal_conflict.alerts_resolved", "alerts", "Pair-specific correlated signal conflict alerts auto-resolved after conflicts cleared");
+        MLCorrelatedSignalConflictSignalsRejected = _meter.CreateCounter<long>("trading.ml.correlated_signal_conflict.signals_rejected", "signals", "Approved, not-yet-ordered signals rejected because they were part of a correlated conflict");
+        MLCorrelatedSignalConflictCyclesSkipped = _meter.CreateCounter<long>("trading.ml.correlated_signal_conflict.cycles_skipped", "cycles", "Correlated signal conflict cycles skipped, tagged by reason");
+        MLCorrelatedSignalConflictLockAttempts = _meter.CreateCounter<long>("trading.ml.correlated_signal_conflict.lock_attempts", "cycles", "Correlated signal conflict distributed-lock attempts, tagged by outcome=acquired|busy|unavailable");
+        MLCorrelatedSignalConflictCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.correlated_signal_conflict.cycle_duration_ms", "ms", "MLCorrelatedSignalConflictWorker cycle duration");
         MLErgodicityModelsEvaluated = _meter.CreateCounter<long>("trading.ml.ergodicity.models_evaluated", "models", "Active ML models with enough resolved outcomes evaluated for ergodicity economics");
         MLErgodicityModelsSkipped = _meter.CreateCounter<long>("trading.ml.ergodicity.models_skipped", "models", "Active ML models skipped by ergodicity evaluation, tagged by reason");
         MLErgodicityLogsWritten = _meter.CreateCounter<long>("trading.ml.ergodicity.logs_written", "logs", "MLErgodicityLog rows written");
@@ -819,6 +1076,7 @@ public sealed class TradingMetrics
         StrategyGenFeedbackBoosted         = _meter.CreateCounter<long>("trading.strategy_generation.feedback_boosted", "candidates", "Candidates boosted or penalised by performance feedback");
         StrategyGenMonteCarloRejected      = _meter.CreateCounter<long>("trading.strategy_generation.monte_carlo_rejected", "candidates", "Candidates rejected by Monte Carlo permutation significance test");
         StrategyGenPortfolioDrawdownFiltered = _meter.CreateCounter<long>("trading.strategy_generation.portfolio_drawdown_filtered", "candidates", "Candidates removed by portfolio-level correlated drawdown check");
+        StrategyGenPortfolioExposureFiltered = _meter.CreateCounter<long>("trading.strategy_generation.portfolio_exposure_filtered", "candidates", "Candidates removed by portfolio symbol/currency exposure capacity checks");
         StrategyGenAdaptiveThresholdsApplied = _meter.CreateCounter<long>("trading.strategy_generation.adaptive_thresholds_applied", "cycles", "Cycles where adaptive threshold calibration was applied");
         StrategyGenWeekendSkipped            = _meter.CreateCounter<long>("trading.strategy_generation.weekend_skipped", "cycles", "Cycles skipped because of weekend/holiday");
         StrategyGenOosDrawdownDegraded       = _meter.CreateCounter<long>("trading.strategy_generation.oos_drawdown_degraded", "candidates", "Candidates rejected for OOS drawdown degradation");

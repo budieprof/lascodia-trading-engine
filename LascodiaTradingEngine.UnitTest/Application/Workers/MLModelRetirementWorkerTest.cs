@@ -77,6 +77,12 @@ public class MLModelRetirementWorkerTest
         _mockReadDbContext.Setup(c => c.Set<Alert>()).Returns(mockSet.Object);
     }
 
+    private void SetupDriftFlags(List<MLDriftFlag> flags)
+    {
+        var mockSet = flags.AsQueryable().BuildMockDbSet();
+        _mockReadDbContext.Setup(c => c.Set<MLDriftFlag>()).Returns(mockSet.Object);
+    }
+
     private void SetupWriteContext(List<MLModel> models, List<Alert> alerts)
     {
         var writeModelSet = models.AsQueryable().BuildMockDbSet();
@@ -118,6 +124,7 @@ public class MLModelRetirementWorkerTest
         SetupEngineConfigs(new List<EngineConfig>());
         SetupEwmaAccuracies(new List<MLModelEwmaAccuracy>());
         SetupAlerts(new List<Alert>());
+        SetupDriftFlags(new List<MLDriftFlag>());
         SetupWriteContext(new List<MLModel>(), new List<Alert>());
 
         // Act
@@ -151,6 +158,7 @@ public class MLModelRetirementWorkerTest
         SetupEngineConfigs(new List<EngineConfig>());
         SetupEwmaAccuracies(new List<MLModelEwmaAccuracy>());
         SetupAlerts(new List<Alert>());
+        SetupDriftFlags(new List<MLDriftFlag>());
         SetupWriteContext(new List<MLModel> { suppressedModel }, new List<Alert>());
 
         // Act
@@ -193,6 +201,7 @@ public class MLModelRetirementWorkerTest
         SetupEngineConfigs(new List<EngineConfig>()); // no cooldown, no ADWIN
         SetupEwmaAccuracies(new List<MLModelEwmaAccuracy> { ewmaRow });
         SetupAlerts(new List<Alert>());
+        SetupDriftFlags(new List<MLDriftFlag>());
         SetupWriteContext(new List<MLModel> { model }, new List<Alert>());
 
         // Act
@@ -242,6 +251,7 @@ public class MLModelRetirementWorkerTest
         SetupEngineConfigs(new List<EngineConfig> { cooldownConfig });
         SetupEwmaAccuracies(new List<MLModelEwmaAccuracy> { ewmaRow });
         SetupAlerts(new List<Alert>());
+        SetupDriftFlags(new List<MLDriftFlag>());
         SetupWriteContext(new List<MLModel> { model }, new List<Alert>());
 
         // Act
@@ -278,17 +288,24 @@ public class MLModelRetirementWorkerTest
             EwmaAccuracy = 0.60 // above threshold — not a signal
         };
 
-        var adwinConfig = new EngineConfig
+        var adwinFlag = new MLDriftFlag
         {
-            Id    = 1,
-            Key   = "MLDrift:GBPUSD:H1:AdwinDriftDetected",
-            Value = DateTime.UtcNow.AddHours(24).ToString("O") // future — drift active
+            Id            = 1,
+            Symbol        = "GBPUSD",
+            Timeframe     = Timeframe.H1,
+            DetectorType  = "AdwinDrift",
+            ExpiresAtUtc  = DateTime.UtcNow.AddHours(24), // future — drift active
+            FirstDetectedAtUtc = DateTime.UtcNow.AddHours(-1),
+            LastRefreshedAtUtc = DateTime.UtcNow,
+            ConsecutiveDetections = 1,
+            IsDeleted     = false
         };
 
         SetupModels(new List<MLModel> { model });
-        SetupEngineConfigs(new List<EngineConfig> { adwinConfig });
+        SetupEngineConfigs(new List<EngineConfig>());
         SetupEwmaAccuracies(new List<MLModelEwmaAccuracy> { ewmaRow });
         SetupAlerts(new List<Alert>());
+        SetupDriftFlags(new List<MLDriftFlag> { adwinFlag });
         SetupWriteContext(new List<MLModel> { model }, new List<Alert>());
 
         // Act
@@ -337,6 +354,7 @@ public class MLModelRetirementWorkerTest
         SetupEngineConfigs(new List<EngineConfig> { cooldownConfig });
         SetupEwmaAccuracies(new List<MLModelEwmaAccuracy> { ewmaRow });
         SetupAlerts(new List<Alert>()); // no existing alert — so a new one should be created
+        SetupDriftFlags(new List<MLDriftFlag>());
         SetupWriteContext(new List<MLModel> { model }, new List<Alert>());
 
         // Act

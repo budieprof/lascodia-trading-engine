@@ -25,9 +25,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///         is below <c>CriticalEwmaThreshold</c> (default 0.48).</item>
 ///   <item><b>Live accuracy degraded</b> — <see cref="MLModel.LiveDirectionAccuracy"/>
 ///         is non-null and below <c>LiveAccuracyFloor</c> (default 0.48).</item>
-///   <item><b>ADWIN drift detected</b> — <c>MLDrift:{Symbol}:{Tf}:AdwinDriftDetected</c>
-///         config key holds a future expiry timestamp, set by <see cref="MLAdwinDriftWorker"/>
-///         when a statistically significant accuracy shift is detected.</item>
+///   <item><b>ADWIN drift detected</b> — an <see cref="MLDriftFlag"/> row with
+///         <c>DetectorType = "AdwinDrift"</c> and a future <c>ExpiresAtUtc</c>, written by
+///         <see cref="MLAdwinDriftWorker"/> when a statistically significant accuracy
+///         shift is detected.</item>
 /// </list>
 ///
 /// When ≥ <c>SignalsRequired</c> (default 2) of these 4 signals are simultaneously
@@ -201,8 +202,8 @@ public sealed class MLModelRetirementWorker : BackgroundService
     ///   <item>
     ///     <b>ADWIN drift detected (Signal 4):</b> The <see cref="MLAdwinDriftWorker"/> has
     ///     detected a statistically significant accuracy shift via adaptive windowing.
-    ///     The flag is stored as an expiring timestamp in
-    ///     <c>MLDrift:{Symbol}:{Timeframe}:AdwinDriftDetected</c> (48-hour TTL).
+    ///     The flag is stored as an <see cref="MLDriftFlag"/> row keyed by
+    ///     (Symbol, Timeframe, DetectorType="AdwinDrift") with a 48-hour TTL.
     ///   </item>
     /// </list>
     ///
@@ -277,23 +278,22 @@ public sealed class MLModelRetirementWorker : BackgroundService
                 $"live_accuracy_degraded ({liveDirectionAccuracy.Value:P2} < {liveAccuracyFloor:P2})");
         }
 
-        // ── Signal 4: ADWIN drift detected ────��──────────────────────────────
-        // MLAdwinDriftWorker writes a timestamped flag when it detects a statistically
-        // significant accuracy shift via adaptive windowing. The flag expires after
-        // 48 hours if ADWIN does not re-detect drift on the next run.
-        var adwinKey   = $"MLDrift:{symbol}:{timeframe}:AdwinDriftDetected";
-        var adwinEntry = await readCtx.Set<EngineConfig>()
+        // ── Signal 4: ADWIN drift detected ────────────────────────────────────
+        // MLAdwinDriftWorker writes a typed MLDriftFlag row when it detects a
+        // statistically significant accuracy shift via adaptive windowing. The flag
+        // expires after 48 hours if ADWIN does not re-detect drift on the next run.
+        var adwinFlag = await readCtx.Set<MLDriftFlag>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == adwinKey, ct);
+            .Where(f =>
+                f.Symbol == symbol &&
+                f.Timeframe == timeframe &&
+                f.DetectorType == "AdwinDrift")
+            .Select(f => new { f.ExpiresAtUtc })
+            .FirstOrDefaultAsync(ct);
 
-        if (adwinEntry?.Value is not null &&
-            DateTime.TryParse(adwinEntry.Value,
-                System.Globalization.CultureInfo.InvariantCulture,
-                System.Globalization.DateTimeStyles.RoundtripKind,
-                out var adwinExpiry) &&
-            now < adwinExpiry)
+        if (adwinFlag is not null && now < adwinFlag.ExpiresAtUtc)
         {
-            activeSignals.Add($"adwin_drift_detected (expires {adwinExpiry:HH:mm} UTC)");
+            activeSignals.Add($"adwin_drift_detected (expires {adwinFlag.ExpiresAtUtc:HH:mm} UTC)");
         }
 
         int signalCount = activeSignals.Count;

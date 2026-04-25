@@ -52,5 +52,15 @@ public enum AlertType
     /// <c>BrokerPnLReconciliationWorker</c>. Distinct from <see cref="DataQualityIssue"/>
     /// because the data is trustworthy — the engine's bookkeeping is not.
     /// </summary>
-    BrokerReconciliation = 13
+    BrokerReconciliation = 13,
+
+    /// <summary>
+    /// An ML monitoring pipeline cannot evaluate a model — typically because no
+    /// informative prediction logs are reaching the worker. Distinct from
+    /// <see cref="MLModelDegraded"/> because the model itself may be fine; the
+    /// problem is upstream in logging, serving, or model lifecycle. Operator
+    /// response: investigate the prediction-logging pipeline or confirm the model
+    /// is still meant to be served.
+    /// </summary>
+    MLMonitoringStale = 14
 }

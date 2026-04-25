@@ -36,9 +36,10 @@ internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtif
         BacktestResult trainResult,
         BacktestResult oosResult,
         double? r2,
-        double pValue,
-        double shufflePValue,
+        double? pValue,
+        double? shufflePValue,
         int walkForwardPassed,
+        int? walkForwardRequiredForScore,
         int walkForwardMask,
         double maxConcentration,
         MarketRegimeEnum targetRegime,
@@ -52,7 +53,23 @@ internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtif
         HaircutRatios? appliedHaircuts,
         IReadOnlyList<ScreeningGateTrace> gateTrace,
         DateTime screenedAtUtc)
-        => new()
+    {
+        double rawQualityScore = ScreeningQualityScorer.ComputeScore(
+            trainResult,
+            oosResult,
+            r2,
+            walkForwardPassed,
+            walkForwardRequiredForScore,
+            pValue,
+            shufflePValue,
+            maxConcentration,
+            marginalSharpeContribution,
+            kellySharpe,
+            fixedLotSharpe);
+        double qualityCalibrationMultiplier = ScreeningQualityScorer.ComputeCalibrationMultiplier(appliedHaircuts);
+        double qualityScore = ScreeningQualityScorer.ApplyCalibration(rawQualityScore, qualityCalibrationMultiplier);
+
+        return new()
         {
             IsWinRate = (double)trainResult.WinRate,
             IsProfitFactor = (double)trainResult.ProfitFactor,
@@ -65,8 +82,8 @@ internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtif
             OosMaxDrawdownPct = (double)oosResult.MaxDrawdownPct,
             OosTotalTrades = oosResult.TotalTrades,
             EquityCurveR2 = r2 ?? -1.0,
-            MonteCarloPValue = pValue,
-            ShufflePValue = shufflePValue,
+            MonteCarloPValue = pValue ?? -1.0,
+            ShufflePValue = shufflePValue ?? -1.0,
             WalkForwardWindowsPassed = walkForwardPassed,
             WalkForwardWindowsMask = walkForwardMask,
             MaxTradeTimeConcentration = maxConcentration,
@@ -84,8 +101,15 @@ internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtif
             ProfitFactorHaircutApplied = appliedHaircuts?.ProfitFactorHaircut ?? 1.0,
             SharpeHaircutApplied = appliedHaircuts?.SharpeHaircut ?? 1.0,
             DrawdownInflationApplied = appliedHaircuts?.DrawdownInflation ?? 1.0,
+            QualityScore = qualityScore,
+            QualityScoreRaw = rawQualityScore,
+            QualityCalibrationMultiplier = qualityCalibrationMultiplier,
+            QualityCalibrationSampleCount = appliedHaircuts?.SampleCount ?? 0,
+            QualityBand = ScreeningQualityScorer.ComputeBand(qualityScore),
+            IsNearMiss = false,
             GateTrace = gateTrace.ToList(),
         };
+    }
 
     public Strategy BuildStrategy(
         StrategyType strategyType,

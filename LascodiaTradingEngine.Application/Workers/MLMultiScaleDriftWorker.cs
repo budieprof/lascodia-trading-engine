@@ -1,187 +1,348 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Services.Alerts;
+using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using LascodiaTradingEngine.Application.Common.Interfaces;
-using LascodiaTradingEngine.Domain.Entities;
-using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Detects two qualitatively different forms of ML model degradation by computing
-/// direction accuracy over two rolling windows simultaneously and comparing them.
-///
-/// <para>
-/// <b>Where it sits in the ML monitoring pipeline:</b><br/>
-/// Most drift detectors operate on a single time scale. The key insight of this worker
-/// is that different types of drift have different temporal signatures:
-/// <list type="bullet">
-///   <item>
-///     <b>Sudden drift</b> (regime change, data pipeline fault, feature distribution flip):
-///     Short-window accuracy collapses much faster than the long-window average. The long window
-///     still contains many "good" predictions from before the break, masking the degradation
-///     if only a single window is used.
-///   </item>
-///   <item>
-///     <b>Gradual drift</b> (slow concept drift, regime shift over weeks):
-///     Both windows fall together, slowly, below an absolute accuracy floor. Neither the
-///     short-window spike nor the short-long gap alone reveals this — it is only visible when
-///     the long-window average eventually crosses a minimum acceptable threshold.
-///   </item>
-/// </list>
-/// This worker is complementary to the other drift detectors:
-/// <list type="bullet">
-///   <item><c>MLDriftMonitorWorker</c> — single-window accuracy, Brier score, ensemble disagreement.</item>
-///   <item><see cref="MLCusumDriftWorker"/> — CUSUM sequential test; optimal for step changes.</item>
-///   <item><see cref="MLAdwinDriftWorker"/> — ADWIN adaptive windowing; no fixed window required.</item>
-///   <item><see cref="MLPeltChangePointWorker"/> — globally optimal multiple change-point detection.</item>
-///   <item><see cref="MLStructuralBreakWorker"/> — Bai-Perron structural break test.</item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Sudden drift detection logic:</b><br/>
-/// <c>gap = shortAccuracy − longAccuracy</c><br/>
-/// Fires when <c>gap &lt; −ShortLongAccuracyGap</c> (default −0.07, i.e., a 7-percentage-point drop).<br/>
-/// Severity: <c>critical</c>. Queues an immediate retrain and creates an urgent alert.
-/// </para>
-///
-/// <para>
-/// <b>Gradual drift detection logic:</b><br/>
-/// Fires when <c>longAccuracy &lt; LongWindowFloor</c> (default 0.50, i.e., model is no better than random).<br/>
-/// Sudden drift takes precedence; gradual drift is only evaluated if sudden drift was not detected.<br/>
-/// Severity: <c>standard</c>. Queues a retrain with <c>TriggerType.AutoDegrading</c>.
-/// </para>
-///
-/// <para>
-/// <b>Configuration keys (stored in <see cref="EngineConfig"/> table):</b>
-/// <list type="table">
-///   <listheader><term>Key</term><description>Default / Description</description></listheader>
-///   <item><term><c>MLMultiScaleDrift:PollIntervalSeconds</c></term><description>1800 — poll every 30 minutes.</description></item>
-///   <item><term><c>MLMultiScaleDrift:ShortWindowDays</c></term><description>3 — recent window in days (fast signal).</description></item>
-///   <item><term><c>MLMultiScaleDrift:LongWindowDays</c></term><description>21 — baseline window in days (slow signal, ~1 month).</description></item>
-///   <item><term><c>MLMultiScaleDrift:MinPredictions</c></term><description>20 — minimum resolved predictions in the long window to run the check.</description></item>
-///   <item><term><c>MLMultiScaleDrift:ShortLongAccuracyGap</c></term><description>0.07 — sudden-drift trigger threshold (7% accuracy gap).</description></item>
-///   <item><term><c>MLMultiScaleDrift:LongWindowFloor</c></term><description>0.50 — gradual-drift trigger; model at or below random-chance accuracy.</description></item>
-/// </list>
-/// </para>
+/// Detects two qualitatively different ML degradation patterns by comparing direction
+/// accuracy across two simultaneous rolling windows: a fast/short window for sudden
+/// drift and a slow/long window for gradual drift.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>Sudden drift:</b> <c>shortAccuracy − longAccuracy &lt; −ShortLongAccuracyGap</c>
+/// (default −0.07). Fires <see cref="AlertSeverity.Critical"/> alerts.<br/>
+/// <b>Gradual drift</b> (only if not already sudden): <c>longAccuracy &lt; LongWindowFloor</c>
+/// (default 0.50). Fires <see cref="AlertSeverity.High"/> alerts.
+/// </para>
+/// <para>
+/// <b>Hardening:</b> distributed lock with TTL, retrain cooldown (12 h default),
+/// unique-violation handling, command timeout, exponential retry backoff, sub-cycle
+/// hot-reload polling, dispatched alerts via <see cref="IAlertDispatcher"/>, and tagged
+/// metrics. Mirrors <see cref="MLAdwinDriftWorker"/>'s operational pattern.
+/// </para>
+/// </remarks>
 public sealed class MLMultiScaleDriftWorker : BackgroundService
 {
+    internal const string WorkerName = nameof(MLMultiScaleDriftWorker);
+    private const string DriftDetectorName = "MultiSignal";
+    private const string DistributedLockKey = "workers:ml-multiscale-drift:cycle";
+
+    private const string CK_Enabled            = "MLMultiScaleDrift:Enabled";
     private const string CK_PollSecs           = "MLMultiScaleDrift:PollIntervalSeconds";
     private const string CK_ShortWindowDays    = "MLMultiScaleDrift:ShortWindowDays";
     private const string CK_LongWindowDays     = "MLMultiScaleDrift:LongWindowDays";
     private const string CK_MinPredictions     = "MLMultiScaleDrift:MinPredictions";
     private const string CK_ShortLongGap       = "MLMultiScaleDrift:ShortLongAccuracyGap";
     private const string CK_LongWindowFloor    = "MLMultiScaleDrift:LongWindowFloor";
+    private const string CK_MaxModelsPerCycle  = "MLMultiScaleDrift:MaxModelsPerCycle";
+    private const string CK_LockTimeoutSecs    = "MLMultiScaleDrift:LockTimeoutSeconds";
+    private const string CK_MinTimeBetweenRetrainsHours = "MLMultiScaleDrift:MinTimeBetweenRetrainsHours";
+    private const string CK_TrainingDays       = "MLTraining:TrainingDataWindowDays";
+    private const string CK_DbCommandTimeoutSecs = "MLMultiScaleDrift:DbCommandTimeoutSeconds";
 
-    private readonly IServiceScopeFactory           _scopeFactory;
+    private const int DefaultPollSeconds = 1800;
+    private const int MinPollSeconds = 60;
+    private const int MaxPollSeconds = 24 * 60 * 60;
+
+    private const int DefaultShortWindowDays = 3;
+    private const int MinShortWindowDays = 1;
+    private const int MaxShortWindowDays = 30;
+
+    private const int DefaultLongWindowDays = 21;
+    private const int MinLongWindowDays = 3;
+    private const int MaxLongWindowDays = 365;
+
+    private const int DefaultMinPredictions = 20;
+    private const int MinMinPredictions = 5;
+    private const int MaxMinPredictions = 5000;
+
+    private const double DefaultShortLongGap = 0.07;
+    private const double MinShortLongGap = 0.005;
+    private const double MaxShortLongGap = 1.0;
+
+    private const double DefaultLongWindowFloor = 0.50;
+    private const double MinLongWindowFloor = 0.0;
+    private const double MaxLongWindowFloor = 1.0;
+
+    private const int DefaultMaxModelsPerCycle = 256;
+    private const int MinMaxModelsPerCycle = 1;
+    private const int MaxMaxModelsPerCycle = 4096;
+
+    private const int DefaultLockTimeoutSeconds = 5;
+    private const int MinLockTimeoutSeconds = 0;
+    private const int MaxLockTimeoutSeconds = 300;
+
+    private const int DefaultMinTimeBetweenRetrainsHours = 12;
+    private const int MinMinTimeBetweenRetrainsHours = 0;
+    private const int MaxMinTimeBetweenRetrainsHours = 24 * 30;
+
+    private const int DefaultTrainingDataWindowDays = 365;
+    private const int MinTrainingDataWindowDays = 30;
+    private const int MaxTrainingDataWindowDays = 3650;
+
+    private const int DefaultDbCommandTimeoutSeconds = 60;
+    private const int MinDbCommandTimeoutSeconds = 5;
+    private const int MaxDbCommandTimeoutSeconds = 600;
+
+    private static readonly TimeSpan WakeInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
+
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLMultiScaleDriftWorker> _logger;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IAlertDispatcher? _alertDispatcher;
 
-    /// <summary>
-    /// Initialises the worker with its required dependencies.
-    /// </summary>
-    /// <param name="scopeFactory">
-    /// DI scope factory. A new scope (and therefore new EF Core DbContexts) is created on
-    /// every polling iteration to prevent stale change-tracker state and connection exhaustion.
-    /// </param>
-    /// <param name="logger">Structured logger for diagnostic, warning, and error output.</param>
+    private long _consecutiveFailuresField;
+    private int _missingDistributedLockWarningEmitted;
+
     public MLMultiScaleDriftWorker(
-        IServiceScopeFactory             scopeFactory,
-        ILogger<MLMultiScaleDriftWorker> logger)
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLMultiScaleDriftWorker> logger,
+        IDistributedLock? distributedLock = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IAlertDispatcher? alertDispatcher = null)
     {
         _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _logger = logger;
+        _distributedLock = distributedLock;
+        _healthMonitor = healthMonitor;
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _alertDispatcher = alertDispatcher;
     }
 
-    /// <summary>
-    /// Entry point invoked by the .NET hosted-service infrastructure on application start.
-    /// Runs a multi-scale drift check every <c>MLMultiScaleDrift:PollIntervalSeconds</c> seconds
-    /// (default 30 minutes) until the application shuts down.
-    /// </summary>
-    /// <remarks>
-    /// The poll interval is re-read from <see cref="EngineConfig"/> on every iteration so it
-    /// can be adjusted at runtime without a service restart. The 30-minute default is a deliberate
-    /// balance: frequent enough to catch sudden drift within a trading session, but not so frequent
-    /// that it floods the database with redundant retrain requests during volatile markets.
-    /// </remarks>
-    /// <param name="stoppingToken">
-    /// Graceful-shutdown cancellation token provided by the .NET host.
-    /// <c>OperationCanceledException</c> breaks the loop cleanly without logging an error.
-    /// </param>
+    private int ConsecutiveFailures
+    {
+        get => (int)Interlocked.Read(ref _consecutiveFailuresField);
+        set => Interlocked.Exchange(ref _consecutiveFailuresField, value);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLMultiScaleDriftWorker started.");
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Detects sudden and gradual ML drift via simultaneous short/long accuracy windows.",
+            TimeSpan.FromSeconds(DefaultPollSeconds));
 
-        while (!stoppingToken.IsCancellationRequested)
+        DateTime lastCycleStartUtc = DateTime.MinValue;
+        DateTime lastSuccessUtc = DateTime.MinValue;
+        TimeSpan currentPollInterval = TimeSpan.FromSeconds(DefaultPollSeconds);
+
+        try
         {
-            // Local copy of poll interval so Task.Delay uses the correct value
-            // even if an exception occurs before the config is re-read.
-            int pollSecs = 1800;
-
             try
             {
-                // Fresh DI scope per iteration — avoids holding scoped DbContext instances
-                // open across the sleep period (which could cause connection-pool starvation).
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx     = readDb.GetDbContext();
-                var wCtx    = writeDb.GetDbContext();
-
-                // Re-read poll interval every cycle so operators can tune without restarting.
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 1800, stoppingToken);
-
-                await CheckMultiScaleDriftAsync(ctx, wCtx, stoppingToken);
+                var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName);
+                if (initialDelay > TimeSpan.Zero)
+                    await Task.Delay(initialDelay, _timeProvider, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                break; // Clean shutdown — not an error
+                return;
             }
-            catch (Exception ex)
+
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "MLMultiScaleDriftWorker loop error");
+                var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+                if (lastSuccessUtc != DateTime.MinValue)
+                {
+                    _metrics?.MLMultiScaleTimeSinceLastSuccessSec.Record(
+                        (nowUtc - lastSuccessUtc).TotalSeconds);
+                }
+
+                bool dueForCycle = nowUtc - lastCycleStartUtc >= currentPollInterval;
+
+                if (dueForCycle)
+                {
+                    long cycleStarted = Stopwatch.GetTimestamp();
+                    lastCycleStartUtc = nowUtc;
+
+                    try
+                    {
+                        _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+                        var result = await RunCycleAsync(stoppingToken);
+                        currentPollInterval = result.Settings.PollInterval;
+
+                        long durationMs = (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds;
+                        _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                        _metrics?.WorkerCycleDurationMs.Record(
+                            durationMs,
+                            new KeyValuePair<string, object?>("worker", WorkerName));
+                        _metrics?.MLMultiScaleCycleDurationMs.Record(durationMs);
+
+                        if (result.SkippedReason is { Length: > 0 })
+                        {
+                            _logger.LogDebug("{Worker}: cycle skipped ({Reason}).", WorkerName, result.SkippedReason);
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "{Worker}: candidates={Candidates}, evaluated={Evaluated}, sudden={Sudden}, gradual={Gradual}, retrain queued={Queued}.",
+                                WorkerName, result.CandidateModelCount, result.EvaluatedModelCount,
+                                result.SuddenDriftCount, result.GradualDriftCount, result.RetrainingQueued);
+                        }
+
+                        var prevFailures = ConsecutiveFailures;
+                        if (prevFailures > 0)
+                        {
+                            _healthMonitor?.RecordRecovery(WorkerName, prevFailures);
+                            _logger.LogInformation(
+                                "{Worker}: recovered after {Failures} consecutive failure(s).",
+                                WorkerName, prevFailures);
+                        }
+
+                        ConsecutiveFailures = 0;
+                        lastSuccessUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref _consecutiveFailuresField);
+                        _healthMonitor?.RecordRetry(WorkerName);
+                        _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                        _metrics?.WorkerErrors.Add(
+                            1,
+                            new KeyValuePair<string, object?>("worker", WorkerName),
+                            new KeyValuePair<string, object?>("reason", "ml_multiscale_cycle"));
+                        _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                    }
+                }
+
+                try
+                {
+                    await Task.Delay(CalculateDelay(WakeInterval, ConsecutiveFailures), _timeProvider, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
-
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
-
-        _logger.LogInformation("MLMultiScaleDriftWorker stopping.");
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopped.", WorkerName);
+        }
     }
 
-    /// <summary>
-    /// Loads configuration, retrieves all active models, and dispatches a per-model
-    /// multi-scale drift check. Configuration is read once per cycle so runtime tuning
-    /// takes effect on the next poll without a service restart.
-    /// </summary>
-    /// <param name="readCtx">Read-side EF Core context for querying models, prediction logs, and config.</param>
-    /// <param name="writeCtx">Write-side EF Core context for persisting training runs and alerts.</param>
-    /// <param name="ct">Cancellation token; propagates <see cref="OperationCanceledException"/> immediately.</param>
-    private async Task CheckMultiScaleDriftAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
+    internal async Task<MultiScaleCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        // Read all window/threshold parameters from the runtime config table.
-        // shortWindowDays: the "fast" signal window — captures only very recent model performance.
-        int    shortWindowDays  = await GetConfigAsync<int>   (readCtx, CK_ShortWindowDays, 3,    ct);
-        // longWindowDays: the "slow" baseline window — smooths out short-term noise.
-        int    longWindowDays   = await GetConfigAsync<int>   (readCtx, CK_LongWindowDays,  21,   ct);
-        // minPredictions: minimum resolved predictions required in the long window to run the check.
-        // Below this threshold, both accuracy estimates are too noisy to compare reliably.
-        int    minPredictions   = await GetConfigAsync<int>   (readCtx, CK_MinPredictions,  20,   ct);
-        // shortLongGap: the sudden-drift threshold. If the short-window accuracy falls more than
-        // this amount below the long-window accuracy, the model has likely encountered a regime change.
-        double shortLongGap     = await GetConfigAsync<double>(readCtx, CK_ShortLongGap,    0.07, ct);
-        // longWindowFloor: the gradual-drift threshold. If the long-window accuracy falls below
-        // this level, the model is performing at or below random-chance and must be retrained.
-        double longWindowFloor  = await GetConfigAsync<double>(readCtx, CK_LongWindowFloor, 0.50, ct);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var ctx = readCtx.GetDbContext();
+        var writeDb = writeCtx.GetDbContext();
+        var settings = await LoadSettingsAsync(ctx, ct);
+
+        ApplyCommandTimeout(ctx, settings.DbCommandTimeoutSeconds);
+        ApplyCommandTimeout(writeDb, settings.DbCommandTimeoutSeconds);
+
+        if (!settings.Enabled)
+        {
+            _metrics?.MLMultiScaleCyclesSkipped.Add(
+                1, new KeyValuePair<string, object?>("reason", "disabled"));
+            return MultiScaleCycleResult.Skipped(settings, "disabled");
+        }
+
+        if (_distributedLock is null)
+        {
+            _metrics?.MLMultiScaleLockAttempts.Add(
+                1, new KeyValuePair<string, object?>("outcome", "unavailable"));
+
+            if (Interlocked.Exchange(ref _missingDistributedLockWarningEmitted, 1) == 0)
+            {
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate multi-scale cycles are possible in multi-instance deployments.",
+                    WorkerName);
+            }
+            return await RunCycleCoreAsync(ctx, writeDb, settings, ct);
+        }
+
+        var cycleLock = await _distributedLock.TryAcquireAsync(
+            DistributedLockKey,
+            TimeSpan.FromSeconds(settings.LockTimeoutSeconds),
+            ct);
+
+        if (cycleLock is null)
+        {
+            _metrics?.MLMultiScaleLockAttempts.Add(
+                1, new KeyValuePair<string, object?>("outcome", "busy"));
+            _metrics?.MLMultiScaleCyclesSkipped.Add(
+                1, new KeyValuePair<string, object?>("reason", "lock_busy"));
+            return MultiScaleCycleResult.Skipped(settings, "lock_busy");
+        }
+
+        _metrics?.MLMultiScaleLockAttempts.Add(
+            1, new KeyValuePair<string, object?>("outcome", "acquired"));
+
+        await using (cycleLock)
+        {
+            return await RunCycleCoreAsync(ctx, writeDb, settings, ct);
+        }
+    }
+
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+        {
+            return baseInterval <= TimeSpan.Zero ? WakeInterval : baseInterval;
+        }
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private static void ApplyCommandTimeout(DbContext db, int seconds)
+    {
+        try
+        {
+            if (db.Database.IsRelational())
+                db.Database.SetCommandTimeout(TimeSpan.FromSeconds(seconds));
+        }
+        catch (InvalidOperationException) { /* unsupported */ }
+    }
+
+    private async Task<MultiScaleCycleResult> RunCycleCoreAsync(
+        DbContext readCtx,
+        DbContext writeCtx,
+        MultiScaleWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
 
         var activeModels = await readCtx.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted)
             .AsNoTracking()
+            .Where(m => m.IsActive && !m.IsDeleted)
+            .OrderBy(m => m.Id)
+            .Select(m => new ActiveModelCandidate(m.Id, m.Symbol, m.Timeframe, m.LearnerArchitecture))
+            .Take(settings.MaxModelsPerCycle)
             .ToListAsync(ct);
+
+        int evaluated = 0, suddenCount = 0, gradualCount = 0, retrainQueued = 0;
 
         foreach (var model in activeModels)
         {
@@ -189,252 +350,420 @@ public sealed class MLMultiScaleDriftWorker : BackgroundService
 
             try
             {
-                await CheckModelDriftAsync(
-                    model, readCtx, writeCtx,
-                    shortWindowDays, longWindowDays, minPredictions,
-                    shortLongGap, longWindowFloor, ct);
+                _metrics?.MLMultiScaleModelsEvaluated.Add(
+                    1,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                    new KeyValuePair<string, object?>("learner_architecture", model.LearnerArchitecture.ToString()));
+
+                var outcome = await EvaluateModelAsync(model, readCtx, writeCtx, settings, nowUtc, ct);
+                if (outcome.Evaluated) evaluated++;
+                if (outcome.SuddenDrift) suddenCount++;
+                if (outcome.GradualDrift) gradualCount++;
+                if (outcome.RetrainQueued) retrainQueued++;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
-                // Per-model failures are non-fatal — skip the failing model and continue.
-                // This prevents a corrupted prediction log for one symbol from blocking all others.
+                writeCtx.ChangeTracker.Clear();
+                _metrics?.WorkerErrors.Add(
+                    1,
+                    new KeyValuePair<string, object?>("worker", WorkerName),
+                    new KeyValuePair<string, object?>("reason", "ml_multiscale_model"),
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
                 _logger.LogWarning(ex,
-                    "Multi-scale drift check failed for {Symbol}/{Tf} model {Id} — skipping.",
-                    model.Symbol, model.Timeframe, model.Id);
+                    "{Worker}: multi-scale check failed for {ModelId} ({Symbol}/{Timeframe}); continuing.",
+                    WorkerName, model.Id, model.Symbol, model.Timeframe);
             }
         }
+
+        return new MultiScaleCycleResult(
+            settings,
+            SkippedReason: null,
+            CandidateModelCount: activeModels.Count,
+            EvaluatedModelCount: evaluated,
+            SuddenDriftCount: suddenCount,
+            GradualDriftCount: gradualCount,
+            RetrainingQueued: retrainQueued);
     }
 
-    /// <summary>
-    /// Core per-model multi-scale drift analysis. Computes accuracy over both windows and
-    /// applies the sudden-drift and gradual-drift decision rules to determine whether
-    /// retraining and alerting are required.
-    /// </summary>
-    /// <remarks>
-    /// <b>Decision rules:</b>
-    /// <list type="number">
-    ///   <item>
-    ///     <b>Sudden drift:</b> <c>gap = shortAccuracy − longAccuracy &lt; −shortLongGap</c><br/>
-    ///     The short window has degraded sharply compared to the long-term baseline.
-    ///     This pattern indicates an abrupt regime change or data-pipeline fault.
-    ///     Severity: <c>critical</c>.
-    ///   </item>
-    ///   <item>
-    ///     <b>Gradual drift (mutually exclusive with sudden):</b>
-    ///     <c>longAccuracy &lt; longWindowFloor</c><br/>
-    ///     Both windows have drifted below an absolute accuracy floor, indicating slow
-    ///     concept drift or a sustained regime shift over weeks. Severity: <c>standard</c>.
-    ///   </item>
-    /// </list>
-    /// <b>Deduplication:</b>
-    /// Training runs are guarded by checking for existing Queued/Running runs on the same
-    /// symbol+timeframe. Alerts are deduped by checking for an existing active alert of type
-    /// <see cref="AlertType.MLModelDegraded"/> for the same symbol.
-    /// </remarks>
-    /// <param name="model">Active ML model to evaluate.</param>
-    /// <param name="readCtx">Read-side EF context.</param>
-    /// <param name="writeCtx">Write-side EF context.</param>
-    /// <param name="shortWindowDays">Size of the recent/fast window in calendar days.</param>
-    /// <param name="longWindowDays">Size of the baseline/slow window in calendar days.</param>
-    /// <param name="minPredictions">
-    /// Minimum resolved predictions required in the long window. Below this the accuracy
-    /// estimates have insufficient statistical power for reliable comparison.
-    /// </param>
-    /// <param name="shortLongGap">
-    /// Minimum negative gap (shortAccuracy − longAccuracy) that triggers sudden-drift detection.
-    /// A default of 0.07 means a 7-percentage-point sharper drop in the short window vs the long.
-    /// </param>
-    /// <param name="longWindowFloor">
-    /// Minimum acceptable long-window accuracy. Below 0.50 the model is no better than coin-flip
-    /// on a directional trading decision and must be retrained immediately.
-    /// </param>
-    /// <param name="ct">Cancellation token.</param>
-    private async Task CheckModelDriftAsync(
-        MLModel                                 model,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        int                                     shortWindowDays,
-        int                                     longWindowDays,
-        int                                     minPredictions,
-        double                                  shortLongGap,
-        double                                  longWindowFloor,
-        CancellationToken                       ct)
+    private async Task<ModelEvalOutcome> EvaluateModelAsync(
+        ActiveModelCandidate model,
+        DbContext readCtx,
+        DbContext writeCtx,
+        MultiScaleWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
     {
-        // Define the time boundaries for each window.
-        var longSince  = DateTime.UtcNow.AddDays(-longWindowDays);
-        var shortSince = DateTime.UtcNow.AddDays(-shortWindowDays);
+        var longSince = nowUtc.AddDays(-settings.LongWindowDays);
+        var shortSince = nowUtc.AddDays(-settings.ShortWindowDays);
 
-        // ── Load all resolved predictions within the long window ───────────────
-        // Loading the full long window first then filtering in-memory for the short window
-        // avoids a second database round-trip. The projection keeps memory usage small —
-        // we only need the timestamp and the binary outcome.
         var allResolved = await readCtx.Set<MLModelPredictionLog>()
-            .Where(l => l.MLModelId        == model.Id  &&
-                        l.PredictedAt      >= longSince &&
-                        l.DirectionCorrect != null       &&
-                        !l.IsDeleted)
-            .Select(l => new { l.PredictedAt, DirectionCorrect = l.DirectionCorrect!.Value })
             .AsNoTracking()
+            .Where(l =>
+                l.MLModelId == model.Id &&
+                l.PredictedAt >= longSince &&
+                l.DirectionCorrect != null &&
+                !l.IsDeleted)
+            .Select(l => new PredictionPoint(l.PredictedAt, l.DirectionCorrect!.Value))
             .ToListAsync(ct);
 
-        if (allResolved.Count < minPredictions)
+        if (allResolved.Count < settings.MinPredictions)
         {
-            // Too few data points to compute a stable long-window accuracy estimate.
-            _logger.LogDebug(
-                "MultiScaleDrift: {Symbol}/{Tf} model {Id} only {N} resolved in long window — skip.",
-                model.Symbol, model.Timeframe, model.Id, allResolved.Count);
-            return;
+            _metrics?.MLMultiScaleModelsSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "insufficient_long_window"),
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+            return ModelEvalOutcome.Skipped;
         }
 
-        // ── Long-window accuracy ───────────────────────────────────────────────
-        // The proportion of correct directional predictions over the full long window.
-        // This is the baseline/reference; the short-window accuracy is compared against it.
         double longAccuracy = allResolved.Count(r => r.DirectionCorrect) / (double)allResolved.Count;
-
-        // ── Short-window accuracy ──────────────────────────────────────────────
-        // Filter to the recent sub-window in-memory (already loaded above).
         var shortResolved = allResolved.Where(r => r.PredictedAt >= shortSince).ToList();
 
-        // Require at least max(5, minPredictions/4) predictions in the short window.
-        // With fewer points the short-window accuracy is too volatile to be actionable.
-        if (shortResolved.Count < Math.Max(5, minPredictions / 4))
+        int minShortPredictions = Math.Max(5, settings.MinPredictions / 4);
+        if (shortResolved.Count < minShortPredictions)
         {
-            _logger.LogDebug(
-                "MultiScaleDrift: {Symbol}/{Tf} model {Id} insufficient short-window predictions ({N}) — skip.",
-                model.Symbol, model.Timeframe, model.Id, shortResolved.Count);
-            return;
+            _metrics?.MLMultiScaleModelsSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "insufficient_short_window"),
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+            return ModelEvalOutcome.Skipped;
         }
 
         double shortAccuracy = shortResolved.Count(r => r.DirectionCorrect) / (double)shortResolved.Count;
-
-        // ── Compute the inter-window accuracy gap ─────────────────────────────
-        // gap > 0: model is performing better recently than on average (improving).
-        // gap < 0: model is performing worse recently than on average (degrading).
-        // gap < -shortLongGap: the degradation is large enough to signal sudden drift.
         double gap = shortAccuracy - longAccuracy;
 
-        _logger.LogDebug(
-            "MultiScaleDrift: {Symbol}/{Tf} model {Id}: short={Short:P1}(n={Ns}) " +
-            "long={Long:P1}(n={Nl}) gap={Gap:+0.0%;-0.0%}",
-            model.Symbol, model.Timeframe, model.Id,
-            shortAccuracy, shortResolved.Count, longAccuracy, allResolved.Count, gap);
+        bool suddenDrift = gap < -settings.ShortLongAccuracyGap;
+        bool gradualDrift = !suddenDrift && longAccuracy < settings.LongWindowFloor;
 
-        // ── Apply drift decision rules ────────────────────────────────────────
-        // Sudden drift takes precedence: if the gap is large enough, gradual drift is irrelevant.
-        bool suddenDrift  = gap < -shortLongGap;
-        // Gradual drift: only evaluated when sudden drift was not triggered. Long-window accuracy
-        // falling below the floor means even the "smoothed" baseline has collapsed.
-        bool gradualDrift = !suddenDrift && longAccuracy < longWindowFloor;
-
-        if (!suddenDrift && !gradualDrift) return; // Model is performing within acceptable bounds
+        if (!suddenDrift && !gradualDrift)
+        {
+            _logger.LogDebug(
+                "{Worker}: {Symbol}/{Timeframe} no drift — short={Short:P1}(n={Ns}) long={Long:P1}(n={Nl}) gap={Gap:+0.0%;-0.0%}.",
+                WorkerName, model.Symbol, model.Timeframe,
+                shortAccuracy, shortResolved.Count, longAccuracy, allResolved.Count, gap);
+            return ModelEvalOutcome.EvaluatedNoDrift;
+        }
 
         string driftType = suddenDrift ? "sudden" : "gradual";
 
+        if (suddenDrift)
+            _metrics?.MLMultiScaleSuddenDrifts.Add(
+                1,
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+        else
+            _metrics?.MLMultiScaleGradualDrifts.Add(
+                1,
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+
         _logger.LogWarning(
-            "MultiScaleDrift: {Symbol}/{Tf} model {Id}: {DriftType} drift detected. " +
-            "short={Short:P1} long={Long:P1} gap={Gap:+0.0%;-0.0%} floor={Floor:P1}",
-            model.Symbol, model.Timeframe, model.Id, driftType,
-            shortAccuracy, longAccuracy, gap, longWindowFloor);
+            "{Worker}: {Symbol}/{Timeframe} {DriftType} drift — short={Short:P1} long={Long:P1} gap={Gap:+0.0%;-0.0%} floor={Floor:P1}.",
+            WorkerName, model.Symbol, model.Timeframe, driftType,
+            shortAccuracy, longAccuracy, gap, settings.LongWindowFloor);
 
-        // ── Queue retrain if not already pending ──────────────────────────────
-        // Guard against duplicate training runs. We check the read context (which sees committed
-        // rows from previous cycles) rather than the write context to include rows from prior runs.
-        bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
-            .AnyAsync(r => r.Symbol    == model.Symbol    &&
-                           r.Timeframe == model.Timeframe &&
-                           (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
+        // Cooldown #1: existing Queued/Running run.
+        bool retrainAlreadyActive = await writeCtx.Set<MLTrainingRun>()
+            .AsNoTracking()
+            .AnyAsync(r =>
+                !r.IsDeleted &&
+                r.Symbol == model.Symbol &&
+                r.Timeframe == model.Timeframe &&
+                (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
 
-        bool saved = false;
-
-        if (!alreadyQueued)
+        if (retrainAlreadyActive)
         {
-            // Embed diagnostic context in HyperparamConfigJson so the MLTrainingWorker and
-            // operators can trace why this retrain was triggered.
-            writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
-            {
-                Symbol    = model.Symbol,
-                Timeframe = model.Timeframe,
-                Status    = RunStatus.Queued,
-                FromDate  = DateTime.UtcNow.AddDays(-365),
-                ToDate    = DateTime.UtcNow,
-                HyperparamConfigJson = System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    triggeredBy    = "MLMultiScaleDriftWorker",
-                    driftType,                  // "sudden" or "gradual"
-                    shortAccuracy,              // Recent accuracy over shortWindowDays
-                    longAccuracy,               // Baseline accuracy over longWindowDays
-                    gap,                        // shortAccuracy − longAccuracy
-                    shortWindowDays,
-                    longWindowDays,
-                    modelId        = model.Id,
-                }),
-            });
-            saved = true;
+            await DispatchDriftAlertAsync(model, suddenDrift, shortAccuracy, longAccuracy, gap, settings, retrainQueued: false, ct);
+            return new ModelEvalOutcome(true, suddenDrift, gradualDrift, false);
         }
 
-        // ── Create alert (deduplicated by active alert check) ─────────────────
-        // Only create a new alert if there is no existing active alert for this symbol.
-        // This prevents flooding the alerting channel during sustained periods of degradation
-        // when the model fails to recover between polling cycles.
-        bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == model.Symbol              &&
-                           a.AlertType == AlertType.MLModelDegraded &&
-                           a.IsActive  && !a.IsDeleted, ct);
-
-        if (!alertExists)
+        // Cooldown #2: recent completed run within cooldown window.
+        if (settings.MinTimeBetweenRetrainsHours > 0)
         {
-            writeCtx.Set<Alert>().Add(new Alert
+            var cutoff = nowUtc.AddHours(-settings.MinTimeBetweenRetrainsHours);
+            bool recentRun = await writeCtx.Set<MLTrainingRun>()
+                .AsNoTracking()
+                .AnyAsync(r =>
+                    !r.IsDeleted &&
+                    r.Symbol == model.Symbol &&
+                    r.Timeframe == model.Timeframe &&
+                    r.DriftTriggerType == DriftDetectorName &&
+                    (r.CompletedAt ?? r.StartedAt) >= cutoff, ct);
+            if (recentRun)
             {
-                AlertType     = AlertType.MLModelDegraded,
-                Symbol        = model.Symbol,
-                ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    reason          = "multi_scale_drift",
-                    driftType,                              // "sudden" or "gradual"
-                    severity        = suddenDrift ? "critical" : "standard", // Severity tier for ops routing
-                    shortAccuracy,                          // Fast-window accuracy at time of detection
-                    longAccuracy,                           // Slow-window baseline accuracy
-                    gap,                                    // shortAccuracy − longAccuracy
-                    shortWindowDays,
-                    longWindowDays,
-                    symbol          = model.Symbol,
-                    timeframe       = model.Timeframe.ToString(),
-                    modelId         = model.Id,
-                }),
-                IsActive = true,
-            });
-            saved = true;
+                _metrics?.MLMultiScaleRetrainCooldownSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                await DispatchDriftAlertAsync(model, suddenDrift, shortAccuracy, longAccuracy, gap, settings, retrainQueued: false, ct);
+                return new ModelEvalOutcome(true, suddenDrift, gradualDrift, false);
+            }
         }
 
-        // Persist all changes in a single transaction for atomicity.
-        if (saved) await writeCtx.SaveChangesAsync(ct);
+        bool queued = await TryQueueRetrainAsync(model, suddenDrift, shortAccuracy, longAccuracy, gap, settings, nowUtc, writeCtx, ct);
+
+        await DispatchDriftAlertAsync(model, suddenDrift, shortAccuracy, longAccuracy, gap, settings, queued, ct);
+
+        return new ModelEvalOutcome(true, suddenDrift, gradualDrift, queued);
     }
 
-    /// <summary>
-    /// Reads a strongly-typed configuration value from the <see cref="EngineConfig"/> table.
-    /// Returns <paramref name="defaultValue"/> when the key is absent or the stored value
-    /// cannot be converted to <typeparamref name="T"/>, so the worker always has a safe
-    /// operational default without requiring config entries to exist at startup.
-    /// </summary>
-    /// <typeparam name="T">Target type; must be supported by <see cref="Convert.ChangeType(object, Type)"/>.</typeparam>
-    /// <param name="ctx">EF Core DbContext (use the read-side context to avoid change-tracker overhead).</param>
-    /// <param name="key">The <see cref="EngineConfig.Key"/> to look up.</param>
-    /// <param name="defaultValue">Fallback value used when the key is missing or unparseable.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>Parsed config value, or <paramref name="defaultValue"/> on any failure.</returns>
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    private async Task<bool> TryQueueRetrainAsync(
+        ActiveModelCandidate model,
+        bool suddenDrift,
+        double shortAccuracy,
+        double longAccuracy,
+        double gap,
+        MultiScaleWorkerSettings settings,
+        DateTime nowUtc,
+        DbContext writeCtx,
+        CancellationToken ct)
     {
-        var entry = await ctx.Set<EngineConfig>()
+        writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
+        {
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            TriggerType = TriggerType.AutoDegrading,
+            Status = RunStatus.Queued,
+            FromDate = nowUtc.AddDays(-settings.TrainingDataWindowDays),
+            ToDate = nowUtc,
+            StartedAt = nowUtc,
+            LearnerArchitecture = model.LearnerArchitecture,
+            DriftTriggerType = DriftDetectorName,
+            DriftMetadataJson = JsonSerializer.Serialize(new
+            {
+                detector = DriftDetectorName,
+                driftType = suddenDrift ? "sudden" : "gradual",
+                shortAccuracy,
+                longAccuracy,
+                gap,
+                shortWindowDays = settings.ShortWindowDays,
+                longWindowDays = settings.LongWindowDays,
+                modelId = model.Id,
+            }),
+            Priority = suddenDrift ? 0 : 1,
+            IsDeleted = false,
+        });
+
+        try
+        {
+            await writeCtx.SaveChangesAsync(ct);
+            _metrics?.MLMultiScaleRetrainingQueued.Add(
+                1,
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                new KeyValuePair<string, object?>("severity", suddenDrift ? "sudden" : "gradual"));
+            return true;
+        }
+        catch (DbUpdateException ex) when (IsUniqueViolation(ex))
+        {
+            writeCtx.ChangeTracker.Clear();
+            _logger.LogInformation(
+                "{Worker}: retrain queue race for {Symbol}/{Timeframe} resolved by partial unique index; another worker queued the run.",
+                WorkerName, model.Symbol, model.Timeframe);
+            return false;
+        }
+    }
+
+    private static bool IsUniqueViolation(DbUpdateException ex)
+    {
+        for (Exception? cur = ex; cur is not null; cur = cur.InnerException)
+        {
+            var sqlStateProp = cur.GetType().GetProperty("SqlState");
+            if (sqlStateProp?.GetValue(cur) is string sqlState && sqlState == "23505") return true;
+            if (cur.Message.Contains("unique constraint", StringComparison.OrdinalIgnoreCase) ||
+                cur.Message.Contains("UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private async Task DispatchDriftAlertAsync(
+        ActiveModelCandidate model,
+        bool suddenDrift,
+        double shortAccuracy,
+        double longAccuracy,
+        double gap,
+        MultiScaleWorkerSettings settings,
+        bool retrainQueued,
+        CancellationToken ct)
+    {
+        if (_alertDispatcher is null) return;
+
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
+            int cooldownSec = await AlertCooldownDefaults.GetCooldownAsync(
+                writeCtx, AlertCooldownDefaults.CK_MLDrift, AlertCooldownDefaults.Default_MLDrift, ct);
+
+            string driftType = suddenDrift ? "sudden" : "gradual";
+
+            string conditionJson = JsonSerializer.Serialize(new
+            {
+                DetectorType = DriftDetectorName,
+                DriftType = driftType,
+                ModelId = model.Id,
+                Symbol = model.Symbol,
+                Timeframe = model.Timeframe.ToString(),
+                LearnerArchitecture = model.LearnerArchitecture.ToString(),
+                ShortAccuracy = shortAccuracy,
+                LongAccuracy = longAccuracy,
+                Gap = gap,
+                ShortWindowDays = settings.ShortWindowDays,
+                LongWindowDays = settings.LongWindowDays,
+                RetrainingQueued = retrainQueued,
+                DetectedAt = _timeProvider.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+            });
+
+            var alert = new Alert
+            {
+                AlertType = AlertType.MLModelDegraded,
+                Severity = suddenDrift ? AlertSeverity.Critical : AlertSeverity.High,
+                Symbol = model.Symbol,
+                DeduplicationKey = $"multiscale-drift:{model.Symbol}:{model.Timeframe}:{driftType}",
+                CooldownSeconds = cooldownSec,
+                ConditionJson = conditionJson,
+                IsActive = true,
+            };
+
+            string message = string.Format(
+                CultureInfo.InvariantCulture,
+                "Multi-scale {0} drift on {1}/{2}: short={3:P1} long={4:P1} gap={5:+0.0%;-0.0%}; retrainQueued={6}.",
+                driftType, model.Symbol, model.Timeframe, shortAccuracy, longAccuracy, gap, retrainQueued);
+
+            await _alertDispatcher.DispatchAsync(alert, message, ct);
+            _metrics?.MLMultiScaleAlertsDispatched.Add(
+                1,
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                new KeyValuePair<string, object?>("severity", driftType));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "{Worker}: failed to dispatch multi-scale drift alert for {ModelId} ({Symbol}/{Timeframe}).",
+                WorkerName, model.Id, model.Symbol, model.Timeframe);
+        }
+    }
+
+    private static async Task<MultiScaleWorkerSettings> LoadSettingsAsync(DbContext db, CancellationToken ct)
+    {
+        string[] keys =
+        [
+            CK_Enabled, CK_PollSecs, CK_ShortWindowDays, CK_LongWindowDays,
+            CK_MinPredictions, CK_ShortLongGap, CK_LongWindowFloor,
+            CK_MaxModelsPerCycle, CK_LockTimeoutSecs, CK_MinTimeBetweenRetrainsHours,
+            CK_TrainingDays, CK_DbCommandTimeoutSecs,
+        ];
+
+        var values = await db.Set<EngineConfig>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .Where(c => keys.Contains(c.Key))
+            .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
 
-        if (entry?.Value is null) return defaultValue;
+        return new MultiScaleWorkerSettings(
+            Enabled: GetBool(values, CK_Enabled, true),
+            PollInterval: TimeSpan.FromSeconds(
+                ClampInt(GetInt(values, CK_PollSecs, DefaultPollSeconds), DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
+            ShortWindowDays: ClampInt(GetInt(values, CK_ShortWindowDays, DefaultShortWindowDays), DefaultShortWindowDays, MinShortWindowDays, MaxShortWindowDays),
+            LongWindowDays: ClampInt(GetInt(values, CK_LongWindowDays, DefaultLongWindowDays), DefaultLongWindowDays, MinLongWindowDays, MaxLongWindowDays),
+            MinPredictions: ClampInt(GetInt(values, CK_MinPredictions, DefaultMinPredictions), DefaultMinPredictions, MinMinPredictions, MaxMinPredictions),
+            ShortLongAccuracyGap: ClampDoublePos(GetDouble(values, CK_ShortLongGap, DefaultShortLongGap), DefaultShortLongGap, MinShortLongGap, MaxShortLongGap),
+            LongWindowFloor: ClampDoubleRange(GetDouble(values, CK_LongWindowFloor, DefaultLongWindowFloor), DefaultLongWindowFloor, MinLongWindowFloor, MaxLongWindowFloor),
+            MaxModelsPerCycle: ClampInt(GetInt(values, CK_MaxModelsPerCycle, DefaultMaxModelsPerCycle), DefaultMaxModelsPerCycle, MinMaxModelsPerCycle, MaxMaxModelsPerCycle),
+            LockTimeoutSeconds: ClampInt(GetInt(values, CK_LockTimeoutSecs, DefaultLockTimeoutSeconds), DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
+            MinTimeBetweenRetrainsHours: ClampNonNegativeInt(
+                GetInt(values, CK_MinTimeBetweenRetrainsHours, DefaultMinTimeBetweenRetrainsHours),
+                DefaultMinTimeBetweenRetrainsHours, MinMinTimeBetweenRetrainsHours, MaxMinTimeBetweenRetrainsHours),
+            TrainingDataWindowDays: ClampInt(GetInt(values, CK_TrainingDays, DefaultTrainingDataWindowDays), DefaultTrainingDataWindowDays, MinTrainingDataWindowDays, MaxTrainingDataWindowDays),
+            DbCommandTimeoutSeconds: ClampInt(GetInt(values, CK_DbCommandTimeoutSecs, DefaultDbCommandTimeoutSeconds), DefaultDbCommandTimeoutSeconds, MinDbCommandTimeoutSeconds, MaxDbCommandTimeoutSeconds));
+    }
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; } // Malformed config value — fall back silently
+    private static bool GetBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+        if (bool.TryParse(raw, out var parsedBool)) return parsedBool;
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedInt))
+            return parsedInt != 0;
+        return defaultValue;
+    }
+
+    private static int GetInt(IReadOnlyDictionary<string, string> values, string key, int defaultValue)
+        => values.TryGetValue(key, out var raw) &&
+           int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed : defaultValue;
+
+    private static double GetDouble(IReadOnlyDictionary<string, string> values, string key, double defaultValue)
+        => values.TryGetValue(key, out var raw) &&
+           double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed : defaultValue;
+
+    private static int ClampInt(int value, int fallback, int min, int max)
+        => value <= 0 ? fallback : Math.Min(Math.Max(value, min), max);
+
+    private static int ClampNonNegativeInt(int value, int fallback, int min, int max)
+        => value < 0 ? fallback : Math.Min(Math.Max(value, min), max);
+
+    private static double ClampDoublePos(double value, double fallback, double min, double max)
+        => !double.IsFinite(value) || value <= 0.0
+            ? fallback
+            : Math.Min(Math.Max(value, min), max);
+
+    private static double ClampDoubleRange(double value, double fallback, double min, double max)
+        => !double.IsFinite(value) || value < min || value > max
+            ? fallback
+            : value;
+
+    private readonly record struct ActiveModelCandidate(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        LearnerArchitecture LearnerArchitecture);
+
+    private readonly record struct PredictionPoint(DateTime PredictedAt, bool DirectionCorrect);
+
+    private readonly record struct ModelEvalOutcome(
+        bool Evaluated,
+        bool SuddenDrift,
+        bool GradualDrift,
+        bool RetrainQueued)
+    {
+        public static readonly ModelEvalOutcome Skipped = new(false, false, false, false);
+        public static readonly ModelEvalOutcome EvaluatedNoDrift = new(true, false, false, false);
+    }
+
+    internal readonly record struct MultiScaleWorkerSettings(
+        bool Enabled,
+        TimeSpan PollInterval,
+        int ShortWindowDays,
+        int LongWindowDays,
+        int MinPredictions,
+        double ShortLongAccuracyGap,
+        double LongWindowFloor,
+        int MaxModelsPerCycle,
+        int LockTimeoutSeconds,
+        int MinTimeBetweenRetrainsHours,
+        int TrainingDataWindowDays,
+        int DbCommandTimeoutSeconds);
+
+    internal readonly record struct MultiScaleCycleResult(
+        MultiScaleWorkerSettings Settings,
+        string? SkippedReason,
+        int CandidateModelCount,
+        int EvaluatedModelCount,
+        int SuddenDriftCount,
+        int GradualDriftCount,
+        int RetrainingQueued)
+    {
+        public static MultiScaleCycleResult Skipped(MultiScaleWorkerSettings settings, string reason)
+            => new(settings, reason, 0, 0, 0, 0, 0);
     }
 }

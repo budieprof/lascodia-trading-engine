@@ -44,16 +44,19 @@ public sealed class MLCorrelatedFailureConfigReader(MLCorrelatedFailureOptions o
         DbContext readCtx,
         CancellationToken ct)
     {
-        int pollSecs = Math.Clamp(
+        int pollSecs = ClampInt(
             await GetConfigAsync(readCtx, CK_PollSecs, options.PollIntervalSeconds, ct),
+            options.PollIntervalSeconds,
             30,
             24 * 60 * 60);
-        double alarmRatio = Math.Clamp(
+        double alarmRatio = ClampFinite(
             await GetConfigAsync(readCtx, CK_AlarmRatio, options.AlarmRatio, ct),
+            options.AlarmRatio,
             0.01,
             1.0);
-        double recoveryRatio = Math.Clamp(
+        double recoveryRatio = ClampFinite(
             await GetConfigAsync(readCtx, CK_RecoveryRatio, options.RecoveryRatio, ct),
+            options.RecoveryRatio,
             0.0,
             1.0);
         if (recoveryRatio >= alarmRatio)
@@ -70,25 +73,32 @@ public sealed class MLCorrelatedFailureConfigReader(MLCorrelatedFailureOptions o
             PollSeconds: pollSecs,
             AlarmRatio: alarmRatio,
             RecoveryRatio: recoveryRatio,
-            MinModelsForAlarm: Math.Max(
+            MinModelsForAlarm: ClampInt(
+                await GetConfigAsync(readCtx, CK_MinModelsForAlarm, options.MinModelsForAlarm, ct),
+                options.MinModelsForAlarm,
                 2,
-                await GetConfigAsync(readCtx, CK_MinModelsForAlarm, options.MinModelsForAlarm, ct)),
-            FailureThreshold: Math.Clamp(
+                10_000),
+            FailureThreshold: ClampFinite(
                 await GetConfigAsync(readCtx, CK_AccThreshold, DefaultFailureThreshold, ct),
+                DefaultFailureThreshold,
                 0.0,
                 1.0),
-            WindowDays: Math.Clamp(
+            WindowDays: ClampInt(
                 await GetConfigAsync(readCtx, CK_WindowDays, DefaultWindowDays, ct),
+                DefaultWindowDays,
                 1,
                 365),
-            MinPredictions: Math.Max(
+            MinPredictions: ClampInt(
+                await GetConfigAsync(readCtx, CK_MinPredictions, DefaultMinPredictions, ct),
+                DefaultMinPredictions,
                 1,
-                await GetConfigAsync(readCtx, CK_MinPredictions, DefaultMinPredictions, ct)),
-            StateChangeCooldownMinutes: Math.Clamp(
+                100_000),
+            StateChangeCooldownMinutes: ClampInt(
                 await GetConfigAsync(readCtx, CK_StateChangeCooldownMinutes, options.StateChangeCooldownMinutes, ct),
+                options.StateChangeCooldownMinutes,
                 0,
                 24 * 60),
-            ModelStatsBatchSize: Math.Clamp(options.ModelStatsBatchSize, 1, 10_000),
+            ModelStatsBatchSize: ClampInt(options.ModelStatsBatchSize, 1_000, 1, 10_000),
             FailureMetric: metric);
     }
 
@@ -152,4 +162,12 @@ public sealed class MLCorrelatedFailureConfigReader(MLCorrelatedFailureOptions o
         result = default!;
         return false;
     }
+
+    private static int ClampInt(int value, int defaultValue, int min, int max)
+        => Math.Clamp(value, min, max);
+
+    private static double ClampFinite(double value, double defaultValue, double min, double max)
+        => double.IsFinite(value)
+            ? Math.Clamp(value, min, max)
+            : Math.Clamp(defaultValue, min, max);
 }

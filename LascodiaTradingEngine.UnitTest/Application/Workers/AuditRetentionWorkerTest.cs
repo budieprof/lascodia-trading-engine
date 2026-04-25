@@ -72,7 +72,7 @@ public class AuditRetentionWorkerTest
         using var scope = provider.CreateScope();
         var worker = NewWorker(time, provider);
 
-        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 90, reconciliationDays: 180, CancellationToken.None);
+        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 90, reconciliationDays: 180, mlAdwinDriftLogDays: 365, CancellationToken.None);
 
         Assert.Equal(3, result.SignalRejectionDeleted);
         Assert.Equal(0, result.ReconciliationDeleted);
@@ -101,7 +101,7 @@ public class AuditRetentionWorkerTest
         using var scope = provider.CreateScope();
         var worker = NewWorker(time, provider);
 
-        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 90, reconciliationDays: 180, CancellationToken.None);
+        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 90, reconciliationDays: 180, mlAdwinDriftLogDays: 365, CancellationToken.None);
 
         Assert.Equal(0, result.SignalRejectionDeleted);
         Assert.Equal(2, result.ReconciliationDeleted);
@@ -139,7 +139,7 @@ public class AuditRetentionWorkerTest
         using var scope = provider.CreateScope();
         var worker = NewWorker(time, provider);
 
-        var result = await worker.RunCycleAsync(scope, batchSize: 10, signalRejectionDays: 90, reconciliationDays: 180, CancellationToken.None);
+        var result = await worker.RunCycleAsync(scope, batchSize: 10, signalRejectionDays: 90, reconciliationDays: 180, mlAdwinDriftLogDays: 365, CancellationToken.None);
 
         Assert.Equal(25, result.SignalRejectionDeleted);
         Assert.Empty(ctx.Set<SignalRejectionAudit>().ToList());
@@ -165,7 +165,7 @@ public class AuditRetentionWorkerTest
         using var scope = provider.CreateScope();
         var worker = NewWorker(time, provider);
 
-        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 90, reconciliationDays: 180, CancellationToken.None);
+        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 90, reconciliationDays: 180, mlAdwinDriftLogDays: 365, CancellationToken.None);
 
         Assert.Equal(0, result.SignalRejectionDeleted);
         Assert.Equal(0, result.ReconciliationDeleted);
@@ -194,7 +194,7 @@ public class AuditRetentionWorkerTest
 
         // signalRejectionDays = 0 clamps to 1 → a 12-hour-old row stays within
         // the retention window.
-        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 0, reconciliationDays: 180, CancellationToken.None);
+        var result = await worker.RunCycleAsync(scope, batchSize: 1000, signalRejectionDays: 0, reconciliationDays: 180, mlAdwinDriftLogDays: 365, CancellationToken.None);
 
         Assert.Equal(0, result.SignalRejectionDeleted);
         Assert.Single(ctx.Set<SignalRejectionAudit>().ToList());
@@ -233,5 +233,12 @@ internal sealed class RetentionTestContext : DbContext,
         modelBuilder.Entity<SignalRejectionAudit>().HasKey(e => e.Id);
         modelBuilder.Entity<ReconciliationRun>().HasKey(e => e.Id);
         modelBuilder.Entity<EngineConfig>().HasKey(e => e.Id);
+        modelBuilder.Entity<MLAdwinDriftLog>(builder =>
+        {
+            builder.HasKey(e => e.Id);
+            builder.Property(e => e.Timeframe).HasConversion<string>();
+            builder.Property(e => e.DominantRegime).HasConversion<string>();
+            builder.Ignore(e => e.MLModel);
+        });
     }
 }

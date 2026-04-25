@@ -61,6 +61,7 @@ internal sealed class StrategyGenerationScreeningContext
     public required Dictionary<string, DateTime> RegimeDetectedAtBySymbol { get; init; }
     public required HashSet<string> TransitionSymbols { get; init; }
     public required IReadOnlyList<string> LowConfidenceSymbols { get; init; }
+    public required IReadOnlyDictionary<string, StrategyGenerationDataHealthSnapshot> DataHealthBySymbol { get; init; }
     public HaircutRatios? Haircuts { get; init; }
     public IReadOnlyList<(DateTime Date, decimal Equity)>? PortfolioEquityCurve { get; init; }
     public ISpreadProfileProvider? SpreadProfileProvider { get; init; }
@@ -125,8 +126,27 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
             .GroupBy(e => e.Symbol)
             .ToDictionary(g => g.Key, g => g.Count());
 
+        var unhealthyDataSymbols = context.ActivePairs
+            .Where(sym => context.DataHealthBySymbol.TryGetValue(sym, out var health)
+                       && (health.Score < config.MinDataHealthScore || !health.HasEligibleTimeframe))
+            .ToList();
+        var unhealthyDataSymbolSet = unhealthyDataSymbols.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var symbol in unhealthyDataSymbols)
+        {
+            _metrics.StrategyGenSymbolsSkipped.Add(1,
+                new KeyValuePair<string, object?>("reason", "market_data_unhealthy"));
+            if (context.DataHealthBySymbol.TryGetValue(symbol, out var health))
+            {
+                _logger.LogDebug(
+                    "StrategyGenerationWorker: data-health preflight skipped {Symbol} (score={Score:F2}, required={Required:F2})",
+                    symbol,
+                    health.Score,
+                    config.MinDataHealthScore);
+            }
+        }
+
         var prioritisedSymbols = context.ActivePairs
-            .Where(sym => context.RegimeBySymbol.ContainsKey(sym))
+            .Where(sym => context.RegimeBySymbol.ContainsKey(sym) && !unhealthyDataSymbolSet.Contains(sym))
             .OrderBy(sym => totalCountBySymbol.TryGetValue(sym, out var count) ? count : 0)
             .ToList();
 
@@ -159,8 +179,30 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
         var screeningConfig = BuildScreeningConfig(config);
         var lowConfidenceSymbolSet = context.LowConfidenceSymbols.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var skippedNoRegime = context.ActivePairs
-            .Where(sym => !context.RegimeBySymbol.ContainsKey(sym) && !lowConfidenceSymbolSet.Contains(sym))
+            .Where(sym => !context.RegimeBySymbol.ContainsKey(sym)
+                       && !lowConfidenceSymbolSet.Contains(sym)
+                       && !unhealthyDataSymbolSet.Contains(sym))
             .ToList();
+
+        if (unhealthyDataSymbols.Count > 0)
+        {
+            var summary = unhealthyDataSymbols
+                .Select(sym =>
+                {
+                    if (!context.DataHealthBySymbol.TryGetValue(sym, out var health))
+                        return $"{sym}:missing";
+
+                    var reasons = health.Timeframes
+                        .Where(tf => !tf.IsEligible)
+                        .GroupBy(tf => tf.Reason)
+                        .Select(g => $"{g.Key}={g.Count()}");
+                    return $"{sym}:score={health.Score:F2}({string.Join("/", reasons)})";
+                });
+            _logger.LogInformation(
+                "StrategyGenerationWorker: data-health preflight skipped {Count} symbols — {Summary}",
+                unhealthyDataSymbols.Count,
+                string.Join(", ", summary));
+        }
 
         var resumeState = await _checkpointCoordinator.RestoreAsync(
             db,
@@ -267,7 +309,7 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
             reserveCreated,
             candidatesScreened,
             primaryResult.SymbolsProcessed,
-            primaryResult.SymbolsSkipped);
+            primaryResult.SymbolsSkipped + unhealthyDataSymbols.Count);
     }
 
     private ScreeningConfig BuildScreeningConfig(GenerationConfig config)
@@ -306,6 +348,10 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
             WalkForwardWindowCount = splitPcts.Count,
             WalkForwardMinWindowsPass = Math.Min(config.WalkForwardMinWindowsPass, splitPcts.Count),
             WalkForwardSplitPcts = splitPcts,
+            WalkForwardEmbargoPct = config.WalkForwardEmbargoPct,
+            LookaheadAuditEnabled = config.LookaheadAuditEnabled,
+            LookaheadAuditMaxTradeCountDelta = config.LookaheadAuditMaxTradeCountDelta,
+            LookaheadAuditMaxPnlDelta = config.LookaheadAuditMaxPnlDelta,
             MonteCarloShufflePermutations = config.MonteCarloShufflePermutations,
             MonteCarloShuffleMinPValue = config.MonteCarloShuffleMinPValue,
             ActiveStrategyCount = config.ActiveStrategyCount,

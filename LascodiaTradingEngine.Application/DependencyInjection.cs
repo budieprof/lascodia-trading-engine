@@ -110,6 +110,13 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLCorrelatedFailureOptions>>().Value);
 
+        services.RemoveAll<MLCorrelatedSignalConflictOptions>();
+        services.AddSingleton<IValidateOptions<MLCorrelatedSignalConflictOptions>, MLCorrelatedSignalConflictOptionsValidator>();
+        services.AddOptions<MLCorrelatedSignalConflictOptions>()
+            .Bind(configuration.GetSection(nameof(MLCorrelatedSignalConflictOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLCorrelatedSignalConflictOptions>>().Value);
+
         services.RemoveAll<MLErgodicityOptions>();
         services.AddSingleton<IValidateOptions<MLErgodicityOptions>, MLErgodicityOptionsValidator>();
         services.AddOptions<MLErgodicityOptions>()

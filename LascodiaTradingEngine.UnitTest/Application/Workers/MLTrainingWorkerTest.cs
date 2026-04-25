@@ -316,6 +316,40 @@ public class MLTrainingWorkerTest
         return new TrainingResult(metrics, cvResult, modelBytes ?? System.Text.Encoding.UTF8.GetBytes("{}"));
     }
 
+    private static byte[] CreateAverageWeightInitializerSnapshotBytes()
+    {
+        var snapshot = new ModelSnapshot
+        {
+            Type = "BaggedLogisticEnsemble",
+            Version = "avgwi-test",
+            FeatureSchemaVersion = 2,
+            Features = ["F0", "F1"],
+            FeatureSchemaFingerprint = "schema-v2",
+            PreprocessingFingerprint = "prep-v1",
+            RawFeatureIndices = [0, 1],
+            ActiveFeatureMask = [true, true],
+            FeatureSubsetIndices =
+            [
+                [0, 1],
+                [0, 1]
+            ],
+            Means = [0f, 0f],
+            Stds = [1f, 1f],
+            BaseLearnersK = 2,
+            Weights =
+            [
+                [1d, 2d],
+                [3d, 4d]
+            ],
+            Biases = [0.1d, 0.2d],
+            FeatureImportanceScores = [0.01d, 0.02d],
+            GenerationNumber = 0,
+            ParentModelId = 0
+        };
+
+        return JsonSerializer.SerializeToUtf8Bytes(snapshot);
+    }
+
     private static byte[] CreateFtTransformerPromotionSnapshotBytes(
         bool includeSplitSummary = true,
         bool includeAuditArtifact = true,
@@ -892,6 +926,79 @@ public class MLTrainingWorkerTest
 
         Assert.Null(exception);
         _mockWriteContext.Verify(c => c.GetDbContext(), Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task ColdStart_RunUsesAverageWeightInitializerWarmStart()
+    {
+        var run = new MLTrainingRun
+        {
+            Id = 42,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            TriggerType = TriggerType.Scheduled,
+            Status = RunStatus.Queued,
+            FromDate = DateTime.UtcNow.AddDays(-90),
+            ToDate = DateTime.UtcNow,
+            StartedAt = DateTime.UtcNow.AddMinutes(-5),
+            LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+            IsDeleted = false
+        };
+
+        var initializerModel = new MLModel
+        {
+            Id = 9001,
+            Symbol = "ALL",
+            Timeframe = Timeframe.H1,
+            LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+            ModelVersion = "avgwi-baggedlogistic-h1-test",
+            Status = MLModelStatus.Active,
+            IsActive = true,
+            IsMamlInitializer = true,
+            TrainedAt = DateTime.UtcNow.AddHours(-1),
+            ActivatedAt = DateTime.UtcNow.AddHours(-1),
+            ModelBytes = CreateAverageWeightInitializerSnapshotBytes(),
+            IsDeleted = false
+        };
+
+        ModelSnapshot? capturedWarmStart = null;
+        long? capturedParentModelId = null;
+
+        SetupPipelineMocks(
+            run,
+            existingModels: new List<MLModel> { initializerModel });
+
+        SetupEngineConfigs(new List<EngineConfig>
+        {
+            new() { Key = "MLTraining:MinTrainingSamples", Value = "10" },
+            new() { Key = "MLTraining:RequireSymmetricTripleBarrier", Value = "false" },
+            new() { Key = "MLTraining:UseEventFeatureVector", Value = "false" },
+            new() { Key = "MLTraining:UseTickMicrostructureFeatureVector", Value = "false" },
+            new() { Key = "MLTraining:UseV5SyntheticMicrostructure", Value = "false" },
+            new() { Key = "MLTraining:UseV6OrderBookFeatures", Value = "false" },
+            new() { Key = "MLTraining:UseV7CpcFeatureVector", Value = "false" },
+            new() { Key = "MLAvgWeightInit:UseForColdStart", Value = "true" }
+        });
+
+        _mockTrainer
+            .Setup(t => t.TrainAsync(
+                It.IsAny<List<TrainingSample>>(),
+                It.IsAny<TrainingHyperparams>(),
+                It.IsAny<ModelSnapshot?>(),
+                It.IsAny<long?>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<List<TrainingSample>, TrainingHyperparams, ModelSnapshot?, long?, CancellationToken>((_, _, warmStart, parentModelId, _) =>
+            {
+                capturedWarmStart = warmStart;
+                capturedParentModelId = parentModelId;
+            })
+            .ReturnsAsync(MakeTrainingResult());
+
+        await InvokeProcessRunAsync(run);
+
+        Assert.NotNull(capturedWarmStart);
+        Assert.Equal("avgwi-test", capturedWarmStart!.Version);
+        Assert.Equal(initializerModel.Id, capturedParentModelId);
     }
 
     // ════════════════════════════════════════════════════════════════════════

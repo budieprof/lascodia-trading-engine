@@ -11,7 +11,7 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 public sealed record ScreeningMetrics
 {
     /// <summary>Schema version for forward/backward compatibility. Bump when adding fields.</summary>
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 7;
 
     [JsonPropertyName("schemaVersion")]
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
@@ -141,6 +141,26 @@ public sealed record ScreeningMetrics
     [JsonPropertyName("prunedAtUtc")]
     public DateTime? PrunedAtUtc { get; init; }
 
+    // ── v6 scorecard ─────────────────────────────────────────────────────
+
+    [JsonPropertyName("qualityScore")]
+    public double QualityScore { get; init; }
+
+    [JsonPropertyName("qualityScoreRaw")]
+    public double QualityScoreRaw { get; init; }
+
+    [JsonPropertyName("qualityCalibrationMultiplier")]
+    public double QualityCalibrationMultiplier { get; init; } = 1.0;
+
+    [JsonPropertyName("qualityCalibrationSampleCount")]
+    public int QualityCalibrationSampleCount { get; init; }
+
+    [JsonPropertyName("qualityBand")]
+    public string? QualityBand { get; init; }
+
+    [JsonPropertyName("isNearMiss")]
+    public bool IsNearMiss { get; init; }
+
     // ── Pipeline trace ─────────────────────────────────────────────────
 
     [JsonPropertyName("gateTrace")]
@@ -168,6 +188,8 @@ public sealed record ScreeningMetrics
             return metrics.SchemaVersion switch
             {
                 CurrentSchemaVersion => metrics,
+                6 => MigrateFromV6(metrics),
+                5 => MigrateFromV5(metrics),
                 4 => MigrateFromV4(metrics),
                 3 => MigrateFromV3(metrics),
                 >= 2 => MigrateFromV2(metrics),
@@ -182,19 +204,77 @@ public sealed record ScreeningMetrics
     }
 
     /// <summary>Migrates v1 (pre-schema) metrics: preserves IS/OOS data, marks missing gates as unevaluated.</summary>
-    private static ScreeningMetrics MigrateFromV1(ScreeningMetrics old) => old with
+    private static ScreeningMetrics MigrateFromV1(ScreeningMetrics old) => MigrateFromV5(old with
     {
-        SchemaVersion = CurrentSchemaVersion,
+        SchemaVersion = 5,
         // v1 lacked walk-forward and Monte Carlo fields — mark as unevaluated
         WalkForwardWindowsPassed = old.WalkForwardWindowsPassed > 0 ? old.WalkForwardWindowsPassed : -1,
         WalkForwardWindowsMask = old.WalkForwardWindowsMask > 0 ? old.WalkForwardWindowsMask : 0,
         EquityCurveR2 = old.EquityCurveR2 != 0 ? old.EquityCurveR2 : -1.0,
+    });
+
+    /// <summary>Migrates v5 metrics: adds the shared scorecard fields.</summary>
+    private static ScreeningMetrics MigrateFromV5(ScreeningMetrics old)
+    {
+        double score = ScreeningQualityScorer.ComputeScore(
+            new Backtesting.Models.BacktestResult
+            {
+                WinRate = (decimal)old.IsWinRate,
+                ProfitFactor = (decimal)old.IsProfitFactor,
+                SharpeRatio = (decimal)old.IsSharpeRatio,
+                MaxDrawdownPct = (decimal)old.IsMaxDrawdownPct,
+                TotalTrades = old.IsTotalTrades,
+            },
+            new Backtesting.Models.BacktestResult
+            {
+                WinRate = (decimal)old.OosWinRate,
+                ProfitFactor = (decimal)old.OosProfitFactor,
+                SharpeRatio = (decimal)old.OosSharpeRatio,
+                MaxDrawdownPct = (decimal)old.OosMaxDrawdownPct,
+                TotalTrades = old.OosTotalTrades,
+            },
+            old.EquityCurveR2,
+            old.WalkForwardWindowsPassed,
+            null,
+            old.MonteCarloPValue,
+            old.ShufflePValue,
+            old.MaxTradeTimeConcentration,
+            old.MarginalSharpeContribution,
+            old.KellySharpeRatio,
+            old.FixedLotSharpeRatio);
+
+        return old with
+        {
+            SchemaVersion = CurrentSchemaVersion,
+            QualityScore = old.QualityScore > 0 ? old.QualityScore : score,
+            QualityScoreRaw = old.QualityScoreRaw > 0
+                ? old.QualityScoreRaw
+                : old.QualityScore > 0 ? old.QualityScore : score,
+            QualityCalibrationMultiplier = old.QualityCalibrationMultiplier > 0
+                ? old.QualityCalibrationMultiplier
+                : 1.0,
+            QualityCalibrationSampleCount = old.QualityCalibrationSampleCount,
+            QualityBand = !string.IsNullOrWhiteSpace(old.QualityBand)
+                ? old.QualityBand
+                : ScreeningQualityScorer.ComputeBand(score),
+        };
+    }
+
+    /// <summary>Migrates v6 metrics: adds live/paper calibration metadata.</summary>
+    private static ScreeningMetrics MigrateFromV6(ScreeningMetrics old) => old with
+    {
+        SchemaVersion = CurrentSchemaVersion,
+        QualityScoreRaw = old.QualityScoreRaw > 0 ? old.QualityScoreRaw : old.QualityScore,
+        QualityCalibrationMultiplier = old.QualityCalibrationMultiplier > 0
+            ? old.QualityCalibrationMultiplier
+            : 1.0,
+        QualityCalibrationSampleCount = old.QualityCalibrationSampleCount,
     };
 
     /// <summary>Migrates v4 metrics: adds marginal Sharpe, Kelly/fixed-lot Sharpe, auto-promote, and live haircut fields.</summary>
-    private static ScreeningMetrics MigrateFromV4(ScreeningMetrics old) => old with
+    private static ScreeningMetrics MigrateFromV4(ScreeningMetrics old) => MigrateFromV5(old with
     {
-        SchemaVersion = CurrentSchemaVersion,
+        SchemaVersion = 5,
         MarginalSharpeContribution = 0,
         KellySharpeRatio = 0,
         FixedLotSharpeRatio = 0,
@@ -204,18 +284,18 @@ public sealed record ScreeningMetrics
         ProfitFactorHaircutApplied = 1.0,
         SharpeHaircutApplied = 1.0,
         DrawdownInflationApplied = 1.0,
-    };
+    });
 
     /// <summary>Migrates v3 metrics: adds GateTrace field (null for pre-v4 rows).</summary>
-    private static ScreeningMetrics MigrateFromV3(ScreeningMetrics old) => old with
+    private static ScreeningMetrics MigrateFromV3(ScreeningMetrics old) => MigrateFromV5(old with
     {
-        SchemaVersion = CurrentSchemaVersion,
+        SchemaVersion = 5,
         // GateTrace was not recorded in v3 — leave as null
-    };
+    });
 
     /// <summary>Migrates v2 metrics: all IS/OOS and quality gate fields exist, just bump version.</summary>
-    private static ScreeningMetrics MigrateFromV2(ScreeningMetrics old) => old with
+    private static ScreeningMetrics MigrateFromV2(ScreeningMetrics old) => MigrateFromV5(old with
     {
-        SchemaVersion = CurrentSchemaVersion,
-    };
+        SchemaVersion = 5,
+    });
 }

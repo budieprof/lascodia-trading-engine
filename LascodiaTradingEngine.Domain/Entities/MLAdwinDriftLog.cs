@@ -41,13 +41,15 @@ public class MLAdwinDriftLog : Entity<long>
 
     /// <summary>
     /// Mean directional accuracy of the older ADWIN sub-window at the selected split point.
-    /// When no drift is found, the current worker leaves this at <c>0</c>.
+    /// On healthy rows this still reflects the most informative audited split, which may
+    /// show stability, a near-miss, or even a statistically significant improvement.
     /// </summary>
     public double    Window1Mean    { get; set; }
 
     /// <summary>
     /// Mean directional accuracy of the newer ADWIN sub-window at the selected split point.
-    /// When no drift is found, the current worker leaves this at <c>0</c>.
+    /// On healthy rows this still reflects the most informative audited split, which may
+    /// show stability, a near-miss, or even a statistically significant improvement.
     /// </summary>
     public double    Window2Mean    { get; set; }
 
@@ -58,8 +60,8 @@ public class MLAdwinDriftLog : Entity<long>
     public double    EpsilonCut     { get; set; }
 
     /// <summary>
-    /// Number of older prediction outcomes in the first ADWIN sub-window. On non-drift
-    /// rows, this is the midpoint fallback used for audit consistency.
+    /// Number of older prediction outcomes in the first ADWIN sub-window chosen for the
+    /// persisted audit row.
     /// </summary>
     public int       Window1Size    { get; set; }
 
@@ -71,6 +73,37 @@ public class MLAdwinDriftLog : Entity<long>
 
     /// <summary>UTC timestamp when the ADWIN scan result was recorded.</summary>
     public DateTime  DetectedAt     { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// The accuracy drop (Window1Mean − Window2Mean), clamped to ≥ 0 when drift was detected.
+    /// Persisted so the operations team can chart degradation magnitude over time and tune
+    /// <c>Delta</c> from the historical false-positive distribution. <c>0</c> on healthy
+    /// (non-drift) audit rows.
+    /// </summary>
+    public double    AccuracyDrop   { get; set; }
+
+    /// <summary>
+    /// The Hoeffding confidence parameter that was active when the scan ran. Stored alongside
+    /// each row so retrospective analysis can reconstruct exactly which threshold was used,
+    /// even after operators tune <c>MLAdwinDrift:Delta</c>.
+    /// </summary>
+    public double    DeltaUsed      { get; set; }
+
+    /// <summary>
+    /// The dominant <see cref="MarketRegime"/> observed during the scanned window. Captured so
+    /// drift can be triaged by regime context (e.g. distinguishing model degradation from a
+    /// regime transition that the model is correctly tracking). Null when no
+    /// <c>MarketRegimeSnapshot</c> was available in the lookback window.
+    /// </summary>
+    public MarketRegime? DominantRegime { get; set; }
+
+    /// <summary>
+    /// Compressed (gzip) byte array of the binary outcome series used by the detector. One
+    /// byte per outcome (1 = direction correct, 0 = wrong). Enables forensic replay of the
+    /// detection decision long after the source <c>MLModelPredictionLog</c> rows have been
+    /// pruned. Null on rows where snapshotting is disabled by configuration.
+    /// </summary>
+    public byte[]?   OutcomeSeriesCompressed { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool      IsDeleted      { get; set; }

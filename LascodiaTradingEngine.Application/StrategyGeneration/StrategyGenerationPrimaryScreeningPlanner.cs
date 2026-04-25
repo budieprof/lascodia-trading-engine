@@ -521,7 +521,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
                 _metrics.StrategyGenCandleCacheEvictions.Add(1);
         }
 
-        if (candles.Count < 100)
+        if (candles.Count < config.DataHealthMinCandles)
         {
             _metrics.StrategyGenSymbolsSkipped.Add(1, new KeyValuePair<string, object?>("reason", "insufficient_candles"));
             return new CandleLoadResult(null, "insufficient_candles");
@@ -569,7 +569,13 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         }
 
         int adjustedMinTrades = AdjustMinTradesForTimeframe(config.MinTotalTrades, timeframe);
-        return new ScreeningThresholds(scaledWR, scaledPF, scaledSh, scaledDD, adjustedMinTrades);
+        return new ScreeningThresholds(
+            scaledWR,
+            scaledPF,
+            scaledSh,
+            scaledDD,
+            adjustedMinTrades,
+            config.MaxCostToWinRatio);
     }
 
     private List<Func<Task<ScreeningOutcome?>>> BuildScreeningTasks(
@@ -619,7 +625,11 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
             // (failedParamsForCombo + normalizedParams) still applies so duplicates
             // with prior rejections won't re-run within cooldown.
             var surrogateProposals = _surrogateService.GetProposals(
-                strategyType, args.Symbol, args.Timeframe, count: args.MaxTemplates);
+                strategyType,
+                args.Symbol,
+                args.Timeframe,
+                args.Regime,
+                count: args.MaxTemplates);
             if (surrogateProposals.Count > 0)
             {
                 var merged = new List<string>(surrogateProposals.Count + templates.Count);
@@ -820,12 +830,30 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         candidate.Strategy.GenerationCycleId = cycleId;
         candidate.Strategy.GenerationCandidateId = selection.Identity.CandidateId;
 
-        var metrics = (candidate.Metrics ?? BuildBaseMetrics(candidate)) with
+        var baseMetrics = candidate.Metrics ?? BuildBaseMetrics(candidate);
+        double qualityScore = baseMetrics.QualityScore > 0
+            ? baseMetrics.QualityScore
+            : ScreeningQualityScorer.ComputeScore(
+                candidate.TrainResult,
+                candidate.OosResult,
+                baseMetrics.EquityCurveR2,
+                baseMetrics.WalkForwardWindowsPassed,
+                null,
+                baseMetrics.MonteCarloPValue,
+                baseMetrics.ShufflePValue,
+                baseMetrics.MaxTradeTimeConcentration,
+                baseMetrics.MarginalSharpeContribution,
+                baseMetrics.KellySharpeRatio,
+                baseMetrics.FixedLotSharpeRatio);
+
+        var metrics = baseMetrics with
         {
             CycleId = cycleId,
             CandidateId = selection.Identity.CandidateId,
             SelectionScore = selection.Score.TotalScore,
             SelectionScoreBreakdown = selection.Score,
+            QualityScore = qualityScore,
+            QualityBand = ScreeningQualityScorer.ComputeBand(qualityScore),
         };
 
         candidate.Strategy.ScreeningMetricsJson = metrics.ToJson();

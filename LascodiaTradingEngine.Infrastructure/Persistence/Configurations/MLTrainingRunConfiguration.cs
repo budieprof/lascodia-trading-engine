@@ -37,6 +37,16 @@ public class MLTrainingRunConfiguration : IEntityTypeConfiguration<MLTrainingRun
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Status });
         builder.HasIndex(x => x.MLModelId);
 
+        // Partial unique index: at most one Queued or Running training run per
+        // (Symbol, Timeframe). Closes the TOCTOU race in MLAdwinDriftWorker (and
+        // any other auto-retrain trigger) where two concurrent worker instances
+        // could insert duplicate Queued runs between the existence-check and the
+        // insert. Filter syntax matches PostgreSQL's quoted-identifier convention.
+        builder.HasIndex(x => new { x.Symbol, x.Timeframe })
+               .IsUnique()
+               .HasDatabaseName("UX_MLTrainingRun_Active_Per_Pair")
+               .HasFilter("\"Status\" IN ('Queued','Running') AND \"IsDeleted\" = false");
+
         // ── Improvement 3.4: Data lineage ──
         builder.Property(x => x.DatasetHash).HasMaxLength(64);
 

@@ -748,9 +748,10 @@ public interface IStrategyScreeningArtifactFactory
         BacktestResult trainResult,
         BacktestResult oosResult,
         double? r2,
-        double pValue,
-        double shufflePValue,
+        double? pValue,
+        double? shufflePValue,
         int walkForwardPassed,
+        int? walkForwardRequiredForScore,
         int walkForwardMask,
         double maxConcentration,
         MarketRegimeEnum targetRegime,
@@ -789,6 +790,22 @@ public interface IStrategyScreeningArtifactFactory
 /// <see cref="StrategyGenerationScreeningContext"/> without repeatedly re-querying the same
 /// underlying market, regime, and existing-strategy state.
 /// </remarks>
+internal sealed record StrategyGenerationDataHealthTimeframeSnapshot(
+    Timeframe Timeframe,
+    int CandleCount,
+    DateTime? LatestClosedCandleUtc,
+    double? EffectiveAgeHours,
+    bool IsEligible,
+    string Reason);
+
+internal sealed record StrategyGenerationDataHealthSnapshot(
+    string Symbol,
+    double Score,
+    IReadOnlyList<StrategyGenerationDataHealthTimeframeSnapshot> Timeframes)
+{
+    public bool HasEligibleTimeframe => Timeframes.Any(t => t.IsEligible);
+}
+
 internal sealed record StrategyGenerationCycleDataSnapshot(
     List<string> ActivePairs,
     Dictionary<string, CurrencyPair> PairDataBySymbol,
@@ -802,7 +819,8 @@ internal sealed record StrategyGenerationCycleDataSnapshot(
     Dictionary<string, MarketRegimeEnum> RegimeTransitions,
     Dictionary<string, DateTime> RegimeDetectedAtBySymbol,
     HashSet<string> TransitionSymbols,
-    IReadOnlyList<string> LowConfidenceSymbols);
+    IReadOnlyList<string> LowConfidenceSymbols,
+    IReadOnlyDictionary<string, StrategyGenerationDataHealthSnapshot> DataHealthBySymbol);
 
 /// <summary>
 /// Durable keyed payload used for feedback-related state that must survive process restarts.

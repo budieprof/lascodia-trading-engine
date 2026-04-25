@@ -46,14 +46,21 @@ public sealed record GenerationConfig
     public int MaxCandleCacheSize { get; init; }
     public int CandleChunkSize { get; init; }
     public int MaxCandleAgeHours { get; init; }
+    public int DataHealthMinCandles { get; init; } = 100;
+    public double MinDataHealthScore { get; init; } = 0.50;
 
     public double MinEquityCurveR2 { get; init; }
     public double MaxTradeTimeConcentration { get; init; }
+    public double MaxCostToWinRatio { get; init; } = 0.35;
 
     public int WalkForwardWindowCount { get; init; }
     public int WalkForwardMinWindowsPass { get; init; }
     public string WalkForwardSplitPcts { get; init; } = "0.40,0.55,0.70";
     public IReadOnlyList<double> WalkForwardSplitPercentages { get; init; } = [];
+    public double WalkForwardEmbargoPct { get; init; } = 0.02;
+    public bool LookaheadAuditEnabled { get; init; } = true;
+    public double LookaheadAuditMaxTradeCountDelta { get; init; } = 0.50;
+    public double LookaheadAuditMaxPnlDelta { get; init; } = 0.50;
 
     public bool MonteCarloEnabled { get; init; }
     public int MonteCarloPermutations { get; init; }
@@ -65,6 +72,8 @@ public sealed record GenerationConfig
     public bool PortfolioBacktestEnabled { get; init; }
     public double MaxPortfolioDrawdownPct { get; init; }
     public double PortfolioCorrelationWeight { get; init; }
+    public double MaxPortfolioSymbolWeightPct { get; init; } = 0.35;
+    public double MaxPortfolioCurrencyExposurePct { get; init; } = 0.80;
 
     public int StrategicReserveQuota { get; init; }
     public int MaxCandidatesPerWeek { get; init; }

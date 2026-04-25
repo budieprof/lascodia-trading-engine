@@ -86,6 +86,7 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
             .GroupBy(e => e.Symbol)
             .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
         var prioritisedSymbols = context.RegimeBySymbol.Keys
+            .Where(sym => IsDataHealthyForReserveSymbol(context, config, sym))
             .OrderBy(sym => totalCountBySymbol.TryGetValue(sym, out var count) ? count : 0)
             .ThenBy(sym => sym, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -155,6 +156,12 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
             {
                 if (reserveCreated >= config.StrategicReserveQuota || totalCreated >= config.MaxCandidates)
                     break;
+                if (!IsDataHealthyForReserveTimeframe(context, reserveTf, symbol))
+                {
+                    _metrics.StrategyGenSymbolsSkipped.Add(1,
+                        new KeyValuePair<string, object?>("reason", "reserve_market_data_unhealthy"));
+                    continue;
+                }
 
                 var candleLoad = await LoadCandlesForScreeningAsync(db, candleCache, config, pairInfo, symbol, reserveTf, ct);
                 if (candleLoad.Candles == null)
@@ -223,7 +230,8 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
                         primaryThresholds.MinProfitFactor * mul,
                         primaryThresholds.MinSharpe * mul,
                         primaryThresholds.MaxDrawdownPct * ddRelax,
-                        primaryThresholds.MinTotalTrades);
+                        primaryThresholds.MinTotalTrades,
+                        primaryThresholds.MaxCostToWinRatio);
                     var orderedTemplates = OrderTemplatesForRegime(
                         templates,
                         reserveTargetRegime,
@@ -455,7 +463,7 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
                 _metrics.StrategyGenCandleCacheEvictions.Add(1);
         }
 
-        if (candles.Count < 100)
+        if (candles.Count < config.DataHealthMinCandles)
         {
             _metrics.StrategyGenSymbolsSkipped.Add(1, new KeyValuePair<string, object?>("reason", "insufficient_candles"));
             return new CandleLoadResult(null, "insufficient_candles");
@@ -513,6 +521,10 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
             WalkForwardWindowCount = splitPcts.Count,
             WalkForwardMinWindowsPass = Math.Min(config.WalkForwardMinWindowsPass, splitPcts.Count),
             WalkForwardSplitPcts = splitPcts,
+            WalkForwardEmbargoPct = config.WalkForwardEmbargoPct,
+            LookaheadAuditEnabled = config.LookaheadAuditEnabled,
+            LookaheadAuditMaxTradeCountDelta = config.LookaheadAuditMaxTradeCountDelta,
+            LookaheadAuditMaxPnlDelta = config.LookaheadAuditMaxPnlDelta,
             MonteCarloShufflePermutations = config.MonteCarloShufflePermutations,
             MonteCarloShuffleMinPValue = config.MonteCarloShuffleMinPValue,
             ActiveStrategyCount = config.ActiveStrategyCount,
@@ -587,7 +599,13 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
         }
 
         int adjustedMinTrades = AdjustMinTradesForTimeframe(config.MinTotalTrades, timeframe);
-        return new ScreeningThresholds(scaledWR, scaledPF, scaledSh, scaledDD, adjustedMinTrades);
+        return new ScreeningThresholds(
+            scaledWR,
+            scaledPF,
+            scaledSh,
+            scaledDD,
+            adjustedMinTrades,
+            config.MaxCostToWinRatio);
     }
 
     private static void IncrementGeneratedCounts(
@@ -625,15 +643,56 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
         candidate.Strategy.GenerationCycleId = cycleId;
         candidate.Strategy.GenerationCandidateId = selection.Identity.CandidateId;
 
-        var metrics = (candidate.Metrics ?? BuildBaseMetrics(candidate)) with
+        var baseMetrics = candidate.Metrics ?? BuildBaseMetrics(candidate);
+        double qualityScore = baseMetrics.QualityScore > 0
+            ? baseMetrics.QualityScore
+            : ScreeningQualityScorer.ComputeScore(
+                candidate.TrainResult,
+                candidate.OosResult,
+                baseMetrics.EquityCurveR2,
+                baseMetrics.WalkForwardWindowsPassed,
+                null,
+                baseMetrics.MonteCarloPValue,
+                baseMetrics.ShufflePValue,
+                baseMetrics.MaxTradeTimeConcentration,
+                baseMetrics.MarginalSharpeContribution,
+                baseMetrics.KellySharpeRatio,
+                baseMetrics.FixedLotSharpeRatio);
+
+        var metrics = baseMetrics with
         {
             CycleId = cycleId,
             CandidateId = selection.Identity.CandidateId,
             SelectionScore = selection.Score.TotalScore,
             SelectionScoreBreakdown = selection.Score,
+            QualityScore = qualityScore,
+            QualityBand = ScreeningQualityScorer.ComputeBand(qualityScore),
         };
 
         candidate.Strategy.ScreeningMetricsJson = metrics.ToJson();
         return candidate with { Metrics = metrics };
+    }
+
+    private static bool IsDataHealthyForReserveSymbol(
+        StrategyGenerationScreeningContext context,
+        GenerationConfig config,
+        string symbol)
+    {
+        if (!context.DataHealthBySymbol.TryGetValue(symbol, out var health))
+            return true;
+
+        return health.Score >= config.MinDataHealthScore && health.HasEligibleTimeframe;
+    }
+
+    private static bool IsDataHealthyForReserveTimeframe(
+        StrategyGenerationScreeningContext context,
+        Timeframe timeframe,
+        string symbol)
+    {
+        if (!context.DataHealthBySymbol.TryGetValue(symbol, out var health))
+            return true;
+
+        var snapshot = health.Timeframes.FirstOrDefault(tf => tf.Timeframe == timeframe);
+        return snapshot?.IsEligible ?? false;
     }
 }

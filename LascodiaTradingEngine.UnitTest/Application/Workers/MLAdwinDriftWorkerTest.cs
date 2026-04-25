@@ -1,359 +1,756 @@
+using System.IO.Compression;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Moq;
-using MockQueryable.Moq;
+using Microsoft.Extensions.Logging.Abstractions;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.UnitTest.TestHelpers;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Workers;
 
-public class MLAdwinDriftWorkerTest
+public sealed class MLAdwinDriftWorkerTest
 {
-    private readonly Mock<IReadApplicationDbContext>  _mockReadContext;
-    private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
-    private readonly Mock<ILogger<MLAdwinDriftWorker>> _mockLogger;
-    private readonly Mock<IServiceScopeFactory>       _mockScopeFactory;
-    private readonly Mock<DbContext>                  _mockReadDbContext;
-    private readonly Mock<DbContext>                  _mockWriteDbContext;
-
-    private readonly MLAdwinDriftWorker _worker;
-
-    public MLAdwinDriftWorkerTest()
+    [Fact]
+    public async Task RunCycleAsync_DegradingShift_SetsFutureFlag_QueuesRetraining_AndWritesDriftLog()
     {
-        _mockReadContext   = new Mock<IReadApplicationDbContext>();
-        _mockWriteContext  = new Mock<IWriteApplicationDbContext>();
-        _mockLogger        = new Mock<ILogger<MLAdwinDriftWorker>>();
-        _mockScopeFactory  = new Mock<IServiceScopeFactory>();
-        _mockReadDbContext  = new Mock<DbContext>();
-        _mockWriteDbContext = new Mock<DbContext>();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
 
-        _mockReadContext.Setup(c => c.GetDbContext()).Returns(_mockReadDbContext.Object);
-        _mockWriteContext.Setup(c => c.GetDbContext()).Returns(_mockWriteDbContext.Object);
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
 
-        // Wire up IServiceScopeFactory -> IServiceScope -> IServiceProvider
-        var mockScope           = new Mock<IServiceScope>();
-        var mockServiceProvider = new Mock<IServiceProvider>();
+        var flag = await harness.LoadFlagAsync("EURUSD", Timeframe.H1);
+        var run = Assert.Single(await harness.LoadTrainingRunsAsync());
+        var driftLog = Assert.Single(await harness.LoadDriftLogsAsync());
 
-        mockServiceProvider
-            .Setup(sp => sp.GetService(typeof(IReadApplicationDbContext)))
-            .Returns(_mockReadContext.Object);
+        Assert.Null(result.SkippedReason);
+        Assert.Equal(1, result.CandidateModelCount);
+        Assert.Equal(1, result.EvaluatedModelCount);
+        Assert.Equal(1, result.DriftCount);
+        Assert.Equal(1, result.RetrainingQueuedCount);
+        Assert.Equal(0, result.FlagClearCount);
 
-        mockServiceProvider
-            .Setup(sp => sp.GetService(typeof(IWriteApplicationDbContext)))
-            .Returns(_mockWriteContext.Object);
+        Assert.NotNull(flag);
+        Assert.False(flag!.IsDeleted);
+        Assert.True(flag.ExpiresAtUtc > now.UtcDateTime);
+        Assert.Equal("AdwinDrift", flag.DetectorType);
+        Assert.Equal(1, flag.ConsecutiveDetections);
 
-        mockScope.Setup(s => s.ServiceProvider).Returns(mockServiceProvider.Object);
+        Assert.Equal(TriggerType.AutoDegrading, run.TriggerType);
+        Assert.Equal(RunStatus.Queued, run.Status);
+        Assert.Equal(LearnerArchitecture.BaggedLogistic, run.LearnerArchitecture);
+        Assert.Equal("AdwinDrift", run.DriftTriggerType);
+        Assert.Equal(1, run.Priority);
 
-        _mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);
+        using var metadata = JsonDocument.Parse(run.DriftMetadataJson!);
+        Assert.Equal("ADWIN", metadata.RootElement.GetProperty("detector").GetString());
+        Assert.Equal("degradation", metadata.RootElement.GetProperty("direction").GetString());
+        Assert.True(metadata.RootElement.GetProperty("accuracyDrop").GetDouble() > 0);
 
-        _worker = new MLAdwinDriftWorker(_mockScopeFactory.Object, _mockLogger.Object);
+        Assert.True(driftLog.DriftDetected);
+        Assert.True(driftLog.Window1Mean > driftLog.Window2Mean);
+        Assert.True(driftLog.EpsilonCut > 0);
+        Assert.True(driftLog.AccuracyDrop > 0);
+        Assert.Equal(0.002, driftLog.DeltaUsed, 6);
+        Assert.Equal(100, driftLog.Window1Size + driftLog.Window2Size);
+        Assert.NotNull(driftLog.OutcomeSeriesCompressed);
+        Assert.Equal(100, DecompressOutcomeSeries(driftLog.OutcomeSeriesCompressed!).Length);
     }
 
-    private void SetupModels(List<MLModel> models)
+    [Fact]
+    public async Task RunCycleAsync_SignificantImprovement_DoesNotSetFlagOrQueueRetraining()
     {
-        var mockSet = models.AsQueryable().BuildMockDbSet();
-        _mockReadDbContext.Setup(c => c.Set<MLModel>()).Returns(mockSet.Object);
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                // Pre-existing live drift flag — we expect the worker to expire it.
+                db.Set<MLDriftFlag>().Add(new MLDriftFlag
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    DetectorType = "AdwinDrift",
+                    ExpiresAtUtc = now.AddHours(4).UtcDateTime,
+                    FirstDetectedAtUtc = now.AddDays(-1).UtcDateTime,
+                    LastRefreshedAtUtc = now.AddHours(-1).UtcDateTime,
+                    ConsecutiveDetections = 3,
+                    IsDeleted = false,
+                });
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(false, 60).Concat(Enumerable.Repeat(true, 40))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var flag = await harness.LoadFlagAsync("EURUSD", Timeframe.H1);
+        var driftLog = Assert.Single(await harness.LoadDriftLogsAsync());
+
+        Assert.Null(result.SkippedReason);
+        Assert.Equal(1, result.EvaluatedModelCount);
+        Assert.Equal(0, result.DriftCount);
+        Assert.Equal(0, result.RetrainingQueuedCount);
+        Assert.Equal(1, result.FlagClearCount);
+        Assert.Empty(await harness.LoadTrainingRunsAsync());
+
+        Assert.NotNull(flag);
+        Assert.True(flag!.ExpiresAtUtc <= now.UtcDateTime);
+        Assert.Equal(0, flag.ConsecutiveDetections);
+
+        Assert.False(driftLog.DriftDetected);
+        Assert.True(driftLog.Window2Mean > driftLog.Window1Mean);
+        Assert.Equal(0.0, driftLog.AccuracyDrop);
     }
 
-    private void SetupPredictionLogs(List<MLModelPredictionLog> logs)
+    [Fact]
+    public async Task RunCycleAsync_StaleResolvedHistoryOutsideLookback_IsSkipped()
     {
-        var mockSet = logs.AsQueryable().BuildMockDbSet();
-        _mockReadDbContext.Setup(c => c.Set<MLModelPredictionLog>()).Returns(mockSet.Object);
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                AddConfig(db, "MLAdwinDrift:LookbackDays", "1");
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddDays(-10).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Null(result.SkippedReason);
+        // The "has >= MinResolvedPredictions" filter now lives in SQL, so dormant models
+        // never reach the per-model evaluation loop and the candidate count is zero.
+        Assert.Equal(0, result.CandidateModelCount);
+        Assert.Equal(0, result.EvaluatedModelCount);
+        Assert.Equal(0, result.DriftCount);
+        Assert.Empty(await harness.LoadDriftLogsAsync());
+        Assert.Empty(await harness.LoadTrainingRunsAsync());
+        Assert.Null(await harness.LoadFlagAsync("EURUSD", Timeframe.H1));
     }
 
-    private void SetupTrainingRuns(List<MLTrainingRun> runs)
+    [Fact]
+    public async Task RunCycleAsync_RevivesSoftDeletedFlag_WhenDriftDetected()
     {
-        var mockSet = runs.AsQueryable().BuildMockDbSet();
-        _mockReadDbContext.Setup(c => c.Set<MLTrainingRun>()).Returns(mockSet.Object);
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLDriftFlag>().Add(new MLDriftFlag
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    DetectorType = "AdwinDrift",
+                    ExpiresAtUtc = now.AddHours(-2).UtcDateTime,
+                    FirstDetectedAtUtc = now.AddDays(-2).UtcDateTime,
+                    LastRefreshedAtUtc = now.AddDays(-1).UtcDateTime,
+                    ConsecutiveDetections = 0,
+                    IsDeleted = true,
+                });
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var revivedFlag = await harness.LoadFlagAsync("EURUSD", Timeframe.H1, includeDeleted: true);
+
+        Assert.Null(result.SkippedReason);
+        Assert.Equal(1, result.DriftCount);
+        Assert.NotNull(revivedFlag);
+        Assert.False(revivedFlag!.IsDeleted);
+        Assert.True(revivedFlag.ExpiresAtUtc > now.UtcDateTime);
+        Assert.Equal(1, revivedFlag.ConsecutiveDetections);
     }
 
-    private void SetupEngineConfigs(List<EngineConfig> configs)
+    [Fact]
+    public async Task RunCycleAsync_WhenDistributedLockBusy_SkipsWithoutMutatingState()
     {
-        var mockSet = configs.AsQueryable().BuildMockDbSet();
-        _mockReadDbContext.Setup(c => c.Set<EngineConfig>()).Returns(mockSet.Object);
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now),
+            distributedLock: new TestDistributedLock(lockAvailable: false));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("lock_busy", result.SkippedReason);
+        Assert.Empty(await harness.LoadDriftLogsAsync());
+        Assert.Empty(await harness.LoadTrainingRunsAsync());
+        Assert.Null(await harness.LoadFlagAsync("EURUSD", Timeframe.H1));
     }
 
-    private void SetupWriteDbSets()
+    [Fact]
+    public async Task RunCycleAsync_InvalidSettingsAreClampedSafely()
     {
-        var driftLogs = new List<MLAdwinDriftLog>().AsQueryable().BuildMockDbSet();
-        _mockWriteDbContext.Setup(c => c.Set<MLAdwinDriftLog>()).Returns(driftLogs.Object);
-
-        var trainingRuns = new List<MLTrainingRun>().AsQueryable().BuildMockDbSet();
-        _mockWriteDbContext.Setup(c => c.Set<MLTrainingRun>()).Returns(trainingRuns.Object);
-
-        var engineConfigs = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
-        _mockWriteDbContext.Setup(c => c.Set<EngineConfig>()).Returns(engineConfigs.Object);
-    }
-
-    /// <summary>
-    /// Runs the worker for a single iteration by cancelling after a short delay.
-    /// </summary>
-    private async Task RunWorkerOnceAsync()
-    {
-        using var cts = new CancellationTokenSource();
-        cts.CancelAfter(TimeSpan.FromMilliseconds(200));
-
-        try
+        using var harness = CreateHarness(db =>
         {
-            await _worker.StartAsync(cts.Token);
-            await Task.Delay(TimeSpan.FromMilliseconds(300));
-            await _worker.StopAsync(CancellationToken.None);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when cancellation fires
-        }
+            AddConfig(db, "MLAdwinDrift:PollIntervalSeconds", "-1");
+            AddConfig(db, "MLAdwinDrift:WindowSize", "1");
+            AddConfig(db, "MLAdwinDrift:MinResolvedPredictions", "999999");
+            AddConfig(db, "MLAdwinDrift:Delta", "0");
+            AddConfig(db, "MLAdwinDrift:LookbackDays", "0");
+            AddConfig(db, "MLAdwinDrift:FlagTtlHours", "0");
+            AddConfig(db, "MLAdwinDrift:MaxModelsPerCycle", "0");
+            AddConfig(db, "MLAdwinDrift:LockTimeoutSeconds", "-2");
+            AddConfig(db, "MLAdwinDrift:MinTimeBetweenRetrainsHours", "-7");
+            AddConfig(db, "MLAdwinDrift:DbCommandTimeoutSeconds", "-1");
+            AddConfig(db, "MLTraining:TrainingDataWindowDays", "0");
+        });
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromSeconds(24 * 60 * 60), result.Settings.PollInterval);
+        Assert.Equal(60, result.Settings.WindowSize);
+        Assert.Equal(60, result.Settings.MinResolvedPredictions);
+        Assert.Equal(0.002, result.Settings.Delta, 6);
+        Assert.Equal(180, result.Settings.LookbackDays);
+        Assert.Equal(48, result.Settings.FlagTtlHours);
+        Assert.Equal(256, result.Settings.MaxModelsPerCycle);
+        Assert.Equal(5, result.Settings.LockTimeoutSeconds);
+        Assert.Equal(365, result.Settings.TrainingDataWindowDays);
+        Assert.Equal(12, result.Settings.MinTimeBetweenRetrainsHours);
+        Assert.Equal(60, result.Settings.DbCommandTimeoutSeconds);
+        Assert.True(result.Settings.SnapshotOutcomeSeries);
     }
 
-    /// <summary>
-    /// Helper to generate prediction logs with a given directional accuracy pattern.
-    /// </summary>
-    private static List<MLModelPredictionLog> GenerateLogs(
-        long modelId, int count, Func<int, bool> isCorrect)
+    [Fact]
+    public async Task RunCycleAsync_UsesStrongestDegradingSplit_NotFirstSignificantSplit()
     {
-        var baseDate = DateTime.UtcNow.AddDays(-count);
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 60).Concat(Enumerable.Repeat(false, 40))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var driftLog = Assert.Single(await harness.LoadDriftLogsAsync());
+
+        Assert.Equal(1, result.DriftCount);
+        Assert.True(driftLog.DriftDetected);
+        Assert.Equal(60, driftLog.Window1Size);
+        Assert.Equal(40, driftLog.Window2Size);
+        Assert.True(driftLog.Window1Mean > driftLog.Window2Mean);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_RecentCompletedAutoDegradingRun_SuppressesNewQueueing()
+    {
+        // Simulates the cooldown path: an earlier auto-degrading run completed 6 hours
+        // ago and is still propagating through SPRT shadow evaluation. A fresh degradation
+        // signal should NOT queue a new run inside the 12h cooldown window.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLTrainingRun>().Add(new MLTrainingRun
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    TriggerType = TriggerType.AutoDegrading,
+                    Status = RunStatus.Completed,
+                    DriftTriggerType = "AdwinDrift",
+                    StartedAt = now.AddHours(-7).UtcDateTime,
+                    CompletedAt = now.AddHours(-6).UtcDateTime,
+                    FromDate = now.AddDays(-365).UtcDateTime,
+                    ToDate = now.AddHours(-7).UtcDateTime,
+                    LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+                    IsDeleted = false,
+                });
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.DriftCount);
+        Assert.Equal(0, result.RetrainingQueuedCount);
+        // Only the seeded historical run should remain; no new auto-degrading run.
+        var runs = await harness.LoadTrainingRunsAsync();
+        Assert.Single(runs);
+        Assert.Equal(RunStatus.Completed, runs[0].Status);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OldCompletedRun_OutsideCooldown_DoesQueueRetraining()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLTrainingRun>().Add(new MLTrainingRun
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    TriggerType = TriggerType.AutoDegrading,
+                    Status = RunStatus.Completed,
+                    DriftTriggerType = "AdwinDrift",
+                    StartedAt = now.AddDays(-3).UtcDateTime,
+                    CompletedAt = now.AddDays(-2).UtcDateTime,
+                    FromDate = now.AddDays(-365).UtcDateTime,
+                    ToDate = now.AddDays(-3).UtcDateTime,
+                    LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+                    IsDeleted = false,
+                });
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.DriftCount);
+        Assert.Equal(1, result.RetrainingQueuedCount);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_PerPairDeltaOverride_AppliedAndRecordedInAuditRow()
+    {
+        // The override should reach AdwinDetector and be persisted on the audit row.
+        // We verify wiring (DeltaUsed) rather than detection outcome, because the
+        // detection outcome depends on the interaction between delta and the outcome
+        // stream and is covered by AdwinDetectorTest.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                AddConfig(db, "MLAdwinDrift:Override:EURUSD:H1:Delta", "0.05");
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var driftLog = Assert.Single(await harness.LoadDriftLogsAsync());
+
+        Assert.Equal(0.05, driftLog.DeltaUsed, 6);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_PerPairWindowSizeOverride_ReducesObservationWindow()
+    {
+        // Override the window size and confirm the audit row's window sums to it.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                AddConfig(db, "MLAdwinDrift:Override:EURUSD:H1:WindowSize", "80");
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-200).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 100).Concat(Enumerable.Repeat(false, 100))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var driftLog = Assert.Single(await harness.LoadDriftLogsAsync());
+
+        Assert.Equal(80, driftLog.Window1Size + driftLog.Window2Size);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_DominantRegimeRecorded_FromMostRecentSnapshot()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MarketRegimeSnapshot>().Add(new MarketRegimeSnapshot
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    Regime = MarketRegime.HighVolatility,
+                    Confidence = 0.85m,
+                    DetectedAt = now.AddHours(-2).UtcDateTime,
+                    IsDeleted = false,
+                });
+
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var driftLog = Assert.Single(await harness.LoadDriftLogsAsync());
+
+        Assert.Equal(MarketRegime.HighVolatility, driftLog.DominantRegime);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_DispatchesAlert_OnDrift()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var dispatcher = new RecordingAlertDispatcher();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now),
+            alertDispatcher: dispatcher);
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var dispatched = Assert.Single(dispatcher.Dispatched);
+        Assert.Equal(AlertType.MLModelDegraded, dispatched.alert.AlertType);
+        Assert.Equal(AlertSeverity.Medium, dispatched.alert.Severity);
+        Assert.Equal("EURUSD", dispatched.alert.Symbol);
+        Assert.Equal("adwin-drift:EURUSD:H1:AdwinDrift", dispatched.alert.DeduplicationKey);
+        Assert.True(dispatched.alert.CooldownSeconds > 0);
+        Assert.Contains("ADWIN drift", dispatched.message);
+    }
+
+    private static byte[] DecompressOutcomeSeries(byte[] compressed)
+    {
+        using var input = new MemoryStream(compressed);
+        using var gzip = new GZipStream(input, CompressionMode.Decompress);
+        using var output = new MemoryStream();
+        gzip.CopyTo(output);
+        return output.ToArray();
+    }
+
+    private static WorkerHarness CreateHarness(
+        Action<MLAdwinDriftWorkerTestContext> seed,
+        TimeProvider? timeProvider = null,
+        IDistributedLock? distributedLock = null,
+        IAlertDispatcher? alertDispatcher = null)
+    {
+        var connection = new SqliteConnection("Filename=:memory:");
+        connection.Open();
+
+        var services = new ServiceCollection();
+        services.AddDbContext<MLAdwinDriftWorkerTestContext>(options => options.UseSqlite(connection));
+        services.AddScoped<IWriteApplicationDbContext>(provider => provider.GetRequiredService<MLAdwinDriftWorkerTestContext>());
+        services.AddScoped<IReadApplicationDbContext>(provider => provider.GetRequiredService<MLAdwinDriftWorkerTestContext>());
+
+        var provider = services.BuildServiceProvider();
+
+        using (var scope = provider.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MLAdwinDriftWorkerTestContext>();
+            db.Database.EnsureCreated();
+            seed(db);
+            db.SaveChanges();
+        }
+
+        var worker = new MLAdwinDriftWorker(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<MLAdwinDriftWorker>.Instance,
+            distributedLock: distributedLock,
+            healthMonitor: null,
+            metrics: null,
+            timeProvider: timeProvider,
+            alertDispatcher: alertDispatcher);
+
+        return new WorkerHarness(provider, connection, worker);
+    }
+
+    private static void SeedActiveModel(
+        MLAdwinDriftWorkerTestContext db,
+        long id)
+    {
+        db.Set<MLModel>().Add(new MLModel
+        {
+            Id = id,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ModelVersion = "1.0.0",
+            FilePath = "/tmp/model.bin",
+            Status = MLModelStatus.Active,
+            IsActive = true,
+            TrainedAt = new DateTime(2026, 04, 20, 12, 0, 0, DateTimeKind.Utc),
+            ModelBytes = [1, 2, 3],
+            LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+            IsDeleted = false,
+            RowVersion = 1
+        });
+    }
+
+    private static void AddConfig(
+        MLAdwinDriftWorkerTestContext db,
+        string key,
+        string value)
+    {
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = key,
+            Value = value,
+            DataType = ConfigDataType.String,
+            IsHotReloadable = true,
+            LastUpdatedAt = DateTime.UtcNow,
+            IsDeleted = false
+        });
+    }
+
+    private static IReadOnlyList<MLModelPredictionLog> NewLogs(
+        long modelId,
+        DateTime startUtc,
+        IEnumerable<bool> outcomes)
+    {
         var logs = new List<MLModelPredictionLog>();
-        for (int i = 0; i < count; i++)
+        int index = 0;
+
+        foreach (var directionCorrect in outcomes)
         {
+            var predictedAtUtc = startUtc.AddHours(index);
             logs.Add(new MLModelPredictionLog
             {
-                Id               = i + 1,
-                MLModelId        = modelId,
-                DirectionCorrect = isCorrect(i),
-                PredictedAt      = baseDate.AddHours(i),
-                IsDeleted        = false,
-                Symbol           = "EURUSD",
-                Timeframe        = Timeframe.H1,
+                Id = index + 1,
+                TradeSignalId = index + 1,
+                MLModelId = modelId,
+                ModelRole = ModelRole.Champion,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                PredictedDirection = TradeDirection.Buy,
+                PredictedMagnitudePips = 0,
+                ConfidenceScore = 0.75m,
+                ServedCalibratedProbability = 0.75m,
+                DecisionThresholdUsed = 0.50m,
+                ActualDirection = directionCorrect ? TradeDirection.Buy : TradeDirection.Sell,
+                ActualMagnitudePips = directionCorrect ? 10m : -10m,
+                DirectionCorrect = directionCorrect,
+                PredictedAt = predictedAtUtc,
+                OutcomeRecordedAt = predictedAtUtc.AddMinutes(5),
+                IsDeleted = false
             });
+            index++;
         }
+
         return logs;
     }
 
-    // -- Test 1: No active models → no drift logs written
-
-    [Fact]
-    public async Task NoActiveModels_WritesNoLogs()
+    private sealed class WorkerHarness(
+        ServiceProvider provider,
+        SqliteConnection connection,
+        MLAdwinDriftWorker worker) : IDisposable
     {
-        // Arrange
-        SetupModels(new List<MLModel>());
-        SetupPredictionLogs(new List<MLModelPredictionLog>());
-        SetupTrainingRuns(new List<MLTrainingRun>());
-        SetupEngineConfigs(new List<EngineConfig>());
-        SetupWriteDbSets();
+        public MLAdwinDriftWorker Worker { get; } = worker;
 
-        // Act
-        await RunWorkerOnceAsync();
+        public async Task<List<MLTrainingRun>> LoadTrainingRunsAsync()
+        {
+            using var scope = provider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<MLAdwinDriftWorkerTestContext>();
+            return await db.Set<MLTrainingRun>()
+                .AsNoTracking()
+                .OrderBy(run => run.Id)
+                .ToListAsync();
+        }
 
-        // Assert — no drift log should be added
-        _mockWriteDbContext.Verify(
-            c => c.Set<MLAdwinDriftLog>(),
-            Times.Never);
+        public async Task<List<MLAdwinDriftLog>> LoadDriftLogsAsync()
+        {
+            using var scope = provider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<MLAdwinDriftWorkerTestContext>();
+            return await db.Set<MLAdwinDriftLog>()
+                .AsNoTracking()
+                .OrderBy(log => log.Id)
+                .ToListAsync();
+        }
+
+        public async Task<MLDriftFlag?> LoadFlagAsync(string symbol, Timeframe timeframe, bool includeDeleted = false)
+        {
+            using var scope = provider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<MLAdwinDriftWorkerTestContext>();
+
+            IQueryable<MLDriftFlag> query = db.Set<MLDriftFlag>().AsNoTracking();
+            if (includeDeleted)
+                query = query.IgnoreQueryFilters();
+
+            return await query.SingleOrDefaultAsync(f =>
+                f.Symbol == symbol &&
+                f.Timeframe == timeframe &&
+                f.DetectorType == "AdwinDrift");
+        }
+
+        public void Dispose()
+        {
+            provider.Dispose();
+            connection.Dispose();
+        }
     }
 
-    // -- Test 2: Insufficient logs (below MinLogs=60) → skips model
-
-    [Fact]
-    public async Task InsufficientLogs_SkipsModel()
+    private sealed class MLAdwinDriftWorkerTestContext(DbContextOptions<MLAdwinDriftWorkerTestContext> options)
+        : DbContext(options), IWriteApplicationDbContext, IReadApplicationDbContext
     {
-        // Arrange — active model with only 30 prediction logs (below MinLogs=60)
-        var model = new MLModel
+        public DbContext GetDbContext() => this;
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
-            Id               = 1,
-            Symbol           = "EURUSD",
-            Timeframe        = Timeframe.H1,
-            IsActive         = true,
-            IsDeleted        = false,
-            IsMetaLearner    = false,
-            IsMamlInitializer = false,
-        };
+            modelBuilder.Entity<EngineConfig>(builder =>
+            {
+                builder.HasKey(config => config.Id);
+                builder.HasQueryFilter(config => !config.IsDeleted);
+                builder.Property(config => config.DataType).HasConversion<string>();
+                builder.HasIndex(config => config.Key).IsUnique();
+            });
 
-        var logs = GenerateLogs(model.Id, 30, _ => true);
+            modelBuilder.Entity<MLModel>(builder =>
+            {
+                builder.HasKey(model => model.Id);
+                builder.HasQueryFilter(model => !model.IsDeleted);
+                builder.Property(model => model.Timeframe).HasConversion<string>();
+                builder.Property(model => model.Status).HasConversion<string>();
+                builder.Property(model => model.LearnerArchitecture).HasConversion<string>();
+                builder.Property(model => model.RowVersion).HasDefaultValue(0u).ValueGeneratedNever();
 
-        SetupModels(new List<MLModel> { model });
-        SetupPredictionLogs(logs);
-        SetupTrainingRuns(new List<MLTrainingRun>());
-        SetupEngineConfigs(new List<EngineConfig>());
-        SetupWriteDbSets();
+                builder.Ignore(model => model.TrainingRuns);
+                builder.Ignore(model => model.TradeSignals);
+                builder.Ignore(model => model.PredictionLogs);
+                builder.Ignore(model => model.ChampionEvaluations);
+                builder.Ignore(model => model.ChallengerEvaluations);
+                builder.Ignore(model => model.CausalFeatureAudits);
+                builder.Ignore(model => model.ConformalCalibrations);
+                builder.Ignore(model => model.FeatureInteractionAudits);
+                builder.Ignore(model => model.LifecycleLogs);
+            });
 
-        // Act
-        await RunWorkerOnceAsync();
+            modelBuilder.Entity<MLModelPredictionLog>(builder =>
+            {
+                builder.HasKey(log => log.Id);
+                builder.HasQueryFilter(log => !log.IsDeleted);
+                builder.Property(log => log.ModelRole).HasConversion<string>();
+                builder.Property(log => log.Timeframe).HasConversion<string>();
+                builder.Property(log => log.PredictedDirection).HasConversion<string>();
+                builder.Property(log => log.ActualDirection).HasConversion<string>();
 
-        // Assert — model skipped, no drift log written, no SaveChangesAsync
-        _mockWriteDbContext.Verify(
-            c => c.Set<MLAdwinDriftLog>(),
-            Times.Never);
+                builder.Ignore(log => log.TradeSignal);
+                builder.Ignore(log => log.MLModel);
+                builder.Ignore(log => log.MLConformalCalibration);
+            });
+
+            modelBuilder.Entity<MLTrainingRun>(builder =>
+            {
+                builder.HasKey(run => run.Id);
+                builder.HasQueryFilter(run => !run.IsDeleted);
+                builder.Property(run => run.Timeframe).HasConversion<string>();
+                builder.Property(run => run.TriggerType).HasConversion<string>();
+                builder.Property(run => run.Status).HasConversion<string>();
+                builder.Property(run => run.LearnerArchitecture).HasConversion<string>();
+
+                builder.Ignore(run => run.MLModel);
+            });
+
+            modelBuilder.Entity<MLAdwinDriftLog>(builder =>
+            {
+                builder.HasKey(log => log.Id);
+                builder.HasQueryFilter(log => !log.IsDeleted);
+                builder.Property(log => log.Timeframe).HasConversion<string>();
+                builder.Property(log => log.DominantRegime).HasConversion<string>();
+
+                builder.Ignore(log => log.MLModel);
+            });
+
+            modelBuilder.Entity<MLDriftFlag>(builder =>
+            {
+                builder.HasKey(f => f.Id);
+                builder.HasQueryFilter(f => !f.IsDeleted);
+                builder.Property(f => f.Timeframe).HasConversion<string>();
+                builder.HasIndex(f => new { f.Symbol, f.Timeframe, f.DetectorType }).IsUnique();
+            });
+
+            modelBuilder.Entity<MarketRegimeSnapshot>(builder =>
+            {
+                builder.HasKey(s => s.Id);
+                builder.HasQueryFilter(s => !s.IsDeleted);
+                builder.Property(s => s.Timeframe).HasConversion<string>();
+                builder.Property(s => s.Regime).HasConversion<string>();
+            });
+        }
     }
 
-    // -- Test 3: No drift → writes log with DriftDetected=false
-
-    [Fact]
-    public async Task NoDrift_WritesLogWithDriftDetectedFalse()
+    private sealed class TestDistributedLock(bool lockAvailable) : IDistributedLock
     {
-        // Arrange — 80 prediction logs all correct (accuracy ~100%), no drift possible
-        var model = new MLModel
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+            => Task.FromResult<IAsyncDisposable?>(lockAvailable ? new Releaser() : null);
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+            => TryAcquireAsync(lockKey, ct);
+
+        private sealed class Releaser : IAsyncDisposable
         {
-            Id               = 1,
-            Symbol           = "EURUSD",
-            Timeframe        = Timeframe.H1,
-            IsActive         = true,
-            IsDeleted        = false,
-            IsMetaLearner    = false,
-            IsMamlInitializer = false,
-        };
-
-        var logs = GenerateLogs(model.Id, 80, _ => true);
-
-        SetupModels(new List<MLModel> { model });
-        SetupPredictionLogs(logs);
-        SetupTrainingRuns(new List<MLTrainingRun>());
-        SetupEngineConfigs(new List<EngineConfig>());
-        SetupWriteDbSets();
-
-        // Act
-        await RunWorkerOnceAsync();
-
-        // Assert — drift log was written (Set<MLAdwinDriftLog> accessed for Add)
-        // and the worker attempted to clear the EngineConfig flag via Set<EngineConfig>().
-        // Note: ExecuteUpdateAsync is an EF Core extension method that cannot be invoked
-        // on a mock DbSet, so SaveChangesAsync is not reached — we verify the worker
-        // progressed through the correct code path by checking which DbSets were accessed.
-        _mockWriteDbContext.Verify(c => c.Set<MLAdwinDriftLog>(), Times.AtLeastOnce);
-        _mockWriteDbContext.Verify(c => c.Set<EngineConfig>(), Times.AtLeastOnce);
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 
-    // -- Test 4: Clear drift → detects shift and queues retraining
-
-    [Fact]
-    public async Task ClearDrift_DetectsShift()
+    private sealed class RecordingAlertDispatcher : IAlertDispatcher
     {
-        // Arrange — 80 logs: first 40 are 90% correct, last 40 are 40% correct
-        // This creates a clear distributional shift that ADWIN should detect.
-        var model = new MLModel
+        public List<(Alert alert, string message)> Dispatched { get; } = new();
+
+        public Task DispatchAsync(Alert alert, string message, CancellationToken ct)
         {
-            Id               = 1,
-            Symbol           = "EURUSD",
-            Timeframe        = Timeframe.H1,
-            IsActive         = true,
-            IsDeleted        = false,
-            IsMetaLearner    = false,
-            IsMamlInitializer = false,
-        };
+            Dispatched.Add((alert, message));
+            return Task.CompletedTask;
+        }
 
-        var rng = new Random(42);
-        var logs = GenerateLogs(model.Id, 80, i =>
-        {
-            if (i < 40)
-                return rng.NextDouble() < 0.90; // ~90% correct in first half
-            else
-                return rng.NextDouble() < 0.40; // ~40% correct in second half
-        });
-
-        SetupModels(new List<MLModel> { model });
-        SetupPredictionLogs(logs);
-        SetupTrainingRuns(new List<MLTrainingRun>()); // No existing queued runs
-        SetupEngineConfigs(new List<EngineConfig>());
-        SetupWriteDbSets();
-
-        // Act
-        await RunWorkerOnceAsync();
-
-        // Assert — drift detected: drift log written, then worker attempts to set the
-        // EngineConfig flag via ExecuteUpdateAsync (which is an EF Core extension and
-        // cannot execute on a mock). We verify the drift log was added and that the
-        // EngineConfig set was accessed, confirming the drift branch was entered.
-        _mockWriteDbContext.Verify(c => c.Set<MLAdwinDriftLog>(), Times.AtLeastOnce);
-        _mockWriteDbContext.Verify(c => c.Set<EngineConfig>(), Times.AtLeastOnce);
-        _mockReadContext.Verify(c => c.GetDbContext(), Times.AtLeastOnce);
-    }
-
-    // -- Test 5: Drift detected but existing queued run → no new run queued
-
-    [Fact]
-    public async Task DriftDetected_SkipsQueueIfAlreadyQueued()
-    {
-        // Arrange — same drift pattern as Test 4 but with an existing queued training run
-        var model = new MLModel
-        {
-            Id               = 1,
-            Symbol           = "EURUSD",
-            Timeframe        = Timeframe.H1,
-            IsActive         = true,
-            IsDeleted        = false,
-            IsMetaLearner    = false,
-            IsMamlInitializer = false,
-        };
-
-        var rng = new Random(42);
-        var logs = GenerateLogs(model.Id, 80, i =>
-        {
-            if (i < 40)
-                return rng.NextDouble() < 0.90;
-            else
-                return rng.NextDouble() < 0.40;
-        });
-
-        var existingRun = new MLTrainingRun
-        {
-            Id        = 99,
-            Symbol    = "EURUSD",
-            Timeframe = Timeframe.H1,
-            Status    = RunStatus.Queued,
-            IsDeleted = false,
-        };
-
-        SetupModels(new List<MLModel> { model });
-        SetupPredictionLogs(logs);
-        SetupTrainingRuns(new List<MLTrainingRun> { existingRun });
-        SetupEngineConfigs(new List<EngineConfig>());
-        SetupWriteDbSets();
-
-        // Act
-        await RunWorkerOnceAsync();
-
-        // Assert — drift log written and EngineConfig set accessed (for the flag update).
-        // ExecuteUpdateAsync on the mock DbSet cannot execute, so the training run
-        // deduplication check is not reached. We verify the worker entered the drift
-        // branch by confirming both write sets were accessed.
-        _mockWriteDbContext.Verify(c => c.Set<MLAdwinDriftLog>(), Times.AtLeastOnce);
-        _mockWriteDbContext.Verify(c => c.Set<EngineConfig>(), Times.AtLeastOnce);
-        _mockReadContext.Verify(c => c.GetDbContext(), Times.AtLeastOnce);
-    }
-
-    // -- Test 6: Meta-learner model is excluded from evaluation
-
-    [Fact]
-    public async Task MetaLearnerModel_Excluded()
-    {
-        // Arrange — model with IsMetaLearner=true should be filtered out by the query
-        var metaModel = new MLModel
-        {
-            Id               = 1,
-            Symbol           = "EURUSD",
-            Timeframe        = Timeframe.H1,
-            IsActive         = true,
-            IsDeleted        = false,
-            IsMetaLearner    = true,
-            IsMamlInitializer = false,
-        };
-
-        // Even though logs exist, the model should be excluded before logs are queried
-        var logs = GenerateLogs(metaModel.Id, 80, _ => true);
-
-        SetupModels(new List<MLModel> { metaModel });
-        SetupPredictionLogs(logs);
-        SetupTrainingRuns(new List<MLTrainingRun>());
-        SetupEngineConfigs(new List<EngineConfig>());
-        SetupWriteDbSets();
-
-        // Act
-        await RunWorkerOnceAsync();
-
-        // Assert — meta-learner filtered out, no drift logs written
-        _mockWriteDbContext.Verify(
-            c => c.Set<MLAdwinDriftLog>(),
-            Times.Never);
+        public Task TryAutoResolveAsync(Alert alert, bool conditionStillActive, CancellationToken ct)
+            => Task.CompletedTask;
     }
 }

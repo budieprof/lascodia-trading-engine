@@ -127,6 +127,62 @@ public class MLCorrelatedFailureWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_Lifts_Systemic_Pause_When_Evaluable_Count_Drops_Below_Activation_Quorum()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        AddConfig(db, "MLTraining:SystemicPauseActive", "true", ConfigDataType.Bool);
+        var first = CreateModel(1, "EURUSD");
+        var second = CreateModel(2, "GBPUSD");
+        db.Set<MLModel>().AddRange(first, second);
+        AddPredictionLogs(db, first, now, correct: true, count: 30, startTradeSignalId: 1);
+        AddPredictionLogs(db, second, now, correct: true, count: 30, startTradeSignalId: 100);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("false", await GetConfigValueAsync(db, "MLTraining:SystemicPauseActive"));
+        var log = await db.Set<MLCorrelatedFailureLog>().SingleAsync();
+        Assert.False(log.PauseActivated);
+        Assert.Equal(2, log.EvaluatedModelCount);
+        Assert.Equal(0, log.FailingModelCount);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Resolves_Systemic_Pause_Alert_When_Recovered()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        AddConfig(db, "MLTraining:SystemicPauseActive", "true", ConfigDataType.Bool);
+        db.Set<Alert>().Add(new Alert
+        {
+            AlertType = AlertType.SystemicMLDegradation,
+            Severity = AlertSeverity.High,
+            Symbol = "SYSTEM",
+            DeduplicationKey = "MLCorrelatedFailure:SystemicPause:Global",
+            ConditionJson = "{}",
+            IsActive = true
+        });
+
+        var first = CreateModel(1, "EURUSD");
+        var second = CreateModel(2, "GBPUSD");
+        var third = CreateModel(3, "USDJPY");
+        db.Set<MLModel>().AddRange(first, second, third);
+        AddPredictionLogs(db, first, now, correct: true, count: 30, startTradeSignalId: 1);
+        AddPredictionLogs(db, second, now, correct: true, count: 30, startTradeSignalId: 100);
+        AddPredictionLogs(db, third, now, correct: true, count: 30, startTradeSignalId: 200);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var alert = await db.Set<Alert>().SingleAsync(a => a.AlertType == AlertType.SystemicMLDegradation);
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Does_Not_Duplicate_Log_Or_Alert_When_Already_Paused()
     {
         await using var db = CreateDbContext();
@@ -242,6 +298,29 @@ public class MLCorrelatedFailureWorkerTest
         var pollSecs = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Equal(30, pollSecs);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Falls_Back_When_Hot_Config_Ratio_Is_NonFinite()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        AddConfig(db, "MLCorrelated:AlarmRatio", "NaN", ConfigDataType.Decimal);
+        var first = CreateModel(1, "EURUSD");
+        var second = CreateModel(2, "GBPUSD");
+        var third = CreateModel(3, "USDJPY");
+        db.Set<MLModel>().AddRange(first, second, third);
+        AddPredictionLogs(db, first, now, correct: false, count: 30, startTradeSignalId: 1);
+        AddPredictionLogs(db, second, now, correct: false, count: 30, startTradeSignalId: 100);
+        AddPredictionLogs(db, third, now, correct: true, count: 30, startTradeSignalId: 200);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("true", await GetConfigValueAsync(db, "MLTraining:SystemicPauseActive"));
+        var log = await db.Set<MLCorrelatedFailureLog>().SingleAsync();
+        Assert.Equal(2.0 / 3.0, log.FailureRatio, precision: 6);
     }
 
     [Fact]

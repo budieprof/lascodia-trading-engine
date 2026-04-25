@@ -1,518 +1,1789 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Performs online EMA-based adaptation of the ML model's decision threshold without
-/// requiring a full retrain.
-///
-/// <para>
-/// The worker loads the most recent N resolved <see cref="MLModelPredictionLog"/> records
-/// for each active model, then sweeps threshold values from 0.3 to 0.7 in steps of 0.01
-/// and picks the threshold that maximises the expected value (EV) on the recent window.
-/// </para>
-///
-/// <para>
-/// The new threshold is blended with the existing <see cref="ModelSnapshot.AdaptiveThreshold"/>
-/// using an EMA: θ_new = α × θ_optimal + (1 − α) × θ_current, where α is configurable
-/// (default 0.2). The blended threshold is then written back to <see cref="MLModel.ModelBytes"/>.
-/// </para>
-///
-/// <para>
-/// Adaptation is skipped when:
-/// <list type="bullet">
-///   <item>Fewer than <c>MLAdaptiveThreshold:MinResolvedPredictions</c> resolved logs are available.</item>
-///   <item>The absolute change in threshold is below <c>MLAdaptiveThreshold:MinThresholdDrift</c>.</item>
-/// </list>
-/// </para>
+/// Adapts deployed ML decision thresholds from recent resolved live outcomes with walk-forward
+/// regression guards, Wilson lower-bound floors, time-decayed weighting, PSI stationarity gating,
+/// per-decision audit logging, P&amp;L-aware EV when broker outcomes are available, and
+/// anomalous-drift alerts.
 /// </summary>
 public sealed class MLAdaptiveThresholdWorker : BackgroundService
 {
-    // ── EngineConfig key constants ─────────────────────────────────────────────
+    internal const string WorkerName = nameof(MLAdaptiveThresholdWorker);
 
-    /// <summary>Seconds between threshold adaptation cycles (default 3600 = 1 h).
-    /// Hourly adaptation is appropriate because the EMA smoothing (alpha = 0.2) already
-    /// dampens rapid changes. Running more frequently would waste DB resources without
-    /// meaningfully changing the threshold since the underlying prediction window barely shifts.</summary>
-    private const string CK_PollSecs         = "MLAdaptiveThreshold:PollIntervalSeconds";
-
-    /// <summary>Maximum number of recent resolved prediction logs to load per model for the
-    /// threshold sweep (default 500). Larger windows provide more stable EV estimates but
-    /// increase DB load and the risk of including stale market regimes in the computation.</summary>
-    private const string CK_WindowSize       = "MLAdaptiveThreshold:WindowSize";
-
-    /// <summary>Minimum number of resolved predictions required before threshold adaptation
-    /// is attempted (default 100). This guards against overfitting the threshold sweep to
-    /// a small, potentially unrepresentative sample of predictions.</summary>
-    private const string CK_MinPredictions   = "MLAdaptiveThreshold:MinResolvedPredictions";
-
-    /// <summary>EMA smoothing factor alpha used to blend the new optimal threshold with the
-    /// existing threshold (default 0.2). Formula: θ_new = α × θ_optimal + (1 - α) × θ_current.
-    /// A lower alpha produces a slower, more stable adaptation (high inertia).
-    /// A higher alpha reacts faster but is noisier. 0.2 = roughly 4-cycle lag to full convergence.</summary>
-    private const string CK_EmaAlpha         = "MLAdaptiveThreshold:EmaAlpha";
-
-    /// <summary>Minimum absolute change in threshold value required before the snapshot is
-    /// re-serialised and written to the DB (default 0.01 = 1 percentage point).
-    /// Prevents spurious writes when the EMA blending produces a sub-pip threshold change
-    /// that has no practical effect on signal generation.</summary>
-    private const string CK_MinDrift         = "MLAdaptiveThreshold:MinThresholdDrift";
-
-    private readonly IServiceScopeFactory                  _scopeFactory;
-    private readonly IMemoryCache                          _cache;
-    private readonly ILogger<MLAdaptiveThresholdWorker>    _logger;
     private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
+    private const string CycleLockKey = "workers:ml-adaptive-threshold:cycle";
+    private const string ModelLockKeyPrefix = "workers:ml-adaptive-threshold:model:";
 
-    /// <summary>
-    /// Initialises the worker with scope factory and logger.
-    /// </summary>
-    /// <param name="scopeFactory">Used to create per-iteration DI scopes for safe scoped service access.</param>
-    /// <param name="logger">Structured logger for threshold adaptation events and diagnostics.</param>
+    private const string CK_Enabled = "MLAdaptiveThreshold:Enabled";
+    private const string CK_PollSecs = "MLAdaptiveThreshold:PollIntervalSeconds";
+    private const string CK_WindowSize = "MLAdaptiveThreshold:WindowSize";
+    private const string CK_MinPredictions = "MLAdaptiveThreshold:MinResolvedPredictions";
+    private const string CK_EmaAlpha = "MLAdaptiveThreshold:EmaAlpha";
+    private const string CK_MinDrift = "MLAdaptiveThreshold:MinThresholdDrift";
+    private const string CK_LookbackDays = "MLAdaptiveThreshold:LookbackDays";
+    private const string CK_MinRegimePredictions = "MLAdaptiveThreshold:MinRegimeResolvedPredictions";
+    private const string CK_MaxModelsPerCycle = "MLAdaptiveThreshold:MaxModelsPerCycle";
+    private const string CK_LockTimeoutSecs = "MLAdaptiveThreshold:LockTimeoutSeconds";
+    private const string CK_ModelLockTimeoutSecs = "MLAdaptiveThreshold:ModelLockTimeoutSeconds";
+    private const string CK_HoldoutFraction = "MLAdaptiveThreshold:HoldoutFraction";
+    private const string CK_MinHoldoutSamples = "MLAdaptiveThreshold:MinHoldoutSamples";
+    private const string CK_TimeDecayHalfLifeDays = "MLAdaptiveThreshold:TimeDecayHalfLifeDays";
+    private const string CK_MinSamplesForTimeDecay = "MLAdaptiveThreshold:MinSamplesForTimeDecay";
+    private const string CK_StationarityPsiThreshold = "MLAdaptiveThreshold:StationarityPsiThreshold";
+    private const string CK_MinStationaritySamples = "MLAdaptiveThreshold:MinStationaritySamples";
+    private const string CK_PsiHardCapMultiplier = "MLAdaptiveThreshold:PsiHardCapMultiplier";
+    private const string CK_WilsonLowerBoundFloor = "MLAdaptiveThreshold:WilsonLowerBoundFloor";
+    private const string CK_RegressionGuardK = "MLAdaptiveThreshold:RegressionGuardK";
+    private const string CK_AnomalousDriftAlertThreshold = "MLAdaptiveThreshold:AnomalousDriftAlertThreshold";
+
+    private const int DefaultPollSeconds = 3600;
+    private const int MinPollSeconds = 60;
+    private const int MaxPollSeconds = 7 * 24 * 60 * 60;
+
+    private const int DefaultWindowSize = 500;
+    private const int MinWindowSize = 2;
+    private const int MaxWindowSize = 5000;
+
+    private const int DefaultMinPredictions = 100;
+    private const int MinMinPredictions = 2;
+    private const int MaxMinPredictions = 5000;
+
+    private const double DefaultEmaAlpha = 0.2;
+    private const double MinEmaAlpha = 0.01;
+    private const double MaxEmaAlpha = 1.0;
+
+    private const double DefaultMinDrift = 0.01;
+    private const double MinMinDrift = 0.0001;
+    private const double MaxMinDrift = 0.50;
+
+    private const int DefaultLookbackDays = 30;
+    private const int MinLookbackDays = 1;
+    private const int MaxLookbackDays = 365;
+
+    private const int DefaultMinRegimePredictions = 20;
+    private const int MinMinRegimePredictions = 2;
+    private const int MaxMinRegimePredictions = 1000;
+
+    private const int DefaultMaxModelsPerCycle = 256;
+    private const int MinMaxModelsPerCycle = 1;
+    private const int MaxMaxModelsPerCycle = 4096;
+
+    private const int DefaultLockTimeoutSeconds = 5;
+    private const int MinLockTimeoutSeconds = 0;
+    private const int MaxLockTimeoutSeconds = 300;
+
+    private const int DefaultModelLockTimeoutSeconds = 30;
+    private const int MinModelLockTimeoutSeconds = 1;
+    private const int MaxModelLockTimeoutSeconds = 600;
+
+    private const double DefaultHoldoutFraction = 0.30;
+    private const double MinHoldoutFraction = 0.05;
+    private const double MaxHoldoutFraction = 0.50;
+
+    private const int DefaultMinHoldoutSamples = 30;
+    private const int MinMinHoldoutSamples = 0;
+    private const int MaxMinHoldoutSamples = 500;
+
+    // Default to a real half-life: time decay is auto-disabled below MinSamplesForTimeDecay,
+    // so production with sufficient data benefits, while small-sample tests stay flat.
+    private const double DefaultTimeDecayHalfLifeDays = 60.0;
+    private const double MinTimeDecayHalfLifeDays = 0.0;
+    private const double MaxTimeDecayHalfLifeDays = 365.0;
+
+    private const int DefaultMinSamplesForTimeDecay = 200;
+    private const int MinMinSamplesForTimeDecay = 0;
+    private const int MaxMinSamplesForTimeDecay = 5000;
+
+    private const double DefaultStationarityPsiThreshold = 0.25;
+    private const double MinStationarityPsiThreshold = 0.05;
+    private const double MaxStationarityPsiThreshold = 1.0;
+
+    private const int DefaultMinStationaritySamples = 40;
+    private const int MinMinStationaritySamples = 0;
+    private const int MaxMinStationaritySamples = 5000;
+
+    private const double DefaultPsiHardCapMultiplier = 2.0;
+    private const double MinPsiHardCapMultiplier = 1.0;
+    private const double MaxPsiHardCapMultiplier = 10.0;
+
+    private const double DefaultWilsonLowerBoundFloor = 0.45;
+    private const double MinWilsonLowerBoundFloor = 0.0;
+    private const double MaxWilsonLowerBoundFloor = 1.0;
+
+    // One-sigma paired-EV improvement bar by default — a meaningful but lenient guard. To
+    // get a true Bonferroni correction across the 41-step sweep at α=0.05, set this to ~3.0.
+    private const double DefaultRegressionGuardK = 1.0;
+    private const double MinRegressionGuardK = 0.0;
+    private const double MaxRegressionGuardK = 5.0;
+
+    private const double DefaultAnomalousDriftAlertThreshold = 0.05;
+    private const double MinAnomalousDriftAlertThreshold = 0.001;
+    private const double MaxAnomalousDriftAlertThreshold = 0.5;
+
+    private const double DataStarvationRatio = 0.9;
+    private const int DataStarvationMinModels = 5;
+
+    private const double SearchMinThreshold = 0.30;
+    private const double SearchMaxThreshold = 0.70;
+    private const int SearchStepBasisPoints = 1;
+    private const double DefaultDecisionThreshold = 0.50;
+    private const double MinProbabilityThreshold = 0.01;
+    private const double MaxProbabilityThreshold = 0.99;
+    private const double ThresholdTieTolerance = 1e-9;
+
+    private const int MaxAuditDiagnosticsLength = 4_000;
+
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
+
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IMemoryCache _cache;
+    private readonly ILogger<MLAdaptiveThresholdWorker> _logger;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IAlertDispatcher? _alertDispatcher;
+
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
+
+    private readonly record struct ActiveModelCandidate(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe);
+
+    private readonly record struct ModelAdaptationOutcome(
+        bool Updated,
+        int PrunedRegimeThresholds,
+        bool DataStarved,
+        string? SkipReason);
+
+    private readonly record struct RegimeSlice(
+        DateTime DetectedAt,
+        MarketRegimeEnum Regime);
+
+    private readonly record struct EvResult(
+        double Ev,
+        int Wins,
+        int Total,
+        double MeanPnlPips);
+
+    private readonly record struct PairedEvComparison(
+        double EvAtPrev,
+        double EvAtNew,
+        double PairedStderr,
+        int Wins,
+        int Total,
+        double MeanPnlPips);
+
     public MLAdaptiveThresholdWorker(
-        IServiceScopeFactory                 scopeFactory,
-        IMemoryCache                         cache,
-        ILogger<MLAdaptiveThresholdWorker>   logger)
+        IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
+        ILogger<MLAdaptiveThresholdWorker> logger,
+        IDistributedLock? distributedLock = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IAlertDispatcher? alertDispatcher = null)
     {
         _scopeFactory = scopeFactory;
-        _cache        = cache;
-        _logger       = logger;
+        _cache = cache;
+        _logger = logger;
+        _distributedLock = distributedLock;
+        _healthMonitor = healthMonitor;
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _alertDispatcher = alertDispatcher;
     }
 
-    /// <summary>
-    /// Main background loop. Runs indefinitely until the host signals cancellation.
-    /// On each iteration:
-    /// <list type="number">
-    ///   <item>Creates a fresh DI scope for scoped DbContext access.</item>
-    ///   <item>Reads the poll interval from <see cref="EngineConfig"/> (hot-reload).</item>
-    ///   <item>Delegates to <see cref="AdaptAllModelsAsync"/> to update thresholds for all active models.</item>
-    ///   <item>Sleeps for the configured poll interval (default 1 h) before the next cycle.</item>
-    /// </list>
-    /// This worker is purely reactive — it does not send alerts or suppress signals. Its only
-    /// side effect is updating <c>MLModel.ModelBytes</c> with a revised <see cref="ModelSnapshot"/>
-    /// containing updated global and per-regime thresholds. The <c>MLSignalScorer</c> reads these
-    /// thresholds at scoring time to determine whether a prediction's confidence is sufficient
-    /// to emit a <see cref="TradeSignal"/>.
-    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLAdaptiveThresholdWorker started.");
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Adapts live ML decision thresholds with walk-forward regression guards, Wilson floors, time-decayed weighting, PSI stationarity gating, P&L-aware EV, persistent stale-data short-circuit, per-decision audit logging, and anomalous-drift alerts.",
+            TimeSpan.FromSeconds(DefaultPollSeconds));
 
-        while (!stoppingToken.IsCancellationRequested)
+        var currentDelay = TimeSpan.FromSeconds(DefaultPollSeconds);
+
+        try
         {
-            int pollSecs = 3600;
-
             try
             {
-                // New DI scope per iteration — EF DbContexts are scoped and must not outlive a tick.
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx     = readDb.GetDbContext();
-                var wCtx    = writeDb.GetDbContext();
-
-                // Hot-reload: re-read poll interval each cycle.
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 3600, stoppingToken);
-
-                await AdaptAllModelsAsync(ctx, wCtx, stoppingToken);
+                var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName);
+                if (initialDelay > TimeSpan.Zero)
+                    await Task.Delay(initialDelay, _timeProvider, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                break;
+                return;
             }
-            catch (Exception ex)
+
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "MLAdaptiveThresholdWorker loop error");
+                long cycleStarted = Stopwatch.GetTimestamp();
+
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+                    var result = await RunCycleAsync(stoppingToken);
+                    currentDelay = result.Settings.PollInterval;
+
+                    long durationMs = (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.ModelsProcessed);
+                    _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                    _metrics?.WorkerCycleDurationMs.Record(
+                        durationMs,
+                        new KeyValuePair<string, object?>("worker", WorkerName));
+                    _metrics?.MLAdaptiveThresholdCycleDurationMs.Record(durationMs);
+
+                    if (result.SkippedReason is { Length: > 0 })
+                    {
+                        _logger.LogDebug(
+                            "{Worker}: cycle skipped ({Reason}).",
+                            WorkerName,
+                            result.SkippedReason);
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "{Worker}: processed={Processed}, updated={Updated}, skipped={Skipped}, failed={Failed}, prunedRegimes={Pruned}, starved={Starved}.",
+                            WorkerName,
+                            result.ModelsProcessed,
+                            result.ModelsUpdated,
+                            result.ModelsSkipped,
+                            result.ModelsFailed,
+                            result.RegimeThresholdsPruned,
+                            result.ModelsStarved);
+                    }
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _logger.LogInformation(
+                            "{Worker}: recovered after {Failures} consecutive failure(s).",
+                            WorkerName,
+                            _consecutiveFailures);
+                    }
+
+                    _consecutiveFailures = 0;
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _metrics?.WorkerErrors.Add(
+                        1,
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("reason", "ml_adaptive_threshold_cycle"));
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                try
+                {
+                    await Task.Delay(CalculateDelay(currentDelay, _consecutiveFailures), _timeProvider, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
-
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
-
-        _logger.LogInformation("MLAdaptiveThresholdWorker stopping.");
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopped.", WorkerName);
+        }
     }
 
-    // ── Main loop ─────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Loads all active ML models that have serialised <c>ModelBytes</c> and delegates to
-    /// <see cref="AdaptModelAsync"/> for each one. Models without <c>ModelBytes</c> are skipped
-    /// because the threshold is stored inside the <see cref="ModelSnapshot"/> which lives in
-    /// that field — there is nowhere to persist the updated threshold without it.
-    ///
-    /// All adaptation parameters are read from <see cref="EngineConfig"/> once upfront to avoid
-    /// N+1 configuration queries per model.
-    /// Per-model failures are isolated so one model's deserialisation error cannot block
-    /// adaptation for all other models.
-    /// </summary>
-    /// <param name="readCtx">Read-only DbContext for model, prediction log, and regime snapshot queries.</param>
-    /// <param name="writeCtx">Write DbContext for persisting updated ModelBytes.</param>
-    /// <param name="ct">Cancellation token from the host.</param>
-    private async Task AdaptAllModelsAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
+    internal async Task<AdaptiveThresholdCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        // Read all adaptation parameters once — avoids repeated EngineConfig queries per model.
-        int    windowSize      = await GetConfigAsync<int>   (readCtx, CK_WindowSize,     500,  ct);
-        int    minPredictions  = await GetConfigAsync<int>   (readCtx, CK_MinPredictions, 100,  ct);
-        double emaAlpha        = await GetConfigAsync<double>(readCtx, CK_EmaAlpha,       0.2,  ct);
-        double minDrift        = await GetConfigAsync<double>(readCtx, CK_MinDrift,       0.01, ct);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var db = writeContext.GetDbContext();
+        var settings = await LoadSettingsAsync(db, ct);
 
-        // Only load models with ModelBytes — adaptation requires a deserialisable ModelSnapshot.
-        // Models without bytes have not yet been trained with threshold support and must be skipped.
-        var activeModels = await readCtx.Set<MLModel>()
+        if (!settings.Enabled)
+        {
+            _metrics?.MLAdaptiveThresholdCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "disabled"));
+            return AdaptiveThresholdCycleResult.Skipped(settings, "disabled");
+        }
+
+        if (_distributedLock is null)
+        {
+            _metrics?.MLAdaptiveThresholdLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "unavailable"));
+
+            if (!_missingDistributedLockWarningEmitted)
+            {
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate threshold adaptation cycles are possible in multi-instance deployments.",
+                    WorkerName);
+                _missingDistributedLockWarningEmitted = true;
+            }
+        }
+        else
+        {
+            var cycleLock = await _distributedLock.TryAcquireAsync(
+                CycleLockKey,
+                TimeSpan.FromSeconds(settings.LockTimeoutSeconds),
+                ct);
+
+            if (cycleLock is null)
+            {
+                _metrics?.MLAdaptiveThresholdLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "busy"));
+                _metrics?.MLAdaptiveThresholdCyclesSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "lock_busy"));
+                return AdaptiveThresholdCycleResult.Skipped(settings, "lock_busy");
+            }
+
+            _metrics?.MLAdaptiveThresholdLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "acquired"));
+
+            await using (cycleLock)
+            {
+                await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+                try
+                {
+                    return await RunCycleCoreAsync(writeContext, db, settings, ct);
+                }
+                finally
+                {
+                    WorkerBulkhead.MLMonitoring.Release();
+                }
+            }
+        }
+
+        await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+        try
+        {
+            return await RunCycleCoreAsync(writeContext, db, settings, ct);
+        }
+        finally
+        {
+            WorkerBulkhead.MLMonitoring.Release();
+        }
+    }
+
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+        {
+            return baseInterval <= TimeSpan.Zero
+                ? TimeSpan.FromSeconds(DefaultPollSeconds)
+                : baseInterval;
+        }
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private async Task<AdaptiveThresholdCycleResult> RunCycleCoreAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        AdaptiveThresholdWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var models = await db.Set<MLModel>()
             .AsNoTracking()
-            .Where(m => m.IsActive && !m.IsDeleted && m.ModelBytes != null)
+            .Where(m => m.IsActive
+                     && !m.IsDeleted
+                     && !m.IsMetaLearner
+                     && !m.IsMamlInitializer
+                     && m.ModelBytes != null)
+            .OrderBy(m => m.Symbol)
+            .ThenBy(m => m.Timeframe)
+            .ThenByDescending(m => m.ActivatedAt ?? m.TrainedAt)
+            .Take(settings.MaxModelsPerCycle)
+            .Select(m => new ActiveModelCandidate(m.Id, m.Symbol, m.Timeframe))
             .ToListAsync(ct);
 
-        _logger.LogDebug("Adaptive threshold: {Count} active model(s).", activeModels.Count);
+        _healthMonitor?.RecordBacklogDepth(WorkerName, models.Count);
+        _metrics?.MLAdaptiveThresholdModelsEvaluated.Add(models.Count);
 
-        foreach (var model in activeModels)
+        // Persistent stale-data short-circuit map: per-model latest NewestOutcomeAt across all
+        // audit rows. Loaded once per cycle so it survives process restarts and is shared via
+        // the audit table across replicas.
+        var modelIds = models.Select(m => m.Id).ToList();
+        var lastNewestOutcome = await LoadLastNewestOutcomeMapAsync(db, modelIds, ct);
+
+        int updated = 0;
+        int skipped = 0;
+        int failed = 0;
+        int starved = 0;
+        int prunedRegimeThresholds = 0;
+
+        foreach (var model in models)
         {
             ct.ThrowIfCancellationRequested();
 
             try
             {
-                await AdaptModelAsync(model, readCtx, writeCtx,
-                    windowSize, minPredictions, emaAlpha, minDrift, ct);
+                lastNewestOutcome.TryGetValue(model.Id, out var lastSeen);
+                var outcome = await AdaptModelWithLockAsync(writeContext, db, model, settings, lastSeen, ct);
+                prunedRegimeThresholds += outcome.PrunedRegimeThresholds;
+
+                if (outcome.Updated)
+                {
+                    updated++;
+                    _metrics?.MLAdaptiveThresholdModelsUpdated.Add(1);
+                    if (outcome.PrunedRegimeThresholds > 0)
+                    {
+                        _metrics?.MLAdaptiveThresholdRegimeThresholdsPruned.Add(outcome.PrunedRegimeThresholds);
+                    }
+                }
+                else
+                {
+                    skipped++;
+                    if (outcome.DataStarved) starved++;
+                    _metrics?.MLAdaptiveThresholdModelsSkipped.Add(
+                        1,
+                        new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "no_change"));
+                }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // Isolate per-model failures — one bad snapshot should not block all others.
-                _logger.LogWarning(ex,
-                    "Adaptive threshold failed for model {Id} ({Symbol}/{Tf}) — skipping.",
-                    model.Id, model.Symbol, model.Timeframe);
+                failed++;
+                _logger.LogWarning(
+                    ex,
+                    "{Worker}: failed adapting model {ModelId} ({Symbol}/{Timeframe}); continuing.",
+                    WorkerName,
+                    model.Id,
+                    model.Symbol,
+                    model.Timeframe);
             }
+            finally
+            {
+                db.ChangeTracker.Clear();
+            }
+        }
+
+        if (models.Count >= DataStarvationMinModels && starved >= models.Count * DataStarvationRatio)
+            await RaiseDataStarvationAlertAsync(models.Count, starved, ct);
+
+        return new AdaptiveThresholdCycleResult(
+            settings,
+            SkippedReason: null,
+            ModelsProcessed: models.Count,
+            ModelsUpdated: updated,
+            ModelsSkipped: skipped,
+            ModelsFailed: failed,
+            ModelsStarved: starved,
+            RegimeThresholdsPruned: prunedRegimeThresholds);
+    }
+
+    private static async Task<Dictionary<long, DateTime?>> LoadLastNewestOutcomeMapAsync(
+        DbContext db, List<long> modelIds, CancellationToken ct)
+    {
+        if (modelIds.Count == 0) return [];
+
+        // GroupBy + Max gives us per-model latest NewestOutcomeAt across all prior cycles.
+        var rows = await db.Set<MLAdaptiveThresholdLog>()
+            .AsNoTracking()
+            .Where(l => modelIds.Contains(l.MLModelId) && !l.IsDeleted && l.NewestOutcomeAt != null)
+            .GroupBy(l => l.MLModelId)
+            .Select(g => new { ModelId = g.Key, MaxAt = g.Max(l => l.NewestOutcomeAt) })
+            .ToListAsync(ct);
+
+        return rows.ToDictionary(r => r.ModelId, r => r.MaxAt);
+    }
+
+    private async Task<ModelAdaptationOutcome> AdaptModelWithLockAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        AdaptiveThresholdWorkerSettings settings,
+        DateTime? lastSeenOutcomeAt,
+        CancellationToken ct)
+    {
+        IAsyncDisposable? modelLock = null;
+        if (_distributedLock is not null)
+        {
+            // Per-model lock uses its own configured TTL — the global cycle lock guarantees
+            // mutual exclusion across replicas; this finer lock prevents any in-process
+            // re-entry for the same model and gives the operator a separate ceiling on how
+            // long any single model evaluation may hold the per-model slot.
+            modelLock = await _distributedLock.TryAcquireAsync(
+                ModelLockKeyPrefix + model.Id.ToString(CultureInfo.InvariantCulture),
+                TimeSpan.FromSeconds(settings.ModelLockTimeoutSeconds),
+                ct);
+
+            if (modelLock is null)
+            {
+                return new ModelAdaptationOutcome(
+                    Updated: false,
+                    PrunedRegimeThresholds: 0,
+                    DataStarved: false,
+                    SkipReason: "model_lock_busy");
+            }
+        }
+
+        try
+        {
+            return await AdaptModelAsync(writeContext, db, model, settings, lastSeenOutcomeAt, ct);
+        }
+        finally
+        {
+            if (modelLock is not null)
+                await modelLock.DisposeAsync();
         }
     }
 
-    /// <summary>
-    /// Performs the full threshold adaptation pipeline for a single ML model:
-    ///
-    /// <b>Phase 1 — Global threshold sweep:</b>
-    /// <list type="number">
-    ///   <item>Load the most recent <paramref name="windowSize"/> resolved prediction logs.</item>
-    ///   <item>Skip if fewer than <paramref name="minPredictions"/> are available.</item>
-    ///   <item>Sweep threshold values from 0.30 to 0.70 in steps of 0.01.</item>
-    ///   <item>At each threshold, simulate trading on the window using <see cref="ComputeEvAtThreshold"/>.</item>
-    ///   <item>Select the threshold that maximised EV (expected value = win − loss fraction).</item>
-    ///   <item>Blend with the current threshold using EMA:
-    ///         <c>θ_new = α × θ_optimal + (1 - α) × θ_current</c>.</item>
-    ///   <item>Only persist if absolute drift ≥ <paramref name="minDrift"/>.</item>
-    /// </list>
-    ///
-    /// <b>Phase 2 — Regime-conditioned threshold sweep:</b>
-    /// <list type="number">
-    ///   <item>Load recent <see cref="MarketRegimeSnapshot"/> records for this model's symbol/timeframe.</item>
-    ///   <item>Assign each prediction log to the most recent regime snapshot that preceded it
-    ///         (using a temporal join on <c>DetectedAt &lt;= PredictedAt</c>).</item>
-    ///   <item>For each regime with at least 20 observations, repeat the EV threshold sweep.</item>
-    ///   <item>Blend the per-regime optimal threshold with the existing regime threshold using the same EMA.</item>
-    ///   <item>Only update if regime-level drift ≥ <paramref name="minDrift"/>.</item>
-    /// </list>
-    ///
-    /// <b>Write-back:</b> If any threshold changed (global or per-regime), the updated
-    /// <see cref="ModelSnapshot"/> is serialised to UTF-8 JSON and written to <c>MLModel.ModelBytes</c>
-    /// via a bulk <c>ExecuteUpdateAsync</c> — no entity tracking required.
-    /// </summary>
-    /// <param name="model">The ML model to adapt (loaded with AsNoTracking; ModelBytes is non-null).</param>
-    /// <param name="readCtx">Read-only DbContext for prediction log and regime snapshot queries.</param>
-    /// <param name="writeCtx">Write DbContext for persisting the updated ModelBytes.</param>
-    /// <param name="windowSize">Maximum number of recent resolved prediction logs to include in the sweep.</param>
-    /// <param name="minPredictions">Minimum resolved logs required to proceed with adaptation.</param>
-    /// <param name="emaAlpha">EMA blending factor (0 = no change, 1 = full replacement with optimal).</param>
-    /// <param name="minDrift">Minimum absolute threshold change required to trigger a DB write.</param>
-    /// <param name="ct">Cancellation token.</param>
-    private async Task AdaptModelAsync(
-        MLModel                                 model,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        int                                     windowSize,
-        int                                     minPredictions,
-        double                                  emaAlpha,
-        double                                  minDrift,
-        CancellationToken                       ct)
+    private async Task<ModelAdaptationOutcome> AdaptModelAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        AdaptiveThresholdWorkerSettings settings,
+        DateTime? lastSeenOutcomeAt,
+        CancellationToken ct)
     {
-        // ── Load resolved prediction logs ─────────────────────────────────────
-        // Only resolved logs (DirectionCorrect != null) are useful — pending outcomes
-        // cannot contribute to the EV sweep since we don't know whether they were correct.
-        // OrderByDescending on OutcomeRecordedAt ensures we get the most recently
-        // resolved outcomes rather than merely the most recently predicted ones.
-        var logs = await readCtx.Set<MLModelPredictionLog>()
+        // All audit rows for this evaluation accumulate locally and flush in a dedicated scope.
+        // The try/finally ensures audits flush even if the snapshot save throws something other
+        // than DbUpdateConcurrencyException — operators always see the decision trail.
+        var pendingAudits = new List<MLAdaptiveThresholdLog>(8);
+
+        try
+        {
+            return await AdaptModelCoreAsync(writeContext, db, model, settings, lastSeenOutcomeAt, pendingAudits, ct);
+        }
+        finally
+        {
+            if (pendingAudits.Count > 0)
+                await FlushAuditsAsync(pendingAudits, ct);
+        }
+    }
+
+    private async Task<ModelAdaptationOutcome> AdaptModelCoreAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        AdaptiveThresholdWorkerSettings settings,
+        DateTime? lastSeenOutcomeAt,
+        List<MLAdaptiveThresholdLog> pendingAudits,
+        CancellationToken ct)
+    {
+        DateTime nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        DateTime lookbackCutoff = nowUtc.AddDays(-settings.LookbackDays);
+
+        var resolvedLogs = await db.Set<MLModelPredictionLog>()
             .AsNoTracking()
-            .Where(l => l.MLModelId        == model.Id &&
-                        l.DirectionCorrect != null   &&
-                        l.ActualDirection.HasValue   &&
-                        l.OutcomeRecordedAt != null  &&
-                        !l.IsDeleted)
+            .Where(l => l.MLModelId == model.Id
+                     && !l.IsDeleted
+                     && l.ActualDirection.HasValue
+                     && l.DirectionCorrect.HasValue
+                     && l.OutcomeRecordedAt != null
+                     && l.OutcomeRecordedAt >= lookbackCutoff)
             .OrderByDescending(l => l.OutcomeRecordedAt)
             .ThenByDescending(l => l.Id)
-            .Take(windowSize)
+            .Take(settings.WindowSize)
             .ToListAsync(ct);
 
-        // Guard: insufficient data to produce a statistically reliable threshold estimate.
-        if (logs.Count < minPredictions)
+        var informativeLogs = resolvedLogs
+            .Where(IsThresholdInformative)
+            .ToList();
+
+        if (informativeLogs.Count < settings.MinResolvedPredictions)
         {
-            _logger.LogDebug(
-                "Adaptive threshold skipped model {Id} — only {N} resolved logs (need {Min}).",
-                model.Id, logs.Count, minPredictions);
-            return;
+            EnqueueAudit(pendingAudits, model, regime: null,
+                outcome: AuditOutcome.SkippedData,
+                reason: "insufficient_informative_logs",
+                sweepSize: informativeLogs.Count,
+                holdoutSize: 0,
+                previousThreshold: 0,
+                optimal: 0,
+                newThreshold: 0,
+                drift: 0,
+                holdoutEvNew: 0,
+                holdoutEvPrev: 0,
+                meanPnlPips: 0,
+                psi: 0,
+                newestOutcomeAt: null,
+                diagnostics: BuildDiagnostics(("availableLogs", informativeLogs.Count), ("required", settings.MinResolvedPredictions)),
+                evaluatedAt: nowUtc);
+            await FlushAuditsAsync(pendingAudits, ct);
+
+            return new ModelAdaptationOutcome(
+                Updated: false,
+                PrunedRegimeThresholds: 0,
+                DataStarved: true,
+                SkipReason: "insufficient_informative_logs");
         }
 
-        // ── Sweep threshold to maximise EV ────────────────────────────────────
-        // Step through thresholds from 0.30 to 0.70 in increments of 0.01 (41 steps total).
-        // The range 0.30–0.70 is intentional: below 0.30 a model would be nearly always trading
-        // (too aggressive), and above 0.70 it would almost never trade (too conservative).
-        double bestThreshold = 0.5;  // sensible default if all steps tie
-        double bestEv        = double.MinValue;
+        DateTime newestOutcomeAt = informativeLogs[0].OutcomeRecordedAt ?? informativeLogs[0].PredictedAt;
 
-        for (int step = 30; step <= 70; step++)
+        // Persistent stale-data short-circuit: if the newest log we'd evaluate is older than
+        // the newest log evaluated by any prior cycle (read from the audit log), the sweep
+        // would yield identical results. Bypass the entire evaluation, including audit writes.
+        if (lastSeenOutcomeAt.HasValue && newestOutcomeAt <= lastSeenOutcomeAt.Value)
         {
-            double thr = step / 100.0;
-            double ev  = ComputeEvAtThreshold(logs, thr);
-            if (ev > bestEv)
+            return new ModelAdaptationOutcome(
+                Updated: false,
+                PrunedRegimeThresholds: 0,
+                DataStarved: false,
+                SkipReason: "no_new_outcomes");
+        }
+
+        var (writeModel, snapshot) = await MLModelSnapshotWriteHelper.LoadTrackedLatestSnapshotAsync(db, model.Id, ct);
+        if (writeModel is null || snapshot is null)
+        {
+            return new ModelAdaptationOutcome(
+                Updated: false,
+                PrunedRegimeThresholds: 0,
+                DataStarved: false,
+                SkipReason: "snapshot_unavailable");
+        }
+
+        // Effective half-life: time decay is forced off below MinSamplesForTimeDecay so the
+        // tilt cannot dominate floating-point noise on small samples. Operators can drop
+        // MinSamplesForTimeDecay to 0 to opt fully into the configured half-life.
+        double effectiveHalfLife = informativeLogs.Count >= settings.MinSamplesForTimeDecay
+            ? settings.TimeDecayHalfLifeDays
+            : 0.0;
+
+        // P&L map: when broker positions are linked through the prediction-log signal, use
+        // realized $ P&L instead of the |actualMagnitudePips| heuristic. Falls back per-log.
+        var pnlMap = await LoadSignalPnlMapAsync(db, informativeLogs, ct);
+
+        double psi = ComputeStationarityPsi(informativeLogs, settings.MinStationaritySamples);
+
+        double psiHardCap = settings.StationarityPsiThreshold * settings.PsiHardCapMultiplier;
+        if (psi > psiHardCap)
+        {
+            EnqueueAudit(pendingAudits, model, regime: null,
+                outcome: AuditOutcome.SkippedStationarity,
+                reason: "psi_above_hard_cap",
+                sweepSize: informativeLogs.Count,
+                holdoutSize: 0,
+                previousThreshold: 0,
+                optimal: 0,
+                newThreshold: 0,
+                drift: 0,
+                holdoutEvNew: 0,
+                holdoutEvPrev: 0,
+                meanPnlPips: 0,
+                psi: psi,
+                newestOutcomeAt: newestOutcomeAt,
+                diagnostics: BuildDiagnostics(("psi", psi), ("hardCap", psiHardCap)),
+                evaluatedAt: nowUtc);
+            await FlushAuditsAsync(pendingAudits, ct);
+
+            return new ModelAdaptationOutcome(
+                Updated: false,
+                PrunedRegimeThresholds: 0,
+                DataStarved: false,
+                SkipReason: "non_stationary");
+        }
+
+        // PSI soft mode: dampen alpha when PSI is between the threshold and the hard cap.
+        // Keeps adaptation moving but more conservatively when distribution shifts loom.
+        double psiAlphaScale = ComputePsiAlphaScale(psi, settings.StationarityPsiThreshold, psiHardCap);
+        double effectiveAlpha = settings.EmaAlpha * psiAlphaScale;
+
+        bool snapshotChanged = NormalizeSnapshotThresholdState(snapshot, out int invalidThresholdsRemoved);
+        int prunedRegimeThresholds = invalidThresholdsRemoved;
+
+        double currentGlobalThreshold = SanitizeThreshold(
+            MLFeatureHelper.ResolveEffectiveDecisionThreshold(snapshot),
+            DefaultDecisionThreshold);
+
+        var chronological = informativeLogs.OrderBy(l => l.PredictedAt).ThenBy(l => l.Id).ToList();
+        var (sweepSlice, holdoutSlice) = SplitWalkForward(chronological, settings.HoldoutFraction, settings.MinHoldoutSamples);
+        bool hasRealHoldout = holdoutSlice.Count > 0;
+
+        var (bestThreshold, bestEv) = FindBestThreshold(
+            sweepSlice, currentGlobalThreshold, nowUtc, effectiveHalfLife, pnlMap);
+
+        double newGlobalThreshold = BlendThreshold(bestThreshold, currentGlobalThreshold, effectiveAlpha);
+        double globalDrift = Math.Abs(newGlobalThreshold - currentGlobalThreshold);
+
+        var holdoutForCheck = hasRealHoldout ? holdoutSlice : sweepSlice;
+        var paired = ComputeHoldoutEvComparison(
+            holdoutForCheck, currentGlobalThreshold, newGlobalThreshold, currentGlobalThreshold,
+            nowUtc, effectiveHalfLife, pnlMap);
+
+        double wilsonLb = WilsonLowerBound(paired.Wins, paired.Total);
+        bool driftMeaningful = globalDrift >= settings.MinThresholdDrift;
+        // When the holdout is real (has its own slice), apply the K-sigma paired-EV regression
+        // guard. Set RegressionGuardK ~= 3.0 to approximate Bonferroni-α=0.05 over 41 candidates.
+        // Sweep-as-holdout fallback is tautological — we degrade to a plain >=.
+        bool holdoutPassed = hasRealHoldout
+            ? paired.EvAtNew > paired.EvAtPrev + settings.RegressionGuardK * paired.PairedStderr
+            : paired.EvAtNew >= paired.EvAtPrev - 1e-9;
+        bool wilsonPassed = paired.Total < settings.MinHoldoutSamples
+                          || wilsonLb >= settings.WilsonLowerBoundFloor;
+        bool globalAccepted = driftMeaningful && holdoutPassed && wilsonPassed;
+
+        string globalReason = !driftMeaningful
+            ? (hasRealHoldout ? "drift_below_floor" : "drift_below_floor_no_holdout")
+            : !holdoutPassed
+                ? (hasRealHoldout ? "holdout_regression" : "no_holdout_regression")
+                : !wilsonPassed
+                    ? "wilson_below_floor"
+                    : (hasRealHoldout ? "accepted" : "accepted_no_holdout");
+
+        double pendingGlobal = currentGlobalThreshold;
+        var pendingRegime = new Dictionary<string, double>(StringComparer.Ordinal);
+
+        if (globalAccepted)
+        {
+            pendingGlobal = newGlobalThreshold;
+            snapshotChanged = true;
+        }
+
+        EnqueueAudit(pendingAudits, model, regime: null,
+            outcome: globalAccepted ? AuditOutcome.Updated : AuditOutcome.SkippedDrift,
+            reason: globalReason,
+            sweepSize: sweepSlice.Count,
+            holdoutSize: holdoutSlice.Count,
+            previousThreshold: currentGlobalThreshold,
+            optimal: bestThreshold,
+            newThreshold: globalAccepted ? newGlobalThreshold : currentGlobalThreshold,
+            drift: globalDrift,
+            holdoutEvNew: paired.EvAtNew,
+            holdoutEvPrev: paired.EvAtPrev,
+            meanPnlPips: paired.MeanPnlPips,
+            psi: psi,
+            newestOutcomeAt: newestOutcomeAt,
+            diagnostics: BuildDiagnostics(
+                ("sweepBestEv", (object)bestEv),
+                ("wilsonLb", (object)wilsonLb),
+                ("alpha", (object)effectiveAlpha),
+                ("psiAlphaScale", (object)psiAlphaScale),
+                ("decayHalfLifeDays", (object)effectiveHalfLife),
+                ("informativeLogs", (object)informativeLogs.Count),
+                ("hasRealHoldout", (object)hasRealHoldout),
+                ("pairedStderr", (object)paired.PairedStderr),
+                ("regressionGuardK", (object)settings.RegressionGuardK),
+                ("pnlMapSize", (object)pnlMap.Count)),
+            evaluatedAt: nowUtc);
+
+        if (globalAccepted && globalDrift >= settings.AnomalousDriftAlertThreshold)
+        {
+            await RaiseAnomalousDriftAlertAsync(model, currentGlobalThreshold, newGlobalThreshold, globalDrift, ct);
+        }
+
+        // Phase 2 — regime-conditioned thresholds.
+        if (chronological.Count > 0)
+        {
+            var earliestPredictedAt = chronological[0].PredictedAt;
+            var latestPredictedAt = chronological[^1].PredictedAt;
+
+            var regimeTimeline = await db.Set<MarketRegimeSnapshot>()
+                .AsNoTracking()
+                .Where(r => r.Symbol == model.Symbol
+                         && r.Timeframe == model.Timeframe
+                         && !r.IsDeleted
+                         && r.DetectedAt >= earliestPredictedAt.AddDays(-1)
+                         && r.DetectedAt <= latestPredictedAt)
+                .OrderBy(r => r.DetectedAt)
+                .Select(r => new RegimeSlice(r.DetectedAt, r.Regime))
+                .ToListAsync(ct);
+
+            if (regimeTimeline.Count > 0)
             {
-                bestEv        = ev;
-                bestThreshold = thr;
+                var matchedRegimes = new HashSet<string>(StringComparer.Ordinal);
+                var regimeGroups = new Dictionary<string, List<MLModelPredictionLog>>(StringComparer.Ordinal);
+
+                foreach (var log in chronological)
+                {
+                    var regime = FindRegimeAt(regimeTimeline, log.PredictedAt);
+                    if (regime is null) continue;
+
+                    string regimeName = regime.Value.ToString();
+                    matchedRegimes.Add(regimeName);
+
+                    if (!regimeGroups.TryGetValue(regimeName, out var group))
+                    {
+                        group = [];
+                        regimeGroups[regimeName] = group;
+                    }
+                    group.Add(log);
+                }
+
+                int stalePruned = PruneMissingRegimeThresholds(snapshot.RegimeThresholds ??= [], matchedRegimes);
+                if (stalePruned > 0)
+                {
+                    snapshotChanged = true;
+                    prunedRegimeThresholds += stalePruned;
+                }
+
+                double globalAfter = pendingGlobal != currentGlobalThreshold ? pendingGlobal : currentGlobalThreshold;
+
+                foreach (var (regimeName, regimeLogs) in regimeGroups)
+                {
+                    if (regimeLogs.Count < settings.MinRegimeResolvedPredictions) continue;
+
+                    double currentRegimeThreshold = snapshot.RegimeThresholds.TryGetValue(regimeName, out var existing)
+                        ? SanitizeThreshold(existing, globalAfter)
+                        : globalAfter;
+
+                    var (rSweep, rHoldout) = SplitWalkForward(regimeLogs, settings.HoldoutFraction,
+                        Math.Max(10, settings.MinHoldoutSamples / 3));
+                    bool rHasRealHoldout = rHoldout.Count > 0;
+
+                    double rEffectiveHalfLife = regimeLogs.Count >= settings.MinSamplesForTimeDecay
+                        ? settings.TimeDecayHalfLifeDays
+                        : 0.0;
+
+                    var (rBest, rBestEv) = FindBestThreshold(
+                        rSweep, currentRegimeThreshold, nowUtc, rEffectiveHalfLife, pnlMap);
+                    double newRegimeThreshold = BlendThreshold(rBest, currentRegimeThreshold, effectiveAlpha);
+                    double rDrift = Math.Abs(newRegimeThreshold - currentRegimeThreshold);
+
+                    var rHoldoutForCheck = rHasRealHoldout ? rHoldout : rSweep;
+                    var rPaired = ComputeHoldoutEvComparison(
+                        rHoldoutForCheck, currentRegimeThreshold, newRegimeThreshold, currentRegimeThreshold,
+                        nowUtc, rEffectiveHalfLife, pnlMap);
+                    double rWilson = WilsonLowerBound(rPaired.Wins, rPaired.Total);
+
+                    int rMinHoldout = Math.Max(10, settings.MinHoldoutSamples / 3);
+                    bool rDriftMeaningful = rDrift >= settings.MinThresholdDrift;
+                    bool rHoldoutPassed = rHasRealHoldout
+                        ? rPaired.EvAtNew > rPaired.EvAtPrev + settings.RegressionGuardK * rPaired.PairedStderr
+                        : rPaired.EvAtNew >= rPaired.EvAtPrev - 1e-9;
+                    bool rWilsonPassed = rPaired.Total < rMinHoldout
+                                      || rWilson >= settings.WilsonLowerBoundFloor;
+                    bool rAccepted = rDriftMeaningful && rHoldoutPassed && rWilsonPassed;
+
+                    string rReason = !rDriftMeaningful
+                        ? (rHasRealHoldout ? "drift_below_floor" : "drift_below_floor_no_holdout")
+                        : !rHoldoutPassed
+                            ? (rHasRealHoldout ? "holdout_regression" : "no_holdout_regression")
+                            : !rWilsonPassed
+                                ? "wilson_below_floor"
+                                : (rHasRealHoldout ? "accepted" : "accepted_no_holdout");
+
+                    if (rAccepted)
+                    {
+                        pendingRegime[regimeName] = newRegimeThreshold;
+                        snapshotChanged = true;
+                    }
+
+                    if (Enum.TryParse<MarketRegimeEnum>(regimeName, ignoreCase: true, out var regimeEnum))
+                    {
+                        EnqueueAudit(pendingAudits, model, regime: regimeEnum,
+                            outcome: rAccepted ? AuditOutcome.Updated : AuditOutcome.SkippedDrift,
+                            reason: rReason,
+                            sweepSize: rSweep.Count,
+                            holdoutSize: rHoldout.Count,
+                            previousThreshold: currentRegimeThreshold,
+                            optimal: rBest,
+                            newThreshold: rAccepted ? newRegimeThreshold : currentRegimeThreshold,
+                            drift: rDrift,
+                            holdoutEvNew: rPaired.EvAtNew,
+                            holdoutEvPrev: rPaired.EvAtPrev,
+                            meanPnlPips: rPaired.MeanPnlPips,
+                            psi: psi,
+                            newestOutcomeAt: newestOutcomeAt,
+                            diagnostics: BuildDiagnostics(
+                                ("regime", regimeName),
+                                ("regimeSamples", regimeLogs.Count),
+                                ("wilsonLb", rWilson),
+                                ("regimeBestEv", rBestEv),
+                                ("hasRealHoldout", rHasRealHoldout),
+                                ("pairedStderr", rPaired.PairedStderr)),
+                            evaluatedAt: nowUtc);
+                    }
+                }
             }
         }
 
-        var (writeModel, snap) = await MLModelSnapshotWriteHelper
-            .LoadTrackedLatestSnapshotAsync(writeCtx, model.Id, ct);
-        if (writeModel == null || snap == null)
-            return;
-
-        // Start from the same deployed threshold precedence as live scoring so the first
-        // adaptive update blends from the true in-production baseline, not an arbitrary 0.5.
-        double currentThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
-
-        // EMA blend: smoothly move the threshold toward the optimal value.
-        // Alpha = 0.2 means 20 % weight on the new optimal and 80 % on the existing value.
-        // This prevents threshold thrashing when the optimal value fluctuates between cycles.
-        double newThreshold     = emaAlpha * bestThreshold + (1.0 - emaAlpha) * currentThreshold;
-        double drift            = Math.Abs(newThreshold - currentThreshold);
-
-        // Track whether any part of the snapshot was updated — used to decide whether to write-back.
-        bool anyUpdate = false;
-
-        if (drift >= minDrift)
+        if (!snapshotChanged)
         {
-            // Drift is meaningful — update the global threshold in the snapshot.
-            snap.AdaptiveThreshold = newThreshold;
-            anyUpdate = true;
-
-            _logger.LogInformation(
-                "Adaptive threshold updated model {Id} ({Symbol}/{Tf}): " +
-                "{Old:F4} → {New:F4} (optimal={Opt:F4}, EV={Ev:F4}, drift={Drift:F4}).",
-                model.Id, model.Symbol, model.Timeframe,
-                currentThreshold, newThreshold, bestThreshold, bestEv, drift);
-        }
-        else
-        {
-            // Change is below the noise floor — skip the global update to avoid redundant DB writes.
-            _logger.LogDebug(
-                "Adaptive threshold model {Id}: global drift {Drift:F4} < minDrift {Min:F4} — skipping global update.",
-                model.Id, drift, minDrift);
+            await FlushAuditsAsync(pendingAudits, ct);
+            return new ModelAdaptationOutcome(
+                Updated: false,
+                PrunedRegimeThresholds: 0,
+                DataStarved: false,
+                SkipReason: "no_change");
         }
 
-        // ── Regime-conditioned threshold sweep ────────────────────────────────
-        // Load recent regime snapshots to assign each prediction log to a market regime.
-        // This enables the model to use a higher threshold during trending regimes (more selective)
-        // and a lower threshold during ranging regimes (more permissive), for example.
-        var regimeSnapshots = await readCtx.Set<MarketRegimeSnapshot>()
-            .AsNoTracking()
-            .Where(r => r.Symbol    == model.Symbol    &&
-                        r.Timeframe == model.Timeframe &&
-                        !r.IsDeleted)
-            .OrderByDescending(r => r.DetectedAt)
-            .Take(2000)  // 2000 snapshots ≈ ~83 days of hourly regime detection
-            .ToListAsync(ct);
-
-        if (regimeSnapshots.Count > 0)
+        if (pendingGlobal != currentGlobalThreshold)
         {
-            // Group prediction logs by the closest prior regime snapshot.
-            // This is a temporal left join: for each prediction log, find the latest regime
-            // snapshot whose DetectedAt is at or before the log's PredictedAt timestamp.
-            var regimeGroups = new Dictionary<string, List<MLModelPredictionLog>>();
-
-            foreach (var log in logs)
-            {
-                // The OrderByDescending query above ensures regimeSnapshots[0] is the latest.
-                // FirstOrDefault (ordered desc) efficiently finds the most recent snapshot
-                // that pre-dates this prediction — equivalent to a "last known regime" lookup.
-                var regime = regimeSnapshots
-                    .FirstOrDefault(r => r.DetectedAt <= log.PredictedAt);
-
-                // Assign to "Unknown" bucket when no prior regime snapshot exists for this period.
-                // This typically happens for prediction logs older than the oldest regime snapshot.
-                string regimeName = regime?.Regime.ToString() ?? "Unknown";
-                if (!regimeGroups.TryGetValue(regimeName, out var group))
-                {
-                    group = [];
-                    regimeGroups[regimeName] = group;
-                }
-                group.Add(log);
-            }
-
-            // Ensure the RegimeThresholds dictionary exists in the snapshot before writing to it.
-            snap.RegimeThresholds ??= [];
-
-            foreach (var (regimeName, regimeLogs) in regimeGroups)
-            {
-                // Skip regimes with fewer than 20 observations — the EV sweep would overfit
-                // to a tiny sample and produce a threshold that does not generalise.
-                if (regimeLogs.Count < 20) continue;
-
-                // Repeat the full EV threshold sweep using only logs from this specific regime.
-                double regimeBestThr = 0.5;
-                double regimeBestEv  = double.MinValue;
-
-                for (int step = 30; step <= 70; step++)
-                {
-                    double thr = step / 100.0;
-                    double ev  = ComputeEvAtThreshold(regimeLogs, thr);
-                    if (ev > regimeBestEv) { regimeBestEv = ev; regimeBestThr = thr; }
-                }
-
-                // Start a new regime-specific threshold from the currently deployed
-                // global baseline, not a hardcoded 0.5, so the first regime override
-                // blends smoothly from what production is already using.
-                double currentRegimeThr = snap.RegimeThresholds.TryGetValue(regimeName, out var existing)
-                    ? existing : currentThreshold;
-
-                // Apply the same EMA blend to the regime-conditioned threshold.
-                double newRegimeThr = emaAlpha * regimeBestThr + (1.0 - emaAlpha) * currentRegimeThr;
-                double regimeDrift  = Math.Abs(newRegimeThr - currentRegimeThr);
-
-                if (regimeDrift >= minDrift)
-                {
-                    // Regime threshold changed enough to be worth persisting.
-                    snap.RegimeThresholds[regimeName] = newRegimeThr;
-                    anyUpdate = true;
-
-                    _logger.LogInformation(
-                        "Regime threshold updated model {Id} ({Symbol}/{Tf}) regime={Regime}: " +
-                        "{Old:F4} → {New:F4} (optimal={Opt:F4}, EV={Ev:F4}, N={N}).",
-                        model.Id, model.Symbol, model.Timeframe, regimeName,
-                        currentRegimeThr, newRegimeThr, regimeBestThr, regimeBestEv, regimeLogs.Count);
-                }
-            }
+            snapshot.AdaptiveThreshold = pendingGlobal;
+            _metrics?.MLAdaptiveThresholdAppliedDrift.Record(
+                globalDrift,
+                new KeyValuePair<string, object?>("scope", "global"));
         }
 
-        // Skip the write-back if neither the global nor any regime threshold actually changed.
-        // This avoids redundant serialise + DB update round trips on stable models.
-        if (!anyUpdate) return;
+        foreach (var kvp in pendingRegime)
+        {
+            snapshot.RegimeThresholds ??= [];
+            double regimeDrift = snapshot.RegimeThresholds.TryGetValue(kvp.Key, out var prev)
+                ? Math.Abs(kvp.Value - prev) : Math.Abs(kvp.Value - currentGlobalThreshold);
+            snapshot.RegimeThresholds[kvp.Key] = kvp.Value;
+            _metrics?.MLAdaptiveThresholdAppliedDrift.Record(
+                regimeDrift,
+                new KeyValuePair<string, object?>("scope", "regime"));
+        }
 
-        // ── Write updated snapshot back to ModelBytes ─────────────────────────
-        // Serialise the entire ModelSnapshot to UTF-8 JSON bytes and update in place.
-        // ExecuteUpdateAsync avoids loading the full entity into the change tracker.
-        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
-        await writeCtx.SaveChangesAsync(ct);
         _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
+        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot);
+
+        try
+        {
+            await writeContext.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            EnqueueAudit(pendingAudits, model, regime: null,
+                outcome: AuditOutcome.SkippedConcurrency,
+                reason: "row_version_conflict",
+                sweepSize: sweepSlice.Count,
+                holdoutSize: holdoutSlice.Count,
+                previousThreshold: currentGlobalThreshold,
+                optimal: bestThreshold,
+                newThreshold: pendingGlobal,
+                drift: globalDrift,
+                holdoutEvNew: paired.EvAtNew,
+                holdoutEvPrev: paired.EvAtPrev,
+                meanPnlPips: paired.MeanPnlPips,
+                psi: psi,
+                newestOutcomeAt: newestOutcomeAt,
+                diagnostics: BuildDiagnostics(("conflict", "row_version")),
+                evaluatedAt: nowUtc);
+            await FlushAuditsAsync(pendingAudits, ct);
+
+            return new ModelAdaptationOutcome(
+                Updated: false,
+                PrunedRegimeThresholds: prunedRegimeThresholds,
+                DataStarved: false,
+                SkipReason: "row_version_conflict");
+        }
+
+        _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
+        await FlushAuditsAsync(pendingAudits, ct);
+
+        return new ModelAdaptationOutcome(
+            Updated: true,
+            PrunedRegimeThresholds: prunedRegimeThresholds,
+            DataStarved: false,
+            SkipReason: null);
     }
 
-    // ── EV computation ────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Simulates trading on the resolved prediction window using a fixed threshold and
-    /// returns the mean per-trade expected value (win fraction − loss fraction).
-    ///
-    /// <b>How prediction is reconstructed from logged data:</b>
-    /// The stored <see cref="MLModelPredictionLog.ConfidenceScore"/> is a model-output confidence
-    /// value, not a raw probability. The calibrated probability is approximated as:
-    /// <list type="bullet">
-    ///   <item>For Buy predictions:  <c>calibP ≈ threshold + conf / 2</c></item>
-    ///   <item>For Sell predictions: <c>calibP ≈ threshold - conf / 2</c></item>
-    /// </list>
-    /// A prediction is considered "active" (i.e. the model would have emitted a signal) when
-    /// <c>calibP &gt;= threshold</c>. The method then compares the simulated prediction against
-    /// the known outcome (<see cref="MLModelPredictionLog.DirectionCorrect"/>).
-    ///
-    /// <b>EV formula:</b> <c>EV = (wins - losses) / (wins + losses)</c>
-    /// <list type="bullet">
-    ///   <item>+1.0 = all predictions correct (impossible in practice)</item>
-    ///   <item> 0.0 = equal wins and losses (break-even, same as random)</item>
-    ///   <item>-1.0 = all predictions wrong</item>
-    /// </list>
-    /// The threshold that maximises this value provides the best risk-adjusted selectivity on
-    /// the observed prediction window.
-    ///
-    /// <b>Limitation:</b> This approximation assumes confidence is linearly related to calibrated
-    /// probability. For models with non-linear probability outputs (e.g. neural networks), a
-    /// full Platt or isotonic calibration pass during training would produce more accurate results.
-    /// </summary>
-    /// <param name="logs">Resolved prediction logs to simulate against (must have non-null <c>DirectionCorrect</c>).</param>
-    /// <param name="threshold">The decision threshold to evaluate (0.30 – 0.70).</param>
-    /// <returns>Expected value in [-1, +1] for this threshold on the provided prediction window.</returns>
-    private static double ComputeEvAtThreshold(
-        IReadOnlyList<MLModelPredictionLog> logs,
-        double                              threshold)
+    private async Task FlushAuditsAsync(List<MLAdaptiveThresholdLog> pending, CancellationToken ct)
     {
-        int wins = 0, losses = 0;
+        if (pending.Count == 0) return;
+
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
+            await writeCtx.Set<MLAdaptiveThresholdLog>().AddRangeAsync(pending, ct);
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "{Worker}: failed to persist {Count} audit row(s); rows discarded.",
+                WorkerName, pending.Count);
+        }
+        finally
+        {
+            pending.Clear();
+        }
+    }
+
+    private static async Task<Dictionary<long, double>> LoadSignalPnlMapAsync(
+        DbContext db, List<MLModelPredictionLog> logs, CancellationToken ct)
+    {
+        var signalIds = logs
+            .Where(l => l.TradeSignalId > 0)
+            .Select(l => l.TradeSignalId)
+            .Distinct()
+            .ToList();
+        if (signalIds.Count == 0) return [];
+
+        // signal -> order ids (one signal can in principle map to multiple orders if retries
+        // were issued; we sum the realised P&L across all of them).
+        var orderRows = await db.Set<Order>()
+            .AsNoTracking()
+            .Where(o => o.TradeSignalId.HasValue && signalIds.Contains(o.TradeSignalId.Value) && !o.IsDeleted)
+            .Select(o => new { o.Id, SignalId = o.TradeSignalId!.Value })
+            .ToListAsync(ct);
+
+        if (orderRows.Count == 0) return [];
+
+        var orderIds = orderRows.Select(o => o.Id).Distinct().ToList();
+
+        var positionRows = await db.Set<Position>()
+            .AsNoTracking()
+            .Where(p => p.OpenOrderId.HasValue
+                     && orderIds.Contains(p.OpenOrderId.Value)
+                     && p.Status == PositionStatus.Closed
+                     && !p.IsDeleted)
+            .Select(p => new { OrderId = p.OpenOrderId!.Value, p.RealizedPnL })
+            .ToListAsync(ct);
+
+        if (positionRows.Count == 0) return [];
+
+        var orderToSignal = orderRows.ToDictionary(o => o.Id, o => o.SignalId);
+        var map = new Dictionary<long, double>(positionRows.Count);
+        foreach (var row in positionRows)
+        {
+            if (!orderToSignal.TryGetValue(row.OrderId, out var sigId)) continue;
+            double pnl = (double)row.RealizedPnL;
+            if (!double.IsFinite(pnl)) continue;
+            map[sigId] = map.TryGetValue(sigId, out var existing) ? existing + pnl : pnl;
+        }
+        return map;
+    }
+
+    private static (List<MLModelPredictionLog> Sweep, List<MLModelPredictionLog> Holdout) SplitWalkForward(
+        List<MLModelPredictionLog> chronological, double holdoutFraction, int minHoldoutSamples)
+    {
+        if (chronological.Count == 0)
+            return (chronological, chronological);
+
+        if (minHoldoutSamples > 0 && chronological.Count < minHoldoutSamples * 2)
+            return (chronological, new List<MLModelPredictionLog>(0));
+
+        int holdoutCount = Math.Max(
+            minHoldoutSamples,
+            (int)Math.Round(chronological.Count * Math.Clamp(holdoutFraction, 0.0, 0.5)));
+        holdoutCount = Math.Min(holdoutCount, chronological.Count - 1);
+        if (holdoutCount <= 0) return (chronological, new List<MLModelPredictionLog>(0));
+
+        int sweepEnd = chronological.Count - holdoutCount;
+        return (chronological.Take(sweepEnd).ToList(), chronological.Skip(sweepEnd).ToList());
+    }
+
+    private static bool IsThresholdInformative(MLModelPredictionLog log)
+    {
+        return log.ServedCalibratedProbability.HasValue
+            || log.CalibratedProbability.HasValue
+            || log.RawProbability.HasValue
+            || log.DecisionThresholdUsed.HasValue;
+    }
+
+    private static (double BestThreshold, double BestEv) FindBestThreshold(
+        IReadOnlyList<MLModelPredictionLog> logs,
+        double currentThreshold,
+        DateTime nowUtc,
+        double halfLifeDays,
+        IReadOnlyDictionary<long, double> pnlMap)
+    {
+        double anchor = Math.Clamp(
+            SanitizeThreshold(currentThreshold, DefaultDecisionThreshold),
+            SearchMinThreshold,
+            SearchMaxThreshold);
+
+        double bestThreshold = anchor;
+        double bestEv = double.NegativeInfinity;
+
+        for (int step = (int)Math.Round(SearchMinThreshold * 100);
+             step <= (int)Math.Round(SearchMaxThreshold * 100);
+             step += SearchStepBasisPoints)
+        {
+            double threshold = step / 100.0;
+            var result = ComputeWeightedEv(logs, threshold, currentThreshold, nowUtc, halfLifeDays, pnlMap);
+            double ev = result.Ev;
+
+            if (ev > bestEv + ThresholdTieTolerance)
+            {
+                bestEv = ev;
+                bestThreshold = threshold;
+                continue;
+            }
+
+            if (Math.Abs(ev - bestEv) <= ThresholdTieTolerance &&
+                Math.Abs(threshold - anchor) < Math.Abs(bestThreshold - anchor))
+            {
+                bestThreshold = threshold;
+            }
+        }
+
+        return (bestThreshold, double.IsFinite(bestEv) ? bestEv : 0);
+    }
+
+    private static EvResult ComputeWeightedEv(
+        IReadOnlyList<MLModelPredictionLog> logs,
+        double threshold,
+        double fallbackThreshold,
+        DateTime nowUtc,
+        double halfLifeDays,
+        IReadOnlyDictionary<long, double> pnlMap)
+    {
+        if (logs.Count == 0) return new EvResult(0, 0, 0, 0);
+
+        double evSum = 0;
+        double weightedPnl = 0;
+        double totalWeight = 0;
+        int wins = 0;
+        int total = 0;
 
         foreach (var log in logs)
         {
-            // Skip any log whose outcome was not resolved — should not occur in practice
-            // because the query filters DirectionCorrect != null, but defensive check.
-            if (log.DirectionCorrect is null) continue;
+            if (!log.ActualDirection.HasValue) continue;
 
-            // Reconstruct the calibrated probability from direction + confidence score.
-            // Approximate inverse: calibP ≈ threshold + conf/2 (for Buy direction).
-            // For Sell, a high confidence score means the model strongly predicts downward movement,
-            // so we subtract conf/2 to move the probability below the threshold midpoint.
-            double calibP = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, threshold);
+            double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, fallbackThreshold);
+            bool predictedBuy = pBuy >= threshold;
+            bool actualBuy = log.ActualDirection.Value == TradeDirection.Buy;
+            bool correct = predictedBuy == actualBuy;
+            double edge = Math.Abs(pBuy - threshold);
+            double weight = ComputeTimeDecayWeight(log, nowUtc, halfLifeDays);
+            if (!double.IsFinite(weight) || weight <= 0) continue;
 
-            bool predictedBuy = calibP >= threshold;
-            bool actualBuy    = log.ActualDirection == TradeDirection.Buy;
+            double contribution = ComputeLogContribution(log, predictedBuy, correct, edge, pnlMap);
 
-            // Compare simulated prediction to actual outcome.
-            if (predictedBuy == actualBuy) wins++;
-            else                          losses++;
+            evSum += weight * contribution;
+            totalWeight += weight;
+            total++;
+            if (correct) wins++;
+
+            // Mirror the contribution's pnl-vs-magnitude routing in the diagnostic mean P&L.
+            bool sameAsHistory = (log.PredictedDirection == TradeDirection.Buy) == predictedBuy;
+            if (sameAsHistory && pnlMap.TryGetValue(log.TradeSignalId, out var pnl))
+            {
+                weightedPnl += weight * pnl;
+            }
+            else if (log.ActualMagnitudePips.HasValue)
+            {
+                double mag = Math.Abs((double)log.ActualMagnitudePips.Value);
+                weightedPnl += weight * (correct ? mag : -mag);
+            }
         }
 
-        int total = wins + losses;
-        if (total == 0) return 0;  // no scorable predictions in this window — neutral EV
+        if (totalWeight <= 0) return new EvResult(0, 0, 0, 0);
 
-        // Return the normalised EV: positive means more wins than losses at this threshold.
-        return (double)(wins - losses) / total;
+        return new EvResult(evSum / totalWeight, wins, total, weightedPnl / totalWeight);
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
-
     /// <summary>
-    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table.
-    /// Returns <paramref name="defaultValue"/> when the key does not exist or the stored
-    /// string cannot be converted to <typeparamref name="T"/>.
+    /// Per-log signed contribution. Real broker P&amp;L only applies when the test threshold
+    /// would have predicted the same direction as the historical execution — otherwise the
+    /// outcome would be a counterfactual estimate and we fall through to the magnitude
+    /// heuristic instead of inverting the historical pnl.
     /// </summary>
-    /// <typeparam name="T">Target type — typically <c>int</c> or <c>double</c>.</typeparam>
-    /// <param name="ctx">Any DbContext with access to the EngineConfig set.</param>
-    /// <param name="key">The EngineConfig key to look up.</param>
-    /// <param name="defaultValue">Fallback returned when the key is absent or unparseable.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>The parsed configuration value, or <paramref name="defaultValue"/>.</returns>
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    private static double ComputeLogContribution(
+        MLModelPredictionLog log,
+        bool predictedBuyAtTestThreshold,
+        bool correctAtTestThreshold,
+        double edge,
+        IReadOnlyDictionary<long, double> pnlMap)
     {
-        var entry = await ctx.Set<EngineConfig>()
+        bool historicalPredictedBuy = log.PredictedDirection == TradeDirection.Buy;
+        bool sameAsHistory = historicalPredictedBuy == predictedBuyAtTestThreshold;
+
+        if (sameAsHistory && pnlMap.TryGetValue(log.TradeSignalId, out var pnl))
+        {
+            // Same trade direction as history → broker P&L is already signed by reality.
+            return edge * pnl;
+        }
+
+        // Counterfactual or no broker outcome — fall back to the magnitude heuristic.
+        double mag = log.ActualMagnitudePips.HasValue
+            ? Math.Abs((double)log.ActualMagnitudePips.Value)
+            : 1.0;
+        return (correctAtTestThreshold ? 1.0 : -1.0) * edge * mag;
+    }
+
+    private static PairedEvComparison ComputeHoldoutEvComparison(
+        IReadOnlyList<MLModelPredictionLog> logs,
+        double prevThreshold,
+        double newThreshold,
+        double fallbackThreshold,
+        DateTime nowUtc,
+        double halfLifeDays,
+        IReadOnlyDictionary<long, double> pnlMap)
+    {
+        if (logs.Count == 0) return new PairedEvComparison(0, 0, 0, 0, 0, 0);
+
+        double sumPrev = 0, sumNew = 0;
+        double totalWeight = 0;
+        double weightedPnlNew = 0;
+        int wins = 0, total = 0;
+
+        // First pass: compute weighted EVs at both thresholds, paired per log so we can
+        // measure stderr of the difference for the Bonferroni-corrected regression test.
+        var deltas = new List<(double WeightedDelta, double Weight)>(logs.Count);
+
+        foreach (var log in logs)
+        {
+            if (!log.ActualDirection.HasValue) continue;
+
+            double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, fallbackThreshold);
+            bool actualBuy = log.ActualDirection.Value == TradeDirection.Buy;
+
+            bool predictedPrev = pBuy >= prevThreshold;
+            bool predictedNew = pBuy >= newThreshold;
+            bool correctPrev = predictedPrev == actualBuy;
+            bool correctNew = predictedNew == actualBuy;
+            double edgePrev = Math.Abs(pBuy - prevThreshold);
+            double edgeNew = Math.Abs(pBuy - newThreshold);
+
+            double weight = ComputeTimeDecayWeight(log, nowUtc, halfLifeDays);
+            if (!double.IsFinite(weight) || weight <= 0) continue;
+
+            double contribPrev = ComputeLogContribution(log, predictedPrev, correctPrev, edgePrev, pnlMap);
+            double contribNew = ComputeLogContribution(log, predictedNew, correctNew, edgeNew, pnlMap);
+
+            sumPrev += weight * contribPrev;
+            sumNew += weight * contribNew;
+            totalWeight += weight;
+            total++;
+            if (correctNew) wins++;
+
+            // Mirror the contribution's pnl-vs-magnitude routing: real broker P&L only when
+            // the test threshold matches the historical execution direction, otherwise the
+            // counterfactual is too uncertain to attribute and we use the magnitude proxy.
+            bool sameAsHistoryNew = (log.PredictedDirection == TradeDirection.Buy) == predictedNew;
+            if (sameAsHistoryNew && pnlMap.TryGetValue(log.TradeSignalId, out var pnl))
+            {
+                weightedPnlNew += weight * pnl;
+            }
+            else if (log.ActualMagnitudePips.HasValue)
+            {
+                double mag = Math.Abs((double)log.ActualMagnitudePips.Value);
+                weightedPnlNew += weight * (correctNew ? mag : -mag);
+            }
+
+            deltas.Add((weight * (contribNew - contribPrev), weight));
+        }
+
+        if (totalWeight <= 0) return new PairedEvComparison(0, 0, 0, 0, 0, 0);
+
+        double evPrev = sumPrev / totalWeight;
+        double evNew = sumNew / totalWeight;
+
+        // Stderr of the paired weighted mean. Uses Kish's effective sample size so non-uniform
+        // (e.g. time-decayed) weights produce honest variance estimates. With uniform weights
+        // this collapses to the standard sample-mean stderr; with skewed weights it correctly
+        // shrinks the effective N.
+        double stderr = 0;
+        if (deltas.Count >= 2 && totalWeight > 0)
+        {
+            double sumW = totalWeight;
+            double sumW2 = 0;
+            foreach (var (_, w) in deltas) sumW2 += w * w;
+            double nEff = sumW2 > 0 ? (sumW * sumW) / sumW2 : deltas.Count;
+
+            double meanDelta = (sumNew - sumPrev) / sumW;
+            double weightedSquaredDiff = 0;
+            foreach (var (wd, w) in deltas)
+            {
+                double perLogContribution = wd / w;
+                double diff = perLogContribution - meanDelta;
+                weightedSquaredDiff += w * diff * diff;
+            }
+            double weightedVariance = weightedSquaredDiff / sumW;
+            double denom = Math.Max(nEff - 1, 1);
+            stderr = Math.Sqrt(weightedVariance / denom);
+            if (!double.IsFinite(stderr)) stderr = 0;
+        }
+
+        return new PairedEvComparison(
+            EvAtPrev: evPrev,
+            EvAtNew: evNew,
+            PairedStderr: stderr,
+            Wins: wins,
+            Total: total,
+            MeanPnlPips: weightedPnlNew / totalWeight);
+    }
+
+    private static double ComputeTimeDecayWeight(MLModelPredictionLog log, DateTime nowUtc, double halfLifeDays)
+    {
+        if (halfLifeDays <= 0) return 1.0;
+        DateTime anchor = log.OutcomeRecordedAt ?? log.PredictedAt;
+        double ageDays = Math.Max(0, (nowUtc - anchor).TotalDays);
+        return Math.Pow(0.5, ageDays / halfLifeDays);
+    }
+
+    private static double ComputePsiAlphaScale(double psi, double psiThreshold, double psiHardCap)
+    {
+        if (psi <= psiThreshold) return 1.0;
+        if (psi >= psiHardCap) return 0.0;
+        // Linear ramp from full alpha at psi==threshold down to zero at psi==hardCap.
+        double range = psiHardCap - psiThreshold;
+        if (range <= 0) return 0.0;
+        return Math.Clamp(1.0 - ((psi - psiThreshold) / range), 0.0, 1.0);
+    }
+
+    private static double BlendThreshold(double targetThreshold, double currentThreshold, double emaAlpha)
+    {
+        double blended = emaAlpha * targetThreshold + (1.0 - emaAlpha) * currentThreshold;
+        return Math.Clamp(blended, MinProbabilityThreshold, MaxProbabilityThreshold);
+    }
+
+    private static bool NormalizeSnapshotThresholdState(ModelSnapshot snapshot, out int removedRegimeThresholds)
+    {
+        bool updated = false;
+        removedRegimeThresholds = 0;
+
+        if (snapshot.AdaptiveThreshold > 0.0 && !IsFiniteThreshold(snapshot.AdaptiveThreshold))
+        {
+            snapshot.AdaptiveThreshold = 0.0;
+            updated = true;
+        }
+
+        if (snapshot.RegimeThresholds is null || snapshot.RegimeThresholds.Count == 0)
+            return updated;
+
+        foreach (var key in snapshot.RegimeThresholds.Keys.ToList())
+        {
+            if (string.IsNullOrWhiteSpace(key) ||
+                !IsFiniteThreshold(snapshot.RegimeThresholds[key]))
+            {
+                snapshot.RegimeThresholds.Remove(key);
+                removedRegimeThresholds++;
+            }
+        }
+
+        return updated || removedRegimeThresholds > 0;
+    }
+
+    private static int PruneMissingRegimeThresholds(
+        Dictionary<string, double> regimeThresholds, HashSet<string> matchedRegimes)
+    {
+        if (regimeThresholds.Count == 0) return 0;
+        int removed = 0;
+        foreach (var key in regimeThresholds.Keys.ToList())
+        {
+            if (matchedRegimes.Contains(key)) continue;
+            regimeThresholds.Remove(key);
+            removed++;
+        }
+        return removed;
+    }
+
+    private static MarketRegimeEnum? FindRegimeAt(List<RegimeSlice> timeline, DateTime predictedAt)
+    {
+        int lo = 0, hi = timeline.Count - 1, found = -1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            if (timeline[mid].DetectedAt <= predictedAt) { found = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        return found >= 0 ? timeline[found].Regime : null;
+    }
+
+    private static double ComputeStationarityPsi(List<MLModelPredictionLog> logs, int minSamples)
+    {
+        if (minSamples <= 0 || logs.Count < minSamples) return 0;
+
+        var sorted = logs.OrderBy(l => l.PredictedAt).ToList();
+        int half = sorted.Count / 2;
+        if (half < 2) return 0;
+
+        var older = sorted.Take(half).Select(l => (double)l.ConfidenceScore).ToList();
+        var newer = sorted.Skip(half).Select(l => (double)l.ConfidenceScore).ToList();
+
+        const int bins = 10;
+        var oldDist = Histogram(older, bins);
+        var newDist = Histogram(newer, bins);
+
+        double psi = 0;
+        for (int i = 0; i < bins; i++)
+        {
+            double e = Math.Max(oldDist[i], 1e-4);
+            double a = Math.Max(newDist[i], 1e-4);
+            psi += (a - e) * Math.Log(a / e);
+        }
+
+        return double.IsFinite(psi) ? Math.Max(0, psi) : 0;
+    }
+
+    private static double[] Histogram(List<double> values, int bins)
+    {
+        var counts = new double[bins];
+        if (values.Count == 0) return counts;
+        foreach (var v in values)
+        {
+            double clamped = Math.Clamp(v, 0, 1);
+            int idx = Math.Min(bins - 1, (int)(clamped * bins));
+            counts[idx]++;
+        }
+        for (int i = 0; i < bins; i++) counts[i] /= values.Count;
+        return counts;
+    }
+
+    private static double WilsonLowerBound(int wins, int total, double z = 1.96)
+    {
+        if (total <= 0) return 0;
+        double pHat = (double)wins / total;
+        double z2 = z * z;
+        double denom = 1 + z2 / total;
+        double centre = pHat + z2 / (2.0 * total);
+        double margin = z * Math.Sqrt((pHat * (1 - pHat) + z2 / (4.0 * total)) / total);
+        double lb = (centre - margin) / denom;
+        return double.IsFinite(lb) ? Math.Clamp(lb, 0, 1) : 0;
+    }
+
+    private void EnqueueAudit(
+        List<MLAdaptiveThresholdLog> pending,
+        ActiveModelCandidate model,
+        MarketRegimeEnum? regime,
+        AuditOutcome outcome,
+        string reason,
+        int sweepSize,
+        int holdoutSize,
+        double previousThreshold,
+        double optimal,
+        double newThreshold,
+        double drift,
+        double holdoutEvNew,
+        double holdoutEvPrev,
+        double meanPnlPips,
+        double psi,
+        DateTime? newestOutcomeAt,
+        string diagnostics,
+        DateTime evaluatedAt)
+    {
+        pending.Add(new MLAdaptiveThresholdLog
+        {
+            MLModelId = model.Id,
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            Regime = regime,
+            EvaluatedAt = evaluatedAt,
+            Outcome = OutcomeString(outcome),
+            Reason = TrimToLength(reason, 64),
+            PreviousThreshold = previousThreshold,
+            OptimalThreshold = optimal,
+            NewThreshold = newThreshold,
+            Drift = drift,
+            HoldoutEvAtNewThreshold = holdoutEvNew,
+            HoldoutEvAtPreviousThreshold = holdoutEvPrev,
+            HoldoutMeanPnlPips = meanPnlPips,
+            SweepSampleSize = sweepSize,
+            HoldoutSampleSize = holdoutSize,
+            StationarityPsi = psi,
+            NewestOutcomeAt = newestOutcomeAt,
+            DiagnosticsJson = TrimToLength(diagnostics, MaxAuditDiagnosticsLength),
+        });
+    }
+
+    private async Task RaiseAnomalousDriftAlertAsync(
+        ActiveModelCandidate model, double oldThreshold, double newThreshold, double drift, CancellationToken ct)
+    {
+        if (_alertDispatcher is null) return;
+
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
+
+            string dedupKey = $"ml-adaptive-threshold-drift:{model.Id}";
+            bool exists = await writeCtx.Set<Alert>()
+                .AnyAsync(a => a.DeduplicationKey == dedupKey && a.IsActive && !a.IsDeleted, ct);
+            if (exists) return;
+
+            int cooldownSec = await AlertCooldownDefaults.GetCooldownAsync(
+                writeCtx, AlertCooldownDefaults.CK_MLDrift, AlertCooldownDefaults.Default_MLDrift, ct);
+
+            string conditionJson = JsonSerializer.Serialize(new
+            {
+                modelId = model.Id,
+                symbol = model.Symbol,
+                timeframe = model.Timeframe.ToString(),
+                oldThreshold,
+                newThreshold,
+                drift,
+                detectedAt = _timeProvider.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture)
+            });
+
+            var alert = new Alert
+            {
+                AlertType = AlertType.ConfigurationDrift,
+                Severity = drift >= 0.10 ? AlertSeverity.High : AlertSeverity.Medium,
+                DeduplicationKey = dedupKey,
+                CooldownSeconds = cooldownSec,
+                ConditionJson = conditionJson,
+                IsActive = true,
+            };
+
+            string message = string.Format(
+                CultureInfo.InvariantCulture,
+                "Adaptive threshold drift {0:F4} on model {1} ({2}/{3}): {4:F4} -> {5:F4}.",
+                drift, model.Id, model.Symbol, model.Timeframe, oldThreshold, newThreshold);
+
+            await _alertDispatcher.DispatchAsync(alert, message, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "{Worker}: failed to dispatch anomalous-drift alert for model {ModelId}.",
+                WorkerName, model.Id);
+        }
+    }
+
+    private async Task RaiseDataStarvationAlertAsync(int totalModels, int starvedModels, CancellationToken ct)
+    {
+        if (_alertDispatcher is null) return;
+
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
+
+            const string dedupKey = "ml-adaptive-threshold-data-starvation";
+            bool exists = await writeCtx.Set<Alert>()
+                .AnyAsync(a => a.DeduplicationKey == dedupKey && a.IsActive && !a.IsDeleted, ct);
+            if (exists) return;
+
+            int cooldownSec = await AlertCooldownDefaults.GetCooldownAsync(
+                writeCtx, AlertCooldownDefaults.CK_MLMonitoring, AlertCooldownDefaults.Default_MLMonitoring, ct);
+
+            string conditionJson = JsonSerializer.Serialize(new
+            {
+                totalModels,
+                starvedModels,
+                ratio = totalModels > 0 ? (double)starvedModels / totalModels : 0,
+                detectedAt = _timeProvider.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture)
+            });
+
+            var alert = new Alert
+            {
+                AlertType = AlertType.DataQualityIssue,
+                Severity = AlertSeverity.High,
+                DeduplicationKey = dedupKey,
+                CooldownSeconds = cooldownSec,
+                ConditionJson = conditionJson,
+                IsActive = true,
+            };
+
+            string message = string.Format(
+                CultureInfo.InvariantCulture,
+                "MLAdaptiveThresholdWorker: {0}/{1} models lack sufficient resolved prediction logs - outcome resolution may be stalled.",
+                starvedModels, totalModels);
+
+            await _alertDispatcher.DispatchAsync(alert, message, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "{Worker}: failed to dispatch data-starvation alert.", WorkerName);
+        }
+    }
+
+    private async Task<AdaptiveThresholdWorkerSettings> LoadSettingsAsync(DbContext db, CancellationToken ct)
+    {
+        string[] keys =
+        [
+            CK_Enabled, CK_PollSecs, CK_WindowSize, CK_MinPredictions, CK_EmaAlpha,
+            CK_MinDrift, CK_LookbackDays, CK_MinRegimePredictions, CK_MaxModelsPerCycle,
+            CK_LockTimeoutSecs, CK_ModelLockTimeoutSecs, CK_HoldoutFraction, CK_MinHoldoutSamples,
+            CK_TimeDecayHalfLifeDays, CK_MinSamplesForTimeDecay,
+            CK_StationarityPsiThreshold, CK_MinStationaritySamples, CK_PsiHardCapMultiplier,
+            CK_WilsonLowerBoundFloor, CK_RegressionGuardK, CK_AnomalousDriftAlertThreshold,
+        ];
+
+        var values = await db.Set<EngineConfig>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .Where(config => keys.Contains(config.Key))
+            .ToDictionaryAsync(config => config.Key, config => config.Value, ct);
 
-        if (entry?.Value is null) return defaultValue;
+        int windowSize = ClampInt(GetInt(values, CK_WindowSize, DefaultWindowSize),
+            DefaultWindowSize, MinWindowSize, MaxWindowSize);
+        int minResolvedPredictions = Math.Min(
+            ClampInt(GetInt(values, CK_MinPredictions, DefaultMinPredictions),
+                DefaultMinPredictions, MinMinPredictions, MaxMinPredictions),
+            windowSize);
+        int minRegimeResolvedPredictions = Math.Min(
+            ClampInt(GetInt(values, CK_MinRegimePredictions, DefaultMinRegimePredictions),
+                DefaultMinRegimePredictions, MinMinRegimePredictions, MaxMinRegimePredictions),
+            windowSize);
 
-        // Convert.ChangeType handles common primitive conversions (string → int, string → double).
-        // Any conversion failure silently falls back to the safe default value.
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        return new AdaptiveThresholdWorkerSettings(
+            Enabled: GetBool(values, CK_Enabled, true),
+            PollInterval: TimeSpan.FromSeconds(
+                ClampInt(GetInt(values, CK_PollSecs, DefaultPollSeconds),
+                    DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
+            WindowSize: windowSize,
+            MinResolvedPredictions: minResolvedPredictions,
+            EmaAlpha: ClampDouble(GetDouble(values, CK_EmaAlpha, DefaultEmaAlpha),
+                DefaultEmaAlpha, MinEmaAlpha, MaxEmaAlpha),
+            MinThresholdDrift: ClampDouble(GetDouble(values, CK_MinDrift, DefaultMinDrift),
+                DefaultMinDrift, MinMinDrift, MaxMinDrift),
+            LookbackDays: ClampInt(GetInt(values, CK_LookbackDays, DefaultLookbackDays),
+                DefaultLookbackDays, MinLookbackDays, MaxLookbackDays),
+            MinRegimeResolvedPredictions: minRegimeResolvedPredictions,
+            MaxModelsPerCycle: ClampInt(GetInt(values, CK_MaxModelsPerCycle, DefaultMaxModelsPerCycle),
+                DefaultMaxModelsPerCycle, MinMaxModelsPerCycle, MaxMaxModelsPerCycle),
+            LockTimeoutSeconds: ClampInt(GetInt(values, CK_LockTimeoutSecs, DefaultLockTimeoutSeconds),
+                DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
+            ModelLockTimeoutSeconds: ClampInt(GetInt(values, CK_ModelLockTimeoutSecs, DefaultModelLockTimeoutSeconds),
+                DefaultModelLockTimeoutSeconds, MinModelLockTimeoutSeconds, MaxModelLockTimeoutSeconds),
+            HoldoutFraction: ClampDouble(GetDouble(values, CK_HoldoutFraction, DefaultHoldoutFraction),
+                DefaultHoldoutFraction, MinHoldoutFraction, MaxHoldoutFraction),
+            MinHoldoutSamples: ClampIntAllowingZero(GetInt(values, CK_MinHoldoutSamples, DefaultMinHoldoutSamples),
+                DefaultMinHoldoutSamples, MinMinHoldoutSamples, MaxMinHoldoutSamples),
+            TimeDecayHalfLifeDays: ClampDoubleAllowingZero(GetDouble(values, CK_TimeDecayHalfLifeDays, DefaultTimeDecayHalfLifeDays),
+                DefaultTimeDecayHalfLifeDays, MinTimeDecayHalfLifeDays, MaxTimeDecayHalfLifeDays),
+            MinSamplesForTimeDecay: ClampIntAllowingZero(GetInt(values, CK_MinSamplesForTimeDecay, DefaultMinSamplesForTimeDecay),
+                DefaultMinSamplesForTimeDecay, MinMinSamplesForTimeDecay, MaxMinSamplesForTimeDecay),
+            StationarityPsiThreshold: ClampDouble(GetDouble(values, CK_StationarityPsiThreshold, DefaultStationarityPsiThreshold),
+                DefaultStationarityPsiThreshold, MinStationarityPsiThreshold, MaxStationarityPsiThreshold),
+            MinStationaritySamples: ClampIntAllowingZero(GetInt(values, CK_MinStationaritySamples, DefaultMinStationaritySamples),
+                DefaultMinStationaritySamples, MinMinStationaritySamples, MaxMinStationaritySamples),
+            PsiHardCapMultiplier: ClampDouble(GetDouble(values, CK_PsiHardCapMultiplier, DefaultPsiHardCapMultiplier),
+                DefaultPsiHardCapMultiplier, MinPsiHardCapMultiplier, MaxPsiHardCapMultiplier),
+            WilsonLowerBoundFloor: ClampDoubleAllowingZero(GetDouble(values, CK_WilsonLowerBoundFloor, DefaultWilsonLowerBoundFloor),
+                DefaultWilsonLowerBoundFloor, MinWilsonLowerBoundFloor, MaxWilsonLowerBoundFloor),
+            RegressionGuardK: ClampDoubleAllowingZero(GetDouble(values, CK_RegressionGuardK, DefaultRegressionGuardK),
+                DefaultRegressionGuardK, MinRegressionGuardK, MaxRegressionGuardK),
+            AnomalousDriftAlertThreshold: ClampDouble(GetDouble(values, CK_AnomalousDriftAlertThreshold, DefaultAnomalousDriftAlertThreshold),
+                DefaultAnomalousDriftAlertThreshold, MinAnomalousDriftAlertThreshold, MaxAnomalousDriftAlertThreshold));
+    }
+
+    private static bool GetBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw)) return defaultValue;
+        if (bool.TryParse(raw, out var b)) return b;
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i)) return i != 0;
+        return defaultValue;
+    }
+
+    private static int GetInt(IReadOnlyDictionary<string, string> values, string key, int defaultValue)
+    {
+        return values.TryGetValue(key, out var raw) &&
+               int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : defaultValue;
+    }
+
+    private static double GetDouble(IReadOnlyDictionary<string, string> values, string key, double defaultValue)
+    {
+        return values.TryGetValue(key, out var raw) &&
+               double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : defaultValue;
+    }
+
+    private static int ClampInt(int value, int fallback, int min, int max)
+    {
+        if (value <= 0) return fallback;
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static int ClampIntAllowingZero(int value, int fallback, int min, int max)
+    {
+        if (value < 0) return fallback;
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static double ClampDouble(double value, double fallback, double min, double max)
+    {
+        if (!double.IsFinite(value) || value <= 0.0) return fallback;
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static double ClampDoubleAllowingZero(double value, double fallback, double min, double max)
+    {
+        if (!double.IsFinite(value) || value < 0.0) return fallback;
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static double SanitizeThreshold(double threshold, double fallback)
+        => IsFiniteThreshold(threshold) ? threshold : fallback;
+
+    private static bool IsFiniteThreshold(double threshold)
+        => double.IsFinite(threshold)
+        && threshold >= MinProbabilityThreshold
+        && threshold <= MaxProbabilityThreshold;
+
+    private static string OutcomeString(AuditOutcome outcome) => outcome switch
+    {
+        AuditOutcome.Updated => "updated",
+        AuditOutcome.SkippedDrift => "skipped_drift",
+        AuditOutcome.SkippedData => "skipped_data",
+        AuditOutcome.SkippedRegression => "skipped_regression",
+        AuditOutcome.SkippedStationarity => "skipped_stationarity",
+        AuditOutcome.SkippedConcurrency => "skipped_concurrency",
+        _ => "error",
+    };
+
+    private static string TrimToLength(string s, int max)
+        => s.Length <= max ? s : s[..max];
+
+    private static string BuildDiagnostics(params (string Key, object Value)[] pairs)
+    {
+        var dict = pairs.ToDictionary(p => p.Key, p => p.Value);
+        return JsonSerializer.Serialize(dict);
+    }
+
+    internal readonly record struct AdaptiveThresholdWorkerSettings(
+        bool Enabled,
+        TimeSpan PollInterval,
+        int WindowSize,
+        int MinResolvedPredictions,
+        double EmaAlpha,
+        double MinThresholdDrift,
+        int LookbackDays,
+        int MinRegimeResolvedPredictions,
+        int MaxModelsPerCycle,
+        int LockTimeoutSeconds,
+        int ModelLockTimeoutSeconds,
+        double HoldoutFraction,
+        int MinHoldoutSamples,
+        double TimeDecayHalfLifeDays,
+        int MinSamplesForTimeDecay,
+        double StationarityPsiThreshold,
+        int MinStationaritySamples,
+        double PsiHardCapMultiplier,
+        double WilsonLowerBoundFloor,
+        double RegressionGuardK,
+        double AnomalousDriftAlertThreshold)
+    {
+        // Preserve the older public name so in-flight call sites and diagnostics remain source-compatible.
+        public double BonferroniK => RegressionGuardK;
+    }
+
+    internal readonly record struct AdaptiveThresholdCycleResult(
+        AdaptiveThresholdWorkerSettings Settings,
+        string? SkippedReason,
+        int ModelsProcessed,
+        int ModelsUpdated,
+        int ModelsSkipped,
+        int ModelsFailed,
+        int ModelsStarved,
+        int RegimeThresholdsPruned)
+    {
+        public static AdaptiveThresholdCycleResult Skipped(
+            AdaptiveThresholdWorkerSettings settings, string reason)
+            => new(settings, reason, 0, 0, 0, 0, 0, 0);
+    }
+
+    private enum AuditOutcome
+    {
+        Updated,
+        SkippedDrift,
+        SkippedData,
+        SkippedRegression,
+        SkippedStationarity,
+        SkippedConcurrency,
+        Error,
     }
 }

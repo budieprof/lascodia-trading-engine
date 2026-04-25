@@ -14,6 +14,13 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 /// </summary>
 internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCycleDataService
 {
+    private readonly IStrategyGenerationMarketDataPolicy _marketDataPolicy;
+
+    public StrategyGenerationCycleDataService(IStrategyGenerationMarketDataPolicy marketDataPolicy)
+    {
+        _marketDataPolicy = marketDataPolicy;
+    }
+
     public async Task<int> CountRecentAutoCandidatesAsync(DbContext db, DateTime createdAfterUtc, CancellationToken ct)
         => await db.Set<Strategy>()
             .IncludingSoftDeleted()
@@ -148,6 +155,14 @@ internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCy
             .GroupBy(s => (s.Symbol.ToUpperInvariant(), s.Timeframe))
             .ToDictionary(g => g.Key, g => g.First().Regime);
 
+        var dataHealthBySymbol = await LoadDataHealthAsync(
+            db,
+            activePairs,
+            pairDataBySymbol,
+            config,
+            nowUtc,
+            ct);
+
         return new StrategyGenerationCycleDataSnapshot(
             activePairs,
             pairDataBySymbol,
@@ -161,6 +176,89 @@ internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCy
             regimeTransitions,
             regimeDetectedAtBySymbol,
             transitionSymbols,
-            lowConfidenceSymbols);
+            lowConfidenceSymbols,
+            dataHealthBySymbol);
+    }
+
+    private async Task<IReadOnlyDictionary<string, StrategyGenerationDataHealthSnapshot>> LoadDataHealthAsync(
+        DbContext db,
+        IReadOnlyList<string> activePairs,
+        IReadOnlyDictionary<string, CurrencyPair> pairDataBySymbol,
+        GenerationConfig config,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<string, StrategyGenerationDataHealthSnapshot>(StringComparer.OrdinalIgnoreCase);
+        if (activePairs.Count == 0 || config.CandidateTimeframes.Count == 0)
+            return result;
+
+        int maxScaledMonths = config.CandidateTimeframes
+            .Select(tf => ScaleScreeningWindowForTimeframe(config.ScreeningMonths, tf))
+            .DefaultIfEmpty(config.ScreeningMonths)
+            .Max();
+        var earliest = nowUtc.AddMonths(-maxScaledMonths);
+
+        var stats = await db.Set<Candle>()
+            .Where(c => activePairs.Contains(c.Symbol)
+                     && config.CandidateTimeframes.Contains(c.Timeframe)
+                     && c.Timestamp >= earliest
+                     && c.IsClosed
+                     && !c.IsDeleted)
+            .GroupBy(c => new { c.Symbol, c.Timeframe })
+            .Select(g => new
+            {
+                g.Key.Symbol,
+                g.Key.Timeframe,
+                Count = g.Count(),
+                Latest = (DateTime?)g.Max(c => c.Timestamp),
+            })
+            .ToListAsync(ct);
+
+        var statsByKey = stats.ToDictionary(
+            s => (s.Symbol.ToUpperInvariant(), s.Timeframe),
+            s => s);
+
+        foreach (var symbol in activePairs)
+        {
+            pairDataBySymbol.TryGetValue(symbol, out var pairInfo);
+            var timeframeSnapshots = new List<StrategyGenerationDataHealthTimeframeSnapshot>(config.CandidateTimeframes.Count);
+
+            foreach (var timeframe in config.CandidateTimeframes)
+            {
+                var key = (symbol.ToUpperInvariant(), timeframe);
+                statsByKey.TryGetValue(key, out var stat);
+                double? effectiveAgeHours = stat?.Latest == null
+                    ? null
+                    : _marketDataPolicy.ComputeEffectiveCandleAgeHours(
+                        stat.Latest.Value,
+                        pairInfo?.TradingHoursJson,
+                        nowUtc);
+
+                bool enoughCandles = stat?.Count >= config.DataHealthMinCandles;
+                bool freshEnough = config.MaxCandleAgeHours <= 0
+                    || (effectiveAgeHours.HasValue && effectiveAgeHours.Value <= config.MaxCandleAgeHours);
+                bool eligible = enoughCandles && freshEnough;
+                string reason = eligible
+                    ? "healthy"
+                    : !enoughCandles
+                        ? "insufficient_candles"
+                        : "stale_candles";
+
+                timeframeSnapshots.Add(new StrategyGenerationDataHealthTimeframeSnapshot(
+                    timeframe,
+                    stat?.Count ?? 0,
+                    stat?.Latest,
+                    effectiveAgeHours,
+                    eligible,
+                    reason));
+            }
+
+            double score = timeframeSnapshots.Count == 0
+                ? 0.0
+                : timeframeSnapshots.Count(t => t.IsEligible) / (double)timeframeSnapshots.Count;
+            result[symbol] = new StrategyGenerationDataHealthSnapshot(symbol, score, timeframeSnapshots);
+        }
+
+        return result;
     }
 }

@@ -50,7 +50,9 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item>Auto-select trainer architecture via <see cref="ITrainerSelector"/> unless the run
 ///         already specifies a non-default <see cref="LearnerArchitecture"/>.</item>
 ///   <item>Optionally warm-start from the previous champion's serialised weights when the trigger
-///         is <see cref="TriggerType.AutoDegrading"/> (speeds re-convergence by ~30%).</item>
+///         is <see cref="TriggerType.AutoDegrading"/>. Cold-start bagged-logistic runs can also
+///         warm-start from the active cross-symbol average-weight initializer produced by
+///         <see cref="MLAverageWeightInitWorker"/>.</item>
 ///   <item>Train with a configurable timeout (<c>MLTraining:TrainingTimeoutMinutes</c>).</item>
 ///   <item>Apply <b>multi-gate quality checks</b>: accuracy, expected value, Brier score, Sharpe
 ///         ratio, walk-forward std dev, ECE (calibration), Brier skill score, and OOB regression guard.</item>
@@ -1562,6 +1564,7 @@ trainingSamplesBuilt:;
 
             // ── Load active champion for lineage tracking + warm-start ──────────
             long?          parentModelId = null;
+            long?          transferredFromModelId = null;
             ModelSnapshot? warmStart     = null;
             {
                 var prevModel = await ctx.Set<MLModel>()
@@ -1584,6 +1587,49 @@ trainingSamplesBuilt:;
                         catch
                         {
                             _logger.LogWarning("Run {RunId}: warm-start deserialization failed — cold start", run.Id);
+                        }
+                    }
+                }
+
+                if (parentModelId is null
+                    && warmStart is null
+                    && run.LearnerArchitecture == LearnerArchitecture.BaggedLogistic
+                    && await GetConfigAsync<bool>(ctx, "MLAvgWeightInit:UseForColdStart", true, stoppingToken))
+                {
+                    var avgInitializer = await ctx.Set<MLModel>()
+                        .Where(m => m.Symbol == "ALL"
+                                 && m.Timeframe == run.Timeframe
+                                 && m.LearnerArchitecture == run.LearnerArchitecture
+                                 && m.IsMamlInitializer
+                                 && m.IsActive
+                                 && !m.IsDeleted
+                                 && m.ModelBytes != null)
+                        .OrderByDescending(m => m.TrainedAt)
+                        .Select(m => new { m.Id, m.ModelVersion, m.ModelBytes })
+                        .AsNoTracking()
+                        .FirstOrDefaultAsync(stoppingToken);
+
+                    if (avgInitializer is not null)
+                    {
+                        try
+                        {
+                            warmStart = JsonSerializer.Deserialize<ModelSnapshot>(avgInitializer.ModelBytes);
+                            if (warmStart is not null)
+                            {
+                                parentModelId = avgInitializer.Id;
+                                transferredFromModelId = avgInitializer.Id;
+                                _logger.LogInformation(
+                                    "Run {RunId}: cold-start warm-starting from average-weight initializer {ModelId} ({Version}).",
+                                    run.Id,
+                                    avgInitializer.Id,
+                                    avgInitializer.ModelVersion);
+                            }
+                        }
+                        catch
+                        {
+                            _logger.LogWarning(
+                                "Run {RunId}: average-weight initializer deserialization failed — continuing with cold start.",
+                                run.Id);
                         }
                     }
                 }
@@ -2111,6 +2157,7 @@ trainingSamplesBuilt:;
                 Symbol                 = run.Symbol,
                 Timeframe              = run.Timeframe,
                 LearnerArchitecture    = run.LearnerArchitecture,
+                TransferredFromModelId = transferredFromModelId,
                 ModelVersion           = modelVersion,
                 Status                 = MLModelStatus.Active,
                 IsActive               = true,

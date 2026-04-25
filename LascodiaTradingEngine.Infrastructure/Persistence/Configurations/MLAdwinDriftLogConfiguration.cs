@@ -18,11 +18,15 @@ public class MLAdwinDriftLogConfiguration : IEntityTypeConfiguration<MLAdwinDrif
         builder.Property(x => x.Window1Mean).HasPrecision(18, 8);
         builder.Property(x => x.Window2Mean).HasPrecision(18, 8);
         builder.Property(x => x.EpsilonCut).HasPrecision(18, 8);
+        builder.Property(x => x.AccuracyDrop).HasPrecision(18, 8);
+        builder.Property(x => x.DeltaUsed).HasPrecision(10, 8);
+        builder.Property(x => x.DominantRegime).HasConversion<string>().HasMaxLength(20);
         builder.HasOne(x => x.MLModel)
                .WithMany()
                .HasForeignKey(x => x.MLModelId)
                .OnDelete(DeleteBehavior.Restrict);
         builder.HasQueryFilter(x => !x.IsDeleted);
         builder.HasIndex(x => new { x.MLModelId, x.DetectedAt });
+        builder.HasIndex(x => x.DetectedAt);
     }
 }

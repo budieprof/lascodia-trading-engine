@@ -1,15 +1,17 @@
+using System.Data;
+using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
-using System.Data;
-using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
 {
+    private const int AlertCooldownSeconds = 3600;
+
     private readonly ILogger<MLConformalBreakerStateStore> _logger;
     private readonly TradingMetrics _metrics;
     private readonly TimeProvider _timeProvider;
@@ -33,24 +35,28 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
     {
         BreakerStateResult result = new(0, 0, 0, 0, 0, 0, 0, []);
         var strategy = db.Database.CreateExecutionStrategy();
+
         await strategy.ExecuteAsync(async token =>
         {
             db.ChangeTracker.Clear();
             await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, token);
 
-            var now = _timeProvider.GetUtcNow().UtcDateTime;
-            var alerts = new List<BreakerAlertDispatch>();
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            var dispatches = new List<BreakerAlertDispatch>();
 
-            int expiredCount = await ClearExpiredBreakersAsync(db, now, token);
+            int expiredCount = await ClearExpiredBreakersAsync(db, nowUtc, dispatches, token);
             int duplicateRepairCount = await DeactivateDuplicateActiveBreakersAsync(db, token);
-            int recoveredCount = await RecoverBreakersAsync(db, recoveryCandidates, token);
+            int recoveredCount = await RecoverBreakersAsync(db, recoveryCandidates, nowUtc, dispatches, token);
             int refreshedCount = await RefreshBreakersAsync(db, refreshCandidates, token);
             int trippedCount = 0;
+            int tripDispatches = 0;
 
             foreach (var candidate in tripCandidates)
             {
                 token.ThrowIfCancellationRequested();
-                var resumeAt = now.Add(MLConformalBreakerWorker.GetBarDuration(candidate.Timeframe) * candidate.SuspensionBars);
+
+                DateTime resumeAt = nowUtc.Add(
+                    MLConformalBreakerWorker.GetBarDuration(candidate.Timeframe) * candidate.SuspensionBars);
 
                 _logger.LogWarning(
                     "MLConformalBreakerWorker: SUSPENDED {Symbol}/{Timeframe} model {ModelId} — reason={Reason}, run={Run}, coverage={Coverage:P1}, wilsonLower={Lower:P1}, wilsonUpper={Upper:P1}, threshold={Threshold:F4}",
@@ -68,7 +74,8 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                     .Where(b => b.MLModelId == candidate.MLModelId
                                 && b.Symbol == candidate.Symbol
                                 && b.Timeframe == candidate.Timeframe
-                                && b.IsActive)
+                                && b.IsActive
+                                && b.ResumeAt > nowUtc)
                     .OrderByDescending(b => b.SuspendedAt)
                     .ThenByDescending(b => b.Id)
                     .ToListAsync(token);
@@ -78,8 +85,8 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                     var existing = existingBreakers[0];
                     ApplyDiagnostics(existing, candidate.Evaluation, candidate.TargetCoverage, candidate.CoverageThreshold);
                     existing.SuspensionBars = candidate.SuspensionBars;
-                    existing.SuspendedAt    = now;
-                    existing.ResumeAt       = resumeAt;
+                    existing.SuspendedAt = nowUtc;
+                    existing.ResumeAt = resumeAt;
 
                     foreach (var duplicate in existingBreakers.Skip(1))
                     {
@@ -91,13 +98,13 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                 {
                     var breaker = new MLConformalBreakerLog
                     {
-                        MLModelId                   = candidate.MLModelId,
-                        Symbol                      = candidate.Symbol,
-                        Timeframe                   = candidate.Timeframe,
-                        SuspensionBars              = candidate.SuspensionBars,
-                        SuspendedAt                 = now,
-                        ResumeAt                    = resumeAt,
-                        IsActive                    = true
+                        MLModelId = candidate.MLModelId,
+                        Symbol = candidate.Symbol,
+                        Timeframe = candidate.Timeframe,
+                        SuspensionBars = candidate.SuspensionBars,
+                        SuspendedAt = nowUtc,
+                        ResumeAt = resumeAt,
+                        IsActive = true
                     };
                     ApplyDiagnostics(breaker, candidate.Evaluation, candidate.TargetCoverage, candidate.CoverageThreshold);
                     await db.Set<MLConformalBreakerLog>().AddAsync(breaker, token);
@@ -108,18 +115,24 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                 if (writeModel is not null)
                     writeModel.IsSuppressed = true;
 
-                _metrics.MLConformalBreakerTrips.Add(1,
+                _metrics.MLConformalBreakerTrips.Add(
+                    1,
                     new("reason", candidate.Evaluation.TripReason.ToString()),
                     new("symbol", candidate.Symbol),
                     new("timeframe", candidate.Timeframe.ToString()));
 
-                var alert = BuildTripAlert(candidate, resumeAt);
-                db.Set<Alert>().Add(alert);
-                alerts.Add(new BreakerAlertDispatch(
-                    alert,
-                    $"ML conformal breaker suppressed model {candidate.MLModelId} on {candidate.Symbol}/{candidate.Timeframe}: " +
-                    $"reason={candidate.Evaluation.TripReason}, coverage={candidate.Evaluation.EmpiricalCoverage:P1}, " +
-                    $"target={candidate.TargetCoverage:P1}, resumeAt={resumeAt:O}."));
+                var (alert, shouldDispatch) = await UpsertTripAlertAsync(db, candidate, resumeAt, nowUtc, token);
+                if (shouldDispatch)
+                {
+                    dispatches.Add(new BreakerAlertDispatch(
+                        alert,
+                        $"ML conformal breaker suppressed model {candidate.MLModelId} on {candidate.Symbol}/{candidate.Timeframe}: " +
+                        $"reason={candidate.Evaluation.TripReason}, coverage={candidate.Evaluation.EmpiricalCoverage:P1}, " +
+                        $"target={candidate.TargetCoverage:P1}, resumeAt={resumeAt:O}.",
+                        BreakerAlertDispatchKind.Trip));
+                    tripDispatches++;
+                }
+
                 trippedCount++;
             }
 
@@ -128,17 +141,19 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
 
             int activeBreakers = await db.Set<MLConformalBreakerLog>()
                 .CountAsync(b => b.IsActive && !b.IsDeleted, token);
+
             if (duplicateRepairCount > 0)
                 _metrics.MLConformalBreakerDuplicateRepairs.Add(duplicateRepairCount);
+
             result = new BreakerStateResult(
                 expiredCount,
                 recoveredCount,
                 refreshedCount,
                 trippedCount,
                 duplicateRepairCount,
-                alerts.Count,
+                tripDispatches,
                 activeBreakers,
-                alerts);
+                dispatches);
         }, ct);
 
         return result;
@@ -167,10 +182,14 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         return deactivated;
     }
 
-    private async Task<int> ClearExpiredBreakersAsync(DbContext db, DateTime now, CancellationToken token)
+    private async Task<int> ClearExpiredBreakersAsync(
+        DbContext db,
+        DateTime nowUtc,
+        List<BreakerAlertDispatch> dispatches,
+        CancellationToken token)
     {
         var expiredBreakers = await db.Set<MLConformalBreakerLog>()
-            .Where(b => b.IsActive && b.ResumeAt <= now)
+            .Where(b => b.IsActive && b.ResumeAt <= nowUtc)
             .ToListAsync(token);
 
         foreach (var breaker in expiredBreakers)
@@ -182,12 +201,20 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                 .FirstOrDefaultAsync(m => m.Id == breaker.MLModelId, token);
             if (suppressed is not null &&
                 await MLSuppressionStateHelper.CanLiftSuppressionAsync(
-                    db, suppressed, token, ignoreConformalBreakerId: breaker.Id))
+                    db,
+                    suppressed,
+                    token,
+                    ignoreConformalBreakerId: breaker.Id))
+            {
                 suppressed.IsSuppressed = false;
+            }
+
+            await ResolveActiveAlertAsync(db, breaker.MLModelId, breaker.Symbol, breaker.Timeframe, nowUtc, dispatches, token);
 
             _logger.LogInformation(
                 "MLConformalBreakerWorker: RESUMED {Symbol}/{Timeframe} — breaker expired.",
-                breaker.Symbol, breaker.Timeframe);
+                breaker.Symbol,
+                breaker.Timeframe);
         }
 
         return expiredBreakers.Count;
@@ -196,12 +223,15 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
     private async Task<int> RecoverBreakersAsync(
         DbContext db,
         IReadOnlyCollection<BreakerRecoveryCandidate> recoveryCandidates,
+        DateTime nowUtc,
+        List<BreakerAlertDispatch> dispatches,
         CancellationToken token)
     {
         int recoveredCount = 0;
         foreach (var candidate in recoveryCandidates)
         {
             token.ThrowIfCancellationRequested();
+
             var activeBreakers = await db.Set<MLConformalBreakerLog>()
                 .Where(b => b.Id == candidate.BreakerId && b.IsActive)
                 .ToListAsync(token);
@@ -220,10 +250,10 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                 .OrderByDescending(b => b.SuspendedAt)
                 .ThenByDescending(b => b.Id)
                 .First();
+
             foreach (var activeBreaker in activeBreakers)
-            {
                 activeBreaker.IsActive = false;
-            }
+
             ApplyDiagnostics(breaker, candidate.Evaluation, breaker.TargetCoverage, breaker.CoverageThreshold);
             recoveredCount++;
 
@@ -235,9 +265,14 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                     suppressed,
                     token,
                     ignoreConformalBreakerIds: activeBreakers.Select(b => b.Id).ToArray()))
+            {
                 suppressed.IsSuppressed = false;
+            }
 
-            _metrics.MLConformalBreakerRecoveries.Add(1,
+            await ResolveActiveAlertAsync(db, candidate.MLModelId, candidate.Symbol, candidate.Timeframe, nowUtc, dispatches, token);
+
+            _metrics.MLConformalBreakerRecoveries.Add(
+                1,
                 new("symbol", candidate.Symbol),
                 new("timeframe", candidate.Timeframe.ToString()));
             _logger.LogInformation(
@@ -260,6 +295,7 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         foreach (var candidate in refreshCandidates)
         {
             token.ThrowIfCancellationRequested();
+
             var activeBreakers = await db.Set<MLConformalBreakerLog>()
                 .Where(b => b.Id == candidate.BreakerId && b.IsActive)
                 .ToListAsync(token);
@@ -279,13 +315,15 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                 .ThenByDescending(b => b.Id)
                 .First();
             ApplyDiagnostics(breaker, candidate.Evaluation, candidate.TargetCoverage, candidate.CoverageThreshold);
-            foreach (var duplicate in activeBreakers.Where(b => b.Id != breaker.Id))
-            {
-                duplicate.IsActive = false;
-            }
-            refreshedCount++;
 
-            _metrics.MLConformalBreakerRefreshes.Add(1,
+            foreach (var duplicate in activeBreakers.Where(b => b.Id != breaker.Id))
+                duplicate.IsActive = false;
+
+            await RefreshActiveAlertPayloadAsync(db, candidate, breaker.ResumeAt, token);
+
+            refreshedCount++;
+            _metrics.MLConformalBreakerRefreshes.Add(
+                1,
                 new("reason", candidate.Evaluation.TripReason.ToString()),
                 new("symbol", candidate.Symbol),
                 new("timeframe", candidate.Timeframe.ToString()));
@@ -308,22 +346,59 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         double coverageThreshold)
     {
         breaker.ConsecutivePoorCoverageBars = evaluation.ConsecutivePoorCoverageBars;
-        breaker.SampleCount                 = evaluation.SampleCount;
-        breaker.CoveredCount                = evaluation.CoveredCount;
-        breaker.FreshSampleCount            = evaluation.SampleCount;
-        breaker.EmpiricalCoverage           = evaluation.EmpiricalCoverage;
-        breaker.TargetCoverage              = targetCoverage;
-        breaker.CoverageThreshold           = coverageThreshold;
-        breaker.TripReason                  = evaluation.TripReason;
-        breaker.CoverageLowerBound          = evaluation.CoverageLowerBound;
-        breaker.CoverageUpperBound          = evaluation.CoverageUpperBound;
-        breaker.CoveragePValue              = evaluation.CoveragePValue;
-        breaker.LastEvaluatedOutcomeAt      = evaluation.LastEvaluatedOutcomeAt;
+        breaker.SampleCount = evaluation.SampleCount;
+        breaker.CoveredCount = evaluation.CoveredCount;
+        breaker.FreshSampleCount = evaluation.SampleCount;
+        breaker.EmpiricalCoverage = evaluation.EmpiricalCoverage;
+        breaker.TargetCoverage = targetCoverage;
+        breaker.CoverageThreshold = coverageThreshold;
+        breaker.TripReason = evaluation.TripReason;
+        breaker.CoverageLowerBound = evaluation.CoverageLowerBound;
+        breaker.CoverageUpperBound = evaluation.CoverageUpperBound;
+        breaker.CoveragePValue = evaluation.CoveragePValue;
+        breaker.LastEvaluatedOutcomeAt = evaluation.LastEvaluatedOutcomeAt;
     }
 
-    private static Alert BuildTripAlert(BreakerTripCandidate candidate, DateTime resumeAt)
+    private async Task<(Alert Alert, bool ShouldDispatch)> UpsertTripAlertAsync(
+        DbContext db,
+        BreakerTripCandidate candidate,
+        DateTime resumeAt,
+        DateTime nowUtc,
+        CancellationToken token)
     {
-        var payload = new MLConformalBreakerAlertPayload(
+        string deduplicationKey = BuildDeduplicationKey(candidate.MLModelId, candidate.Symbol, candidate.Timeframe);
+
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(a => !a.IsDeleted
+                                   && a.IsActive
+                                   && a.DeduplicationKey == deduplicationKey, token);
+
+        bool shouldDispatch = true;
+        if (alert is null)
+        {
+            alert = new Alert
+            {
+                AlertType = AlertType.MLModelDegraded,
+                DeduplicationKey = deduplicationKey,
+                IsActive = true
+            };
+            db.Set<Alert>().Add(alert);
+        }
+        else
+        {
+            alert.AlertType = AlertType.MLModelDegraded;
+            if (alert.LastTriggeredAt.HasValue &&
+                nowUtc - NormalizeUtc(alert.LastTriggeredAt.Value) < TimeSpan.FromSeconds(AlertCooldownSeconds))
+            {
+                shouldDispatch = false;
+            }
+        }
+
+        alert.Symbol = candidate.Symbol;
+        alert.Severity = AlertSeverity.High;
+        alert.CooldownSeconds = AlertCooldownSeconds;
+        alert.AutoResolvedAt = null;
+        alert.ConditionJson = JsonSerializer.Serialize(new MLConformalBreakerAlertPayload(
             candidate.MLModelId,
             candidate.Timeframe.ToString(),
             candidate.Evaluation.TripReason.ToString(),
@@ -333,16 +408,85 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
             candidate.Evaluation.CoverageUpperBound,
             candidate.Evaluation.CoveragePValue,
             candidate.Evaluation.LastEvaluatedOutcomeAt,
-            resumeAt);
+            resumeAt));
 
-        return new Alert
-        {
-            AlertType = AlertType.MLModelDegraded,
-            Symbol = candidate.Symbol,
-            Severity = AlertSeverity.High,
-            DeduplicationKey = $"MLConformalBreaker:{candidate.MLModelId}:{candidate.Symbol}:{candidate.Timeframe}",
-            CooldownSeconds = 3600,
-            ConditionJson = JsonSerializer.Serialize(payload)
-        };
+        return (alert, shouldDispatch);
     }
+
+    private async Task RefreshActiveAlertPayloadAsync(
+        DbContext db,
+        BreakerRefreshCandidate candidate,
+        DateTime resumeAt,
+        CancellationToken token)
+    {
+        string deduplicationKey = BuildDeduplicationKey(candidate.MLModelId, candidate.Symbol, candidate.Timeframe);
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(a => !a.IsDeleted
+                                   && a.IsActive
+                                   && a.DeduplicationKey == deduplicationKey, token);
+
+        if (alert is null)
+            return;
+
+        alert.Symbol = candidate.Symbol;
+        alert.Severity = AlertSeverity.High;
+        alert.CooldownSeconds = AlertCooldownSeconds;
+        alert.AutoResolvedAt = null;
+        alert.ConditionJson = JsonSerializer.Serialize(new MLConformalBreakerAlertPayload(
+            candidate.MLModelId,
+            candidate.Timeframe.ToString(),
+            candidate.Evaluation.TripReason.ToString(),
+            candidate.Evaluation.EmpiricalCoverage,
+            candidate.TargetCoverage,
+            candidate.Evaluation.CoverageLowerBound,
+            candidate.Evaluation.CoverageUpperBound,
+            candidate.Evaluation.CoveragePValue,
+            candidate.Evaluation.LastEvaluatedOutcomeAt,
+            resumeAt));
+    }
+
+    private async Task ResolveActiveAlertAsync(
+        DbContext db,
+        long modelId,
+        string symbol,
+        Timeframe timeframe,
+        DateTime nowUtc,
+        List<BreakerAlertDispatch> dispatches,
+        CancellationToken token)
+    {
+        string deduplicationKey = BuildDeduplicationKey(modelId, symbol, timeframe);
+        var activeAlerts = await db.Set<Alert>()
+            .Where(a => !a.IsDeleted
+                     && a.IsActive
+                     && a.DeduplicationKey == deduplicationKey)
+            .ToListAsync(token);
+
+        foreach (var alert in activeAlerts)
+        {
+            alert.IsActive = false;
+
+            if (alert.LastTriggeredAt.HasValue)
+            {
+                dispatches.Add(new BreakerAlertDispatch(
+                    alert,
+                    string.Empty,
+                    BreakerAlertDispatchKind.Resolve));
+            }
+            else
+            {
+                alert.AutoResolvedAt ??= nowUtc;
+            }
+        }
+    }
+
+    private static string BuildDeduplicationKey(long modelId, string symbol, Timeframe timeframe)
+        => $"MLConformalBreaker:{modelId}:{symbol}:{timeframe}";
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+        };
 }

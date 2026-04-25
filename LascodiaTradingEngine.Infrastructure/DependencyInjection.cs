@@ -72,8 +72,10 @@ public static class DependencyInjection
 
             services.AddScoped<IReadApplicationDbContext>(provider => provider.GetService<ReadApplicationDbContext>()!);
 
-            // Distributed lock via PostgreSQL advisory locks — no extra infrastructure needed.
-            services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
+            // Distributed lock backed by a typed lease row with TTL + background heartbeat.
+            // Replaces the previous session-scoped advisory-lock primitive, which had no
+            // auto-expiry on holder crash. See LeaseBasedDistributedLock for details.
+            services.AddSingleton<IDistributedLock, LeaseBasedDistributedLock>();
 
             // Provider-specific DbUpdateException classifier (unique-violation etc.) so
             // Application code can branch on duplicate keys without depending on Npgsql.

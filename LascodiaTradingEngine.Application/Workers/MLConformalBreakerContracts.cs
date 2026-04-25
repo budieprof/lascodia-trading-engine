@@ -113,7 +113,16 @@ public readonly record struct BreakerStateResult(
     int ActiveBreakers,
     IReadOnlyList<BreakerAlertDispatch> Alerts);
 
-public readonly record struct BreakerAlertDispatch(Alert Alert, string Message);
+public enum BreakerAlertDispatchKind
+{
+    Trip,
+    Resolve
+}
+
+public readonly record struct BreakerAlertDispatch(
+    Alert Alert,
+    string Message,
+    BreakerAlertDispatchKind Kind);
 
 public sealed record MLConformalBreakerAlertPayload(
     long ModelId,

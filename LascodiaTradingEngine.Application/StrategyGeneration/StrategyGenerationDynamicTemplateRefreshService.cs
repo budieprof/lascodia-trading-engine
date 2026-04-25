@@ -55,7 +55,8 @@ internal sealed class StrategyGenerationDynamicTemplateRefreshService : IStrateg
             var qualifiedIds = qualifiedStrategies.Select(s => s.Id).ToList();
             var approvedOptRuns = await db.Set<OptimizationRun>()
                 .Where(o => !o.IsDeleted
-                         && o.Status == OptimizationRunStatus.Completed
+                         && (o.Status == OptimizationRunStatus.Approved
+                          || o.Status == OptimizationRunStatus.Completed)
                          && o.ApprovedAt != null
                          && o.ApprovedAt >= promotedCutoff
                          && qualifiedIds.Contains(o.StrategyId))

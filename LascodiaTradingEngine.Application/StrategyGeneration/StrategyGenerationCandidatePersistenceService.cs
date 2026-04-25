@@ -590,7 +590,23 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
 
         candidate.Strategy.GenerationCandidateId ??= identity.CandidateId;
         candidate.Strategy.ValidationPriority = priority;
-        var metrics = (candidate.Metrics ?? BuildBaseMetrics(candidate)) with
+        var baseMetrics = candidate.Metrics ?? BuildBaseMetrics(candidate);
+        double qualityScore = baseMetrics.QualityScore > 0
+            ? baseMetrics.QualityScore
+            : ScreeningQualityScorer.ComputeScore(
+                candidate.TrainResult,
+                candidate.OosResult,
+                baseMetrics.EquityCurveR2,
+                baseMetrics.WalkForwardWindowsPassed,
+                null,
+                baseMetrics.MonteCarloPValue,
+                baseMetrics.ShufflePValue,
+                baseMetrics.MaxTradeTimeConcentration,
+                baseMetrics.MarginalSharpeContribution,
+                baseMetrics.KellySharpeRatio,
+                baseMetrics.FixedLotSharpeRatio);
+
+        var metrics = baseMetrics with
         {
             CycleId = candidate.Strategy.GenerationCycleId,
             CandidateId = candidate.Strategy.GenerationCandidateId,
@@ -598,6 +614,12 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
             SelectionScoreBreakdown = scoreBreakdown,
             ValidationPriority = priority,
             IsAutoPromoted = isElite,
+            QualityScore = qualityScore,
+            QualityScoreRaw = baseMetrics.QualityScoreRaw > 0 ? baseMetrics.QualityScoreRaw : qualityScore,
+            QualityCalibrationMultiplier = baseMetrics.QualityCalibrationMultiplier > 0
+                ? baseMetrics.QualityCalibrationMultiplier
+                : 1.0,
+            QualityBand = ScreeningQualityScorer.ComputeBand(qualityScore),
         };
 
         candidate.Strategy.ScreeningMetricsJson = metrics.ToJson();

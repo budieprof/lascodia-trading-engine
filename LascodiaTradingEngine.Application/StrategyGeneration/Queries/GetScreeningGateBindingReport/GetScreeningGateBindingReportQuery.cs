@@ -132,7 +132,7 @@ public class GetScreeningGateBindingReportQueryHandler
             .Set<Domain.Entities.StrategyGenerationFailure>()
             .AsNoTracking()
             .Where(f => !f.IsDeleted && f.CreatedAtUtc >= cutoff)
-            .Select(f => new { f.FailureReason, f.StrategyType })
+            .Select(f => new { f.FailureStage, f.FailureReason, f.StrategyType })
             .ToListAsync(cancellationToken);
 
         long total = rows.Count;
@@ -140,7 +140,7 @@ public class GetScreeningGateBindingReportQueryHandler
         // Group by reason (gate-level). Also track the top strategy type per
         // reason so operators can see which archetype is hit hardest.
         var byReason = rows
-            .GroupBy(r => r.FailureReason)
+            .GroupBy(r => ResolveStructuredReason(r.FailureStage, r.FailureReason))
             .Select(g =>
             {
                 var topType = g.GroupBy(x => x.StrategyType)
@@ -219,6 +219,11 @@ public class GetScreeningGateBindingReportQueryHandler
     private static bool IsInfrastructureReason(string reason) =>
         string.Equals(reason, nameof(ScreeningFailureReason.Timeout),   StringComparison.OrdinalIgnoreCase)
      || string.Equals(reason, nameof(ScreeningFailureReason.TaskFault), StringComparison.OrdinalIgnoreCase);
+
+    private static string ResolveStructuredReason(string failureStage, string failureReason)
+        => Enum.TryParse<ScreeningFailureReason>(failureStage, ignoreCase: true, out var _)
+            ? failureStage
+            : failureReason;
 
     /// <summary>
     /// Maps the binding reason to a short action hint. Keep these terse —

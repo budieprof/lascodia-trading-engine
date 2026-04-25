@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using MediatR;
 using Microsoft.Extensions.DependencyInjection;
@@ -115,7 +116,14 @@ public class ScreeningAuditLogger
         // past failures to fit a TPE surrogate and propose next-cycle params.
         // Strategy may be null on very early failures (before tempStrategy is built).
         var trainResult = result.TrainResult;
+        var oosResult = result.OosResult;
+        var metrics = result.Metrics;
         var hasMetrics  = trainResult is not null && result.Strategy is not null;
+        var hasOosMetrics = oosResult is not null && result.Strategy is not null;
+        double qualityScore = metrics?.QualityScore > 0
+            ? metrics.QualityScore
+            : ScreeningQualityScorer.ComputeScore(trainResult, oosResult);
+        bool isNearMiss = metrics?.IsNearMiss == true || ScreeningQualityScorer.IsNearMiss(result);
 
         var command = new LogDecisionCommand
         {
@@ -140,6 +148,18 @@ public class ScreeningAuditLogger
                 isSharpeRatio = hasMetrics ? (double?)trainResult!.SharpeRatio : null,
                 isMaxDrawdownPct = hasMetrics ? (double?)trainResult!.MaxDrawdownPct : null,
                 isTotalTrades = hasMetrics ? (int?)trainResult!.TotalTrades : null,
+                oosWinRate = hasOosMetrics ? (double?)oosResult!.WinRate : null,
+                oosProfitFactor = hasOosMetrics ? (double?)oosResult!.ProfitFactor : null,
+                oosSharpeRatio = hasOosMetrics ? (double?)oosResult!.SharpeRatio : null,
+                oosMaxDrawdownPct = hasOosMetrics ? (double?)oosResult!.MaxDrawdownPct : null,
+                oosTotalTrades = hasOosMetrics ? (int?)oosResult!.TotalTrades : null,
+                qualityScore,
+                qualityScoreRaw = metrics?.QualityScoreRaw,
+                qualityCalibrationMultiplier = metrics?.QualityCalibrationMultiplier,
+                qualityCalibrationSampleCount = metrics?.QualityCalibrationSampleCount,
+                qualityBand = ScreeningQualityScorer.ComputeBand(qualityScore),
+                isNearMiss,
+                gateTrace = metrics?.GateTrace,
             }, JsonOpts),
             Source       = "StrategyGenerationWorker"
         };
@@ -164,12 +184,16 @@ public class ScreeningAuditLogger
                 candidate.OosResult.SharpeRatio),
             ContextJson  = JsonSerializer.Serialize(new
             {
+                strategyType = candidate.Strategy.StrategyType.ToString(),
+                symbol = candidate.Strategy.Symbol,
+                timeframe = candidate.Strategy.Timeframe.ToString(),
                 regime = candidate.Regime.ToString(),
                 observedRegime = candidate.ObservedRegime.ToString(),
                 generationSource = candidate.GenerationSource,
                 reserveTargetRegime = string.Equals(candidate.GenerationSource, "Reserve", StringComparison.OrdinalIgnoreCase)
                     ? candidate.Regime.ToString()
                     : null,
+                paramsJson = candidate.Strategy.ParametersJson,
                 isWinRate = (double)candidate.TrainResult.WinRate,
                 isProfitFactor = (double)candidate.TrainResult.ProfitFactor,
                 isSharpeRatio = (double)candidate.TrainResult.SharpeRatio,
@@ -183,6 +207,12 @@ public class ScreeningAuditLogger
                 equityCurveR2 = candidate.Metrics?.EquityCurveR2,
                 monteCarloPValue = candidate.Metrics?.MonteCarloPValue,
                 walkForwardWindowsPassed = candidate.Metrics?.WalkForwardWindowsPassed,
+                qualityScore = candidate.Metrics?.QualityScore,
+                qualityScoreRaw = candidate.Metrics?.QualityScoreRaw,
+                qualityCalibrationMultiplier = candidate.Metrics?.QualityCalibrationMultiplier,
+                qualityCalibrationSampleCount = candidate.Metrics?.QualityCalibrationSampleCount,
+                qualityBand = candidate.Metrics?.QualityBand,
+                isNearMiss = false,
             }, JsonOpts),
             Source = "StrategyGenerationWorker"
         }, ct);

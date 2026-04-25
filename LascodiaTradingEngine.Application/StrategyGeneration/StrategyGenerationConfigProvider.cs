@@ -64,7 +64,8 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
         // snapshot rather than repeatedly re-querying individual keys.
         var allConfigs = await db.Set<EngineConfig>()
             .AsNoTracking()
-            .Where(c => c.Key.StartsWith("StrategyGeneration:"))
+            .Where(c => c.Key.StartsWith("StrategyGeneration:")
+                     || c.Key.StartsWith("ScreeningGate:"))
             .ToDictionaryAsync(c => c.Key, c => c.Value, StringComparer.OrdinalIgnoreCase, ct);
         var symbolOverrides = ExtractAllSymbolOverrides(allConfigs);
 
@@ -122,11 +123,14 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             RegimeBudgetDiversityPct = Get("StrategyGeneration:RegimeBudgetDiversityPct", 0.60),
             MinEquityCurveR2 = Get("StrategyGeneration:MinEquityCurveR2", 0.70),
             MaxTradeTimeConcentration = Get("StrategyGeneration:MaxTradeTimeConcentration", 0.60),
+            MaxCostToWinRatio = Get("StrategyGeneration:MaxCostToWinRatio", 0.35),
             CircuitBreakerMaxFailures = Get("StrategyGeneration:CircuitBreakerMaxFailures", 3),
             CircuitBreakerBackoffDays = Get("StrategyGeneration:CircuitBreakerBackoffDays", 2),
             MaxFaultsPerStrategyType = Get("StrategyGeneration:MaxFaultsPerStrategyType", 3),
             MaxCandleCacheSize = Get("StrategyGeneration:MaxCandleCacheSize", 500_000),
             CandleChunkSize = Get("StrategyGeneration:CandleChunkSize", 5),
+            DataHealthMinCandles = Get("StrategyGeneration:DataHealthMinCandles", 100),
+            MinDataHealthScore = Get("StrategyGeneration:MinDataHealthScore", 0.50),
             MaxCorrelatedCandidates = Get("StrategyGeneration:MaxCorrelatedCandidates", 4),
             AdaptiveThresholdsEnabled = Get("StrategyGeneration:AdaptiveThresholdsEnabled", true),
             AdaptiveThresholdsMinSamples = Get("StrategyGeneration:AdaptiveThresholdsMinSamples", 10),
@@ -142,6 +146,8 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             PortfolioBacktestEnabled = Get("StrategyGeneration:PortfolioBacktestEnabled", true),
             MaxPortfolioDrawdownPct = Get("StrategyGeneration:MaxPortfolioDrawdownPct", 0.30),
             PortfolioCorrelationWeight = Get("StrategyGeneration:PortfolioCorrelationWeight", 0.05),
+            MaxPortfolioSymbolWeightPct = Get("StrategyGeneration:MaxPortfolioSymbolWeightPct", 0.35),
+            MaxPortfolioCurrencyExposurePct = Get("StrategyGeneration:MaxPortfolioCurrencyExposurePct", 0.80),
             MaxCandleAgeHours = Get("StrategyGeneration:MaxCandleAgeHours", 72),
             SkipWeekends = Get("StrategyGeneration:SkipWeekends", true),
             BlackoutTimezone = Get("StrategyGeneration:BlackoutTimezone", "UTC"),
@@ -150,6 +156,10 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             WalkForwardMinWindowsPass = Get("StrategyGeneration:WalkForwardMinWindowsPass", 2),
             WalkForwardSplitPcts = Get("StrategyGeneration:WalkForwardSplitPcts", "0.40,0.55,0.70"),
             WalkForwardSplitPercentages = ParseWalkForwardSplitPcts(Get("StrategyGeneration:WalkForwardSplitPcts", "0.40,0.55,0.70")),
+            WalkForwardEmbargoPct = Get("StrategyGeneration:WalkForwardEmbargoPct", 0.02),
+            LookaheadAuditEnabled = Get("StrategyGeneration:LookaheadAuditEnabled", true),
+            LookaheadAuditMaxTradeCountDelta = Get("StrategyGeneration:LookaheadAuditMaxTradeCountDelta", 0.50),
+            LookaheadAuditMaxPnlDelta = Get("StrategyGeneration:LookaheadAuditMaxPnlDelta", 0.50),
             OosPfRelaxation = Get("ScreeningGate:OosPfRelaxation", 0.9),
             OosDdRelaxation = Get("ScreeningGate:OosDdRelaxation", 1.1),
             OosSharpeRelaxation = Get("ScreeningGate:OosSharpeRelaxation", 0.8),
@@ -269,6 +279,20 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
                 "StrategyGenerationConfigProvider: MaxCandidatesPerCycle ({Max}) < StrategicReserveQuota ({Reserve})",
                 config.MaxCandidates,
                 config.StrategicReserveQuota);
+        if (config.MinDataHealthScore is < 0 or > 1.0)
+            _logger.LogWarning("StrategyGenerationConfigProvider: MinDataHealthScore={Value} is outside valid range [0, 1]", config.MinDataHealthScore);
+        if (config.MaxCostToWinRatio <= 0)
+            _logger.LogWarning("StrategyGenerationConfigProvider: MaxCostToWinRatio={Value} must be positive", config.MaxCostToWinRatio);
+        if (config.MaxPortfolioSymbolWeightPct is <= 0 or > 1.0)
+            _logger.LogWarning("StrategyGenerationConfigProvider: MaxPortfolioSymbolWeightPct={Value} is outside valid range (0, 1]", config.MaxPortfolioSymbolWeightPct);
+        if (config.MaxPortfolioCurrencyExposurePct is <= 0 or > 1.0)
+            _logger.LogWarning("StrategyGenerationConfigProvider: MaxPortfolioCurrencyExposurePct={Value} is outside valid range (0, 1]", config.MaxPortfolioCurrencyExposurePct);
+        if (config.WalkForwardEmbargoPct is < 0 or > 0.25)
+            _logger.LogWarning("StrategyGenerationConfigProvider: WalkForwardEmbargoPct={Value} is outside valid range [0, 0.25]", config.WalkForwardEmbargoPct);
+        if (config.LookaheadAuditMaxTradeCountDelta is < 0 or > 1.0)
+            _logger.LogWarning("StrategyGenerationConfigProvider: LookaheadAuditMaxTradeCountDelta={Value} is outside valid range [0, 1]", config.LookaheadAuditMaxTradeCountDelta);
+        if (config.LookaheadAuditMaxPnlDelta is < 0 or > 1.0)
+            _logger.LogWarning("StrategyGenerationConfigProvider: LookaheadAuditMaxPnlDelta={Value} is outside valid range [0, 1]", config.LookaheadAuditMaxPnlDelta);
     }
 
     private GenerationConfig NormalizeConfiguration(GenerationConfig config) => config with
@@ -303,20 +327,28 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
         MaxCandleCacheSize = Math.Max(10_000, config.MaxCandleCacheSize),
         CandleChunkSize = Math.Max(1, config.CandleChunkSize),
         MaxCandleAgeHours = Math.Max(0, config.MaxCandleAgeHours),
+        DataHealthMinCandles = Math.Max(20, config.DataHealthMinCandles),
+        MinDataHealthScore = Math.Clamp(config.MinDataHealthScore, 0.0, 1.0),
         MinEquityCurveR2 = Math.Clamp(config.MinEquityCurveR2, 0.0, 1.0),
         MaxTradeTimeConcentration = Math.Clamp(config.MaxTradeTimeConcentration, 0.0, 1.0),
+        MaxCostToWinRatio = Math.Clamp(config.MaxCostToWinRatio, 0.01, 2.0),
         WalkForwardWindowCount = Math.Max(2, config.WalkForwardWindowCount),
         WalkForwardMinWindowsPass = Math.Max(1, config.WalkForwardMinWindowsPass),
         WalkForwardSplitPcts = ParseWalkForwardSplitPcts(config.WalkForwardSplitPcts).Count >= 2 ? config.WalkForwardSplitPcts : "0.40,0.55,0.70",
         WalkForwardSplitPercentages = ParseWalkForwardSplitPcts(config.WalkForwardSplitPcts).Count >= 2
             ? ParseWalkForwardSplitPcts(config.WalkForwardSplitPcts)
             : [0.40, 0.55, 0.70],
+        WalkForwardEmbargoPct = Math.Clamp(config.WalkForwardEmbargoPct, 0.0, 0.25),
+        LookaheadAuditMaxTradeCountDelta = Math.Clamp(config.LookaheadAuditMaxTradeCountDelta, 0.0, 1.0),
+        LookaheadAuditMaxPnlDelta = Math.Clamp(config.LookaheadAuditMaxPnlDelta, 0.0, 1.0),
         MonteCarloPermutations = Math.Max(1, config.MonteCarloPermutations),
         MonteCarloMinPValue = Math.Clamp(config.MonteCarloMinPValue, 0.0, 1.0),
         MonteCarloShufflePermutations = Math.Max(0, config.MonteCarloShufflePermutations),
         MonteCarloShuffleMinPValue = Math.Clamp(config.MonteCarloShuffleMinPValue, 0.0, 1.0),
         MaxPortfolioDrawdownPct = Math.Clamp(config.MaxPortfolioDrawdownPct, 0.0, 1.0),
         PortfolioCorrelationWeight = Math.Clamp(config.PortfolioCorrelationWeight, 0.0, 1.0),
+        MaxPortfolioSymbolWeightPct = Math.Clamp(config.MaxPortfolioSymbolWeightPct, 0.05, 1.0),
+        MaxPortfolioCurrencyExposurePct = Math.Clamp(config.MaxPortfolioCurrencyExposurePct, 0.10, 1.0),
         StrategicReserveQuota = Math.Max(0, config.StrategicReserveQuota),
         MaxCandidatesPerWeek = Math.Max(1, config.MaxCandidatesPerWeek),
         AdaptiveThresholdsMinSamples = Math.Max(1, config.AdaptiveThresholdsMinSamples),
@@ -329,7 +361,7 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
         RegimeDegradationRelaxation = Math.Clamp(config.RegimeDegradationRelaxation, 1.0, 5.0),
         KellyFactor = Math.Clamp(config.KellyFactor, 0.1m, 1.0m),
         KellyMinLot = Math.Clamp(config.KellyMinLot, 0.001m, 1.0m),
-        KellyMaxLot = Math.Clamp(config.KellyMaxLot, config.KellyMinLot, 1.0m),
+        KellyMaxLot = Math.Clamp(config.KellyMaxLot, Math.Clamp(config.KellyMinLot, 0.001m, 1.0m), 1.0m),
     };
 
     private IReadOnlyDictionary<string, StrategyGenerationSymbolOverrides> ExtractAllSymbolOverrides(

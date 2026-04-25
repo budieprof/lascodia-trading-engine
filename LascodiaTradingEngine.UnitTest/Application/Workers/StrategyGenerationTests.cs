@@ -1,9 +1,12 @@
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.StrategyGeneration;
+using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Text.Json;
 using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenerationHelpers;
 using Xunit;
 
@@ -280,6 +283,202 @@ public class StrategyGenerationTests
             candidates, 0.001, 10_000m); // Very tight DD limit to force removal
 
         Assert.Equal(originalCount, candidates.Count); // Input not mutated
+    }
+
+    [Fact]
+    public void PortfolioExposureFilter_EnforcesSymbolAndCurrencyCapacity()
+    {
+        var eurusdLow = CreateDummyOutcome("EURUSD", 10m) with
+        {
+            Metrics = new ScreeningMetrics { QualityScore = 70, SelectionScore = 70 },
+        };
+        var eurusdHigh = CreateDummyOutcome("EURUSD", 12m) with
+        {
+            Metrics = new ScreeningMetrics { QualityScore = 92, SelectionScore = 92 },
+        };
+        var gbpusd = CreateDummyOutcome("GBPUSD", 11m) with
+        {
+            Metrics = new ScreeningMetrics { QualityScore = 88, SelectionScore = 88 },
+        };
+
+        var pairs = new Dictionary<string, CurrencyPair>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["EURUSD"] = new() { Symbol = "EURUSD", BaseCurrency = "EUR", QuoteCurrency = "USD" },
+            ["GBPUSD"] = new() { Symbol = "GBPUSD", BaseCurrency = "GBP", QuoteCurrency = "USD" },
+        };
+        var activeBySymbol = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["EURUSD"] = 2,
+        };
+
+        var (survivors, removed) = StrategyScreeningEngine.RunPortfolioExposureFilter(
+            [eurusdLow, eurusdHigh, gbpusd],
+            pairs,
+            activeBySymbol,
+            maxActivePerSymbol: 3,
+            maxSymbolWeightPct: 1.0,
+            maxCurrencyExposurePct: 1.0);
+
+        Assert.Equal(2, survivors.Count);
+        Assert.Equal(1, removed);
+        Assert.Contains(eurusdHigh, survivors);
+        Assert.DoesNotContain(eurusdLow, survivors);
+        Assert.Contains(gbpusd, survivors);
+    }
+
+    [Fact]
+    public async Task ScreeningSurrogate_Warmup_UsesCreatedMixedParameterObservations()
+    {
+        var options = new DbContextOptionsBuilder<SurrogateTestDbContext>()
+            .UseInMemoryDatabase($"surrogate-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SurrogateTestDbContext(options);
+
+        for (int i = 0; i < 6; i++)
+        {
+            string parametersJson = JsonSerializer.Serialize(new
+            {
+                CorrelatedSymbol = "GBPUSD",
+                LookbackPeriod = 60 + i * 5,
+                ZScoreEntry = 2.0 + i * 0.05,
+                ZScoreExit = 0.4,
+                StopLossAtrMultiplier = 2.0,
+                TakeProfitAtrMultiplier = 3.0,
+                AtrPeriod = 14,
+            });
+            db.Set<DecisionLog>().Add(new DecisionLog
+            {
+                EntityType = "Strategy",
+                EntityId = i + 1,
+                DecisionType = "StrategyGeneration",
+                Outcome = i == 0 ? "Created" : "ScreeningFailed",
+                Reason = "synthetic",
+                Source = "StrategyGenerationWorker",
+                CreatedAt = DateTime.UtcNow.AddMinutes(-i),
+                ContextJson = JsonSerializer.Serialize(new
+                {
+                    strategyType = StrategyType.StatisticalArbitrage.ToString(),
+                    symbol = "EURUSD",
+                    timeframe = Timeframe.H4.ToString(),
+                    regime = MarketRegime.Ranging.ToString(),
+                    paramsJson = parametersJson,
+                    qualityScore = 80 + i,
+                    isNearMiss = i > 0,
+                }),
+            });
+        }
+
+        await db.SaveChangesAsync();
+
+        var service = new ScreeningSurrogateService(NullLogger<ScreeningSurrogateService>.Instance);
+        await service.WarmupAsync(db, CancellationToken.None);
+
+        var proposals = service.GetProposals(
+            StrategyType.StatisticalArbitrage,
+            "EURUSD",
+            Timeframe.H4,
+            MarketRegime.Ranging,
+            count: 3);
+
+        Assert.NotEmpty(proposals);
+        using var proposalDoc = JsonDocument.Parse(proposals[0]);
+        Assert.Equal("GBPUSD", proposalDoc.RootElement.GetProperty("CorrelatedSymbol").GetString());
+        Assert.True(proposalDoc.RootElement.TryGetProperty("LookbackPeriod", out var lookback));
+        Assert.Equal(JsonValueKind.Number, lookback.ValueKind);
+    }
+
+    [Fact]
+    public async Task DynamicTemplateRefresh_IncludesApprovedOptimizationRuns()
+    {
+        var now = new DateTimeOffset(2026, 4, 25, 12, 0, 0, TimeSpan.Zero);
+        var options = new DbContextOptionsBuilder<SurrogateTestDbContext>()
+            .UseInMemoryDatabase($"dynamic-template-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SurrogateTestDbContext(options);
+
+        const string approvedParams = """{"FastPeriod":37,"SlowPeriod":89}""";
+        const string unapprovedParams = """{"FastPeriod":41,"SlowPeriod":144}""";
+
+        db.Set<Strategy>().AddRange(
+            new Strategy
+            {
+                Id = 101,
+                Name = "Auto-EURUSD-approved",
+                StrategyType = StrategyType.MovingAverageCrossover,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = approvedParams,
+                LifecycleStage = StrategyLifecycleStage.BacktestQualified,
+            },
+            new Strategy
+            {
+                Id = 102,
+                Name = "Auto-EURUSD-completed-only",
+                StrategyType = StrategyType.MovingAverageCrossover,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = unapprovedParams,
+                LifecycleStage = StrategyLifecycleStage.BacktestQualified,
+            });
+
+        db.Set<OptimizationRun>().AddRange(
+            new OptimizationRun
+            {
+                Id = 201,
+                StrategyId = 101,
+                Status = OptimizationRunStatus.Approved,
+                ApprovedAt = now.UtcDateTime.AddDays(-1),
+            },
+            new OptimizationRun
+            {
+                Id = 202,
+                StrategyId = 102,
+                Status = OptimizationRunStatus.Completed,
+                ApprovedAt = null,
+            });
+        await db.SaveChangesAsync();
+
+        var provider = new StrategyParameterTemplateProvider();
+        var service = new StrategyGenerationDynamicTemplateRefreshService(
+            NullLogger<StrategyGenerationWorker>.Instance,
+            provider,
+            new FixedTimeProvider(now));
+
+        await service.RefreshDynamicTemplatesAsync(db, CancellationToken.None);
+
+        var templates = provider.GetTemplates(StrategyType.MovingAverageCrossover);
+        Assert.Contains(NormalizeTemplateParameters(approvedParams), templates);
+        Assert.DoesNotContain(NormalizeTemplateParameters(unapprovedParams), templates);
+    }
+
+    [Fact]
+    public async Task StrategyGenerationConfigProvider_LoadsScreeningGateAndAuditSettings()
+    {
+        var options = new DbContextOptionsBuilder<SurrogateTestDbContext>()
+            .UseInMemoryDatabase($"generation-config-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SurrogateTestDbContext(options);
+
+        db.Set<EngineConfig>().AddRange(
+            new EngineConfig { Key = "StrategyGeneration:WalkForwardEmbargoPct", Value = "0.07" },
+            new EngineConfig { Key = "StrategyGeneration:LookaheadAuditEnabled", Value = "false" },
+            new EngineConfig { Key = "StrategyGeneration:LookaheadAuditMaxTradeCountDelta", Value = "0.25" },
+            new EngineConfig { Key = "StrategyGeneration:LookaheadAuditMaxPnlDelta", Value = "0.35" },
+            new EngineConfig { Key = "ScreeningGate:OosPfRelaxation", Value = "0.77" },
+            new EngineConfig { Key = "ScreeningGate:KellyMaxLot", Value = "0.20" });
+        await db.SaveChangesAsync();
+
+        var provider = new StrategyGenerationConfigProvider(
+            NullLogger<StrategyGenerationConfigProvider>.Instance);
+
+        var snapshot = await provider.LoadAsync(db, CancellationToken.None);
+
+        Assert.Equal(0.07, snapshot.Config.WalkForwardEmbargoPct);
+        Assert.False(snapshot.Config.LookaheadAuditEnabled);
+        Assert.Equal(0.25, snapshot.Config.LookaheadAuditMaxTradeCountDelta);
+        Assert.Equal(0.35, snapshot.Config.LookaheadAuditMaxPnlDelta);
+        Assert.Equal(0.77, snapshot.Config.OosPfRelaxation);
+        Assert.Equal(0.20m, snapshot.Config.KellyMaxLot);
     }
 
     // ── Asset classification (#24) ─────────────────────────────────────────
@@ -664,6 +863,36 @@ public class StrategyGenerationTests
         Assert.NotNull(result);
     }
 
+    [Fact]
+    public void ScreeningQualityScore_IgnoresUnevaluatedStatisticalGateSentinels()
+    {
+        var train = BuildPassingBacktestResult();
+        var oos = BuildPassingBacktestResult();
+
+        double baseline = ScreeningQualityScorer.ComputeScore(train, oos, monteCarloPValue: null, shufflePValue: null);
+        double sentinelScore = ScreeningQualityScorer.ComputeScore(train, oos, monteCarloPValue: -1.0, shufflePValue: -1.0);
+        double evaluatedScore = ScreeningQualityScorer.ComputeScore(train, oos, monteCarloPValue: 0.0, shufflePValue: 0.0);
+
+        Assert.Equal(baseline, sentinelScore);
+        Assert.True(evaluatedScore > baseline);
+    }
+
+    [Fact]
+    public void ScreeningQualityScore_RewardsEvaluatedWalkForwardPasses()
+    {
+        var train = BuildPassingBacktestResult();
+        var oos = BuildPassingBacktestResult();
+
+        double withoutWalkForward = ScreeningQualityScorer.ComputeScore(train, oos);
+        double withWalkForward = ScreeningQualityScorer.ComputeScore(
+            train,
+            oos,
+            walkForwardPassed: 3,
+            walkForwardRequired: 3);
+
+        Assert.True(withWalkForward > withoutWalkForward);
+    }
+
     // ── Confidence scaling (#1) ───────────────────────────────────────────
 
     [Theory]
@@ -838,6 +1067,49 @@ public class StrategyGenerationTests
             InitialBalance = 10_000m,
             FinalBalance = 11_200m,
         };
+    }
+
+    private sealed class SurrogateTestDbContext : DbContext
+    {
+        public SurrogateTestDbContext(DbContextOptions<SurrogateTestDbContext> options) : base(options)
+        {
+        }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<DecisionLog>().HasKey(d => d.Id);
+            modelBuilder.Entity<EngineConfig>().HasKey(e => e.Id);
+            modelBuilder.Entity<OptimizationRun>(entity =>
+            {
+                entity.HasKey(o => o.Id);
+                entity.Ignore(o => o.Strategy);
+            });
+            modelBuilder.Entity<Strategy>(entity =>
+            {
+                entity.HasKey(s => s.Id);
+                entity.Ignore(s => s.RiskProfile);
+                entity.Ignore(s => s.TradeSignals);
+                entity.Ignore(s => s.Orders);
+                entity.Ignore(s => s.BacktestRuns);
+                entity.Ignore(s => s.OptimizationRuns);
+                entity.Ignore(s => s.WalkForwardRuns);
+                entity.Ignore(s => s.Allocations);
+                entity.Ignore(s => s.PerformanceSnapshots);
+                entity.Ignore(s => s.ExecutionQualityLogs);
+            });
+        }
+    }
+
+    private sealed class FixedTimeProvider : TimeProvider
+    {
+        private readonly DateTimeOffset _utcNow;
+
+        public FixedTimeProvider(DateTimeOffset utcNow)
+        {
+            _utcNow = utcNow;
+        }
+
+        public override DateTimeOffset GetUtcNow() => _utcNow;
     }
 
     private sealed class SequencedBacktestEngine : IBacktestEngine

@@ -911,6 +911,44 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.ToTable("DecisionLog");
                 });
 
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.DistributedLockLease", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime>("AcquiredAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("ExpiresAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Key")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("OwnerId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ExpiresAtUtc");
+
+                    b.HasIndex("Key")
+                        .IsUnique();
+
+                    b.ToTable("DistributedLockLease");
+                });
+
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.DrawdownSnapshot", b =>
                 {
                     b.Property<long>("Id")
@@ -1487,6 +1525,105 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.ToTable("LivePrice");
                 });
 
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLAdaptiveThresholdLog", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("DiagnosticsJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<double>("Drift")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTime>("EvaluatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<double>("HoldoutEvAtNewThreshold")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("HoldoutEvAtPreviousThreshold")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("HoldoutMeanPnlPips")
+                        .HasPrecision(14, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("HoldoutSampleSize")
+                        .HasColumnType("integer");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<long>("MLModelId")
+                        .HasColumnType("bigint");
+
+                    b.Property<double>("NewThreshold")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTime?>("NewestOutcomeAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<double>("OptimalThreshold")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Outcome")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<double>("PreviousThreshold")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int?>("Regime")
+                        .HasColumnType("integer");
+
+                    b.Property<double>("StationarityPsi")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("SweepSampleSize")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Symbol")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<int>("Timeframe")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("MLModelId", "EvaluatedAt");
+
+                    b.HasIndex("MLModelId", "NewestOutcomeAt");
+
+                    b.HasIndex("Outcome", "Reason", "EvaluatedAt");
+
+                    b.HasIndex("Symbol", "Timeframe", "Regime", "EvaluatedAt");
+
+                    b.ToTable("MLAdaptiveThresholdLog");
+                });
+
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLAdwinDriftLog", b =>
                 {
                     b.Property<long>("Id")
@@ -1495,8 +1632,20 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<double>("AccuracyDrop")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("DeltaUsed")
+                        .HasPrecision(10, 8)
+                        .HasColumnType("double precision");
+
                     b.Property<DateTime>("DetectedAt")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("DominantRegime")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<bool>("DriftDetected")
                         .HasColumnType("boolean");
@@ -1513,6 +1662,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
+
+                    b.Property<byte[]>("OutcomeSeriesCompressed")
+                        .HasColumnType("bytea");
 
                     b.Property<string>("Symbol")
                         .IsRequired()
@@ -1538,9 +1690,121 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("DetectedAt");
+
                     b.HasIndex("MLModelId", "DetectedAt");
 
                     b.ToTable("MLAdwinDriftLog");
+                });
+
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLCalibrationLog", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<double>("Accuracy")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("AlertState")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<double>("BaselineDelta")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("BaselineEce")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<bool>("BaselineExceeded")
+                        .HasColumnType("boolean");
+
+                    b.Property<double>("CurrentEce")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("DiagnosticsJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<double>("EceStderr")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTime>("EvaluatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<long>("MLModelId")
+                        .HasColumnType("bigint");
+
+                    b.Property<double>("MeanConfidence")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTime?>("NewestOutcomeAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Outcome")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<double?>("PreviousEce")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int?>("Regime")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("ResolvedSampleCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Symbol")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<bool>("ThresholdExceeded")
+                        .HasColumnType("boolean");
+
+                    b.Property<int>("Timeframe")
+                        .HasColumnType("integer");
+
+                    b.Property<double>("TrendDelta")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<bool>("TrendExceeded")
+                        .HasColumnType("boolean");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AlertState", "EvaluatedAt");
+
+                    b.HasIndex("MLModelId", "EvaluatedAt");
+
+                    b.HasIndex("MLModelId", "NewestOutcomeAt");
+
+                    b.HasIndex("Symbol", "Timeframe", "Regime", "EvaluatedAt");
+
+                    b.ToTable("MLCalibrationLog");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLCausalFeatureAudit", b =>
@@ -1963,6 +2227,57 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasIndex("Symbol", "Timeframe", "Regime", "EncoderType", "EvaluatedAt");
 
                     b.ToTable("MLCpcEncoderTrainingLog");
+                });
+
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLDriftFlag", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("ConsecutiveDetections")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("DetectorType")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)");
+
+                    b.Property<DateTime>("ExpiresAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("FirstDetectedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<DateTime>("LastRefreshedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Symbol")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<string>("Timeframe")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DetectorType", "ExpiresAtUtc");
+
+                    b.HasIndex("Symbol", "Timeframe", "DetectorType")
+                        .IsUnique();
+
+                    b.ToTable("MLDriftFlag");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLErgodicityLog", b =>
@@ -3964,6 +4279,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("MLModelId");
+
+                    b.HasIndex("Symbol", "Timeframe")
+                        .IsUnique()
+                        .HasDatabaseName("UX_MLTrainingRun_Active_Per_Pair")
+                        .HasFilter("\"Status\" IN ('Queued','Running') AND \"IsDeleted\" = false");
 
                     b.HasIndex("Symbol", "Timeframe", "Status");
 

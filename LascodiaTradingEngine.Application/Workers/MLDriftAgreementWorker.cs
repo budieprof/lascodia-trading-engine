@@ -1,269 +1,662 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Services.Alerts;
+using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using LascodiaTradingEngine.Application.Common.Interfaces;
-using LascodiaTradingEngine.Domain.Entities;
-using LascodiaTradingEngine.Domain.Enums;
-using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Tracks cross-detector agreement for ML drift detection. Counts how many independent
-/// drift detectors are simultaneously signalling drift for each active model's symbol/timeframe
-/// and creates alerts when a consensus threshold is reached.
-///
-/// <para>
-/// Detectors monitored:
-/// <list type="number">
-///   <item><see cref="MLDriftMonitorWorker"/> — consecutive failure counter > 0</item>
-///   <item><see cref="MLAdwinDriftWorker"/> — ADWIN drift flag with future expiry</item>
-///   <item><see cref="MLCusumDriftWorker"/> — recent CUSUM alert</item>
-///   <item><see cref="MLCovariateShiftWorker"/> — recent covariate shift training run</item>
-///   <item><see cref="MLMultiScaleDriftWorker"/> — recent multi-scale drift training run</item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Alert rules:</b>
-/// <list type="bullet">
-///   <item>If >= 4 detectors agree: CRITICAL alert "Multi-detector drift consensus"</item>
-///   <item>If 0 detectors agree but model is suppressed: WARNING "Model suppressed but no detectors firing"</item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Polling interval:</b> configurable via <c>MLDriftAgreement:PollIntervalSeconds</c> (default 21600 s / 6 hours).
-/// </para>
+/// drift detectors are simultaneously signalling drift for each active model's
+/// (Symbol, Timeframe), and dispatches alerts when the consensus threshold is reached
+/// or when the model is suppressed without any detector agreement.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Detectors monitored: <see cref="MLDriftMonitorWorker"/> (consecutive failure counter),
+/// <see cref="MLAdwinDriftWorker"/> (typed <see cref="MLDriftFlag"/> with future expiry),
+/// <see cref="MLCusumDriftWorker"/> (recent CUSUM alert), <see cref="MLCovariateShiftWorker"/>
+/// (recent covariate-shift training run), and <see cref="MLMultiScaleDriftWorker"/>
+/// (recent multi-scale training run).
+/// </para>
+/// <para>
+/// Alerts go through <see cref="IAlertDispatcher"/> with a per-pair dedupe key so the
+/// same consensus produces one notification per cooldown window rather than one per
+/// cycle. The earlier behaviour of writing <see cref="Alert"/> rows directly is preserved
+/// when the dispatcher is unavailable.
+/// </para>
+/// </remarks>
 public sealed class MLDriftAgreementWorker : BackgroundService
 {
-    private const string CK_PollSecs     = "MLDriftAgreement:PollIntervalSeconds";
-    private const string CK_AlertDest    = "MLDriftAgreement:AlertDestination";
-    private const string CK_CusumWindowH = "MLDriftAgreement:CusumAlertWindowHours";
-    private const string CK_ShiftWindowH = "MLDriftAgreement:ShiftRunWindowHours";
+    internal const string WorkerName = nameof(MLDriftAgreementWorker);
 
-    private readonly IServiceScopeFactory             _scopeFactory;
-    private readonly ILogger<MLDriftAgreementWorker>   _logger;
+    private const string DistributedLockKey = "workers:ml-drift-agreement:cycle";
+
+    private const string CK_Enabled         = "MLDriftAgreement:Enabled";
+    private const string CK_PollSecs        = "MLDriftAgreement:PollIntervalSeconds";
+    private const string CK_CusumWindowH    = "MLDriftAgreement:CusumAlertWindowHours";
+    private const string CK_ShiftWindowH    = "MLDriftAgreement:ShiftRunWindowHours";
+    private const string CK_ConsensusThresh = "MLDriftAgreement:ConsensusThreshold";
+    private const string CK_LockTimeoutSecs = "MLDriftAgreement:LockTimeoutSeconds";
+    private const string CK_DbCommandTimeoutSecs = "MLDriftAgreement:DbCommandTimeoutSeconds";
+
+    private const int DefaultPollSeconds = 21600; // 6 hours
+    private const int MinPollSeconds = 60;
+    private const int MaxPollSeconds = 24 * 60 * 60;
+
+    private const int DefaultCusumWindowHours = 24;
+    private const int MinCusumWindowHours = 1;
+    private const int MaxCusumWindowHours = 24 * 30;
+
+    private const int DefaultShiftWindowHours = 48;
+    private const int MinShiftWindowHours = 1;
+    private const int MaxShiftWindowHours = 24 * 30;
+
+    private const int DefaultConsensusThreshold = 4;
+    private const int MinConsensusThreshold = 2;
+    private const int MaxConsensusThreshold = 5;
+
+    private const int DefaultLockTimeoutSeconds = 5;
+    private const int MinLockTimeoutSeconds = 0;
+    private const int MaxLockTimeoutSeconds = 300;
+
+    private const int DefaultDbCommandTimeoutSeconds = 60;
+    private const int MinDbCommandTimeoutSeconds = 5;
+    private const int MaxDbCommandTimeoutSeconds = 600;
+
+    private static readonly TimeSpan WakeInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
+
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<MLDriftAgreementWorker> _logger;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IAlertDispatcher? _alertDispatcher;
+
+    private long _consecutiveFailuresField;
+    private int _missingDistributedLockWarningEmitted;
 
     public MLDriftAgreementWorker(
-        IServiceScopeFactory              scopeFactory,
-        ILogger<MLDriftAgreementWorker>   logger)
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLDriftAgreementWorker> logger,
+        IDistributedLock? distributedLock = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IAlertDispatcher? alertDispatcher = null)
     {
         _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _logger = logger;
+        _distributedLock = distributedLock;
+        _healthMonitor = healthMonitor;
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _alertDispatcher = alertDispatcher;
+    }
+
+    private int ConsecutiveFailures
+    {
+        get => (int)Interlocked.Read(ref _consecutiveFailuresField);
+        set => Interlocked.Exchange(ref _consecutiveFailuresField, value);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLDriftAgreementWorker started.");
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Tracks cross-detector drift agreement and alerts on consensus or unexplained suppression.",
+            TimeSpan.FromSeconds(DefaultPollSeconds));
 
-        while (!stoppingToken.IsCancellationRequested)
+        DateTime lastCycleStartUtc = DateTime.MinValue;
+        DateTime lastSuccessUtc = DateTime.MinValue;
+        TimeSpan currentPollInterval = TimeSpan.FromSeconds(DefaultPollSeconds);
+
+        try
         {
-            int pollSecs = 21600; // default 6 hours
-
             try
             {
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readDb   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx      = readDb.GetDbContext();
-                var writeCtx = writeDb.GetDbContext();
-
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 21600, stoppingToken);
-                string alertDest = await GetConfigAsync<string>(ctx, CK_AlertDest, "ml-ops", stoppingToken);
-                int cusumWindowH = await GetConfigAsync<int>(ctx, CK_CusumWindowH, 24, stoppingToken);
-                int shiftWindowH = await GetConfigAsync<int>(ctx, CK_ShiftWindowH, 48, stoppingToken);
-                int alertCooldown = await GetConfigAsync<int>(ctx, AlertCooldownDefaults.CK_MLDrift, AlertCooldownDefaults.Default_MLDrift, stoppingToken);
-
-                var activeModels = await ctx.Set<MLModel>()
-                    .Where(m => m.IsActive && !m.IsDeleted)
-                    .AsNoTracking()
-                    .ToListAsync(stoppingToken);
-
-                foreach (var model in activeModels)
-                {
-                    stoppingToken.ThrowIfCancellationRequested();
-                    await CheckAgreementAsync(
-                        model, ctx, writeCtx, alertDest,
-                        cusumWindowH, shiftWindowH, alertCooldown, stoppingToken);
-                }
+                var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName);
+                if (initialDelay > TimeSpan.Zero)
+                    await Task.Delay(initialDelay, _timeProvider, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                break;
+                return;
+            }
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+                if (lastSuccessUtc != DateTime.MinValue)
+                {
+                    _metrics?.MLDriftAgreementTimeSinceLastSuccessSec.Record(
+                        (nowUtc - lastSuccessUtc).TotalSeconds);
+                }
+
+                bool dueForCycle = nowUtc - lastCycleStartUtc >= currentPollInterval;
+
+                if (dueForCycle)
+                {
+                    long cycleStarted = Stopwatch.GetTimestamp();
+                    lastCycleStartUtc = nowUtc;
+
+                    try
+                    {
+                        _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+                        var result = await RunCycleAsync(stoppingToken);
+                        currentPollInterval = result.Settings.PollInterval;
+
+                        long durationMs = (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds;
+                        _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                        _metrics?.WorkerCycleDurationMs.Record(
+                            durationMs,
+                            new KeyValuePair<string, object?>("worker", WorkerName));
+                        _metrics?.MLDriftAgreementCycleDurationMs.Record(durationMs);
+
+                        if (result.SkippedReason is { Length: > 0 })
+                        {
+                            _logger.LogDebug("{Worker}: cycle skipped ({Reason}).", WorkerName, result.SkippedReason);
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "{Worker}: models evaluated={Evaluated}, consensus alerts={ConsensusAlerts}, anomaly alerts={AnomalyAlerts}.",
+                                WorkerName, result.ModelsEvaluated, result.ConsensusAlertsRaised, result.AnomalyAlertsRaised);
+                        }
+
+                        var prevFailures = ConsecutiveFailures;
+                        if (prevFailures > 0)
+                        {
+                            _healthMonitor?.RecordRecovery(WorkerName, prevFailures);
+                            _logger.LogInformation(
+                                "{Worker}: recovered after {Failures} consecutive failure(s).",
+                                WorkerName, prevFailures);
+                        }
+
+                        ConsecutiveFailures = 0;
+                        lastSuccessUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref _consecutiveFailuresField);
+                        _healthMonitor?.RecordRetry(WorkerName);
+                        _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                        _metrics?.WorkerErrors.Add(
+                            1,
+                            new KeyValuePair<string, object?>("worker", WorkerName),
+                            new KeyValuePair<string, object?>("reason", "ml_drift_agreement_cycle"));
+                        _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                    }
+                }
+
+                try
+                {
+                    await Task.Delay(CalculateDelay(WakeInterval, ConsecutiveFailures), _timeProvider, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopped.", WorkerName);
+        }
+    }
+
+    internal async Task<DriftAgreementCycleResult> RunCycleAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var ctx = readCtx.GetDbContext();
+        var writeDb = writeCtx.GetDbContext();
+        var settings = await LoadSettingsAsync(ctx, ct);
+
+        ApplyCommandTimeout(ctx, settings.DbCommandTimeoutSeconds);
+        ApplyCommandTimeout(writeDb, settings.DbCommandTimeoutSeconds);
+
+        if (!settings.Enabled)
+        {
+            _metrics?.MLDriftAgreementCyclesSkipped.Add(
+                1, new KeyValuePair<string, object?>("reason", "disabled"));
+            return DriftAgreementCycleResult.Skipped(settings, "disabled");
+        }
+
+        if (_distributedLock is null)
+        {
+            _metrics?.MLDriftAgreementLockAttempts.Add(
+                1, new KeyValuePair<string, object?>("outcome", "unavailable"));
+
+            if (Interlocked.Exchange(ref _missingDistributedLockWarningEmitted, 1) == 0)
+            {
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate drift-agreement cycles are possible in multi-instance deployments.",
+                    WorkerName);
+            }
+            return await RunCycleCoreAsync(ctx, writeDb, settings, ct);
+        }
+
+        var cycleLock = await _distributedLock.TryAcquireAsync(
+            DistributedLockKey,
+            TimeSpan.FromSeconds(settings.LockTimeoutSeconds),
+            ct);
+
+        if (cycleLock is null)
+        {
+            _metrics?.MLDriftAgreementLockAttempts.Add(
+                1, new KeyValuePair<string, object?>("outcome", "busy"));
+            _metrics?.MLDriftAgreementCyclesSkipped.Add(
+                1, new KeyValuePair<string, object?>("reason", "lock_busy"));
+            return DriftAgreementCycleResult.Skipped(settings, "lock_busy");
+        }
+
+        _metrics?.MLDriftAgreementLockAttempts.Add(
+            1, new KeyValuePair<string, object?>("outcome", "acquired"));
+
+        await using (cycleLock)
+        {
+            return await RunCycleCoreAsync(ctx, writeDb, settings, ct);
+        }
+    }
+
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+        {
+            return baseInterval <= TimeSpan.Zero
+                ? WakeInterval
+                : baseInterval;
+        }
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private static void ApplyCommandTimeout(DbContext db, int seconds)
+    {
+        try
+        {
+            if (db.Database.IsRelational())
+                db.Database.SetCommandTimeout(TimeSpan.FromSeconds(seconds));
+        }
+        catch (InvalidOperationException) { /* provider lacks support */ }
+    }
+
+    private async Task<DriftAgreementCycleResult> RunCycleCoreAsync(
+        DbContext readCtx,
+        DbContext writeCtx,
+        DriftAgreementWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        int alertCooldown = await AlertCooldownDefaults.GetCooldownAsync(
+            readCtx, AlertCooldownDefaults.CK_MLDrift, AlertCooldownDefaults.Default_MLDrift, ct);
+
+        var activeModels = await readCtx.Set<MLModel>()
+            .AsNoTracking()
+            .Where(m => m.IsActive && !m.IsDeleted)
+            .Select(m => new ActiveModelSnapshot(m.Id, m.Symbol, m.Timeframe, m.IsSuppressed))
+            .ToListAsync(ct);
+
+        int modelsEvaluated = 0;
+        int consensusAlerts = 0;
+        int anomalyAlerts = 0;
+
+        foreach (var model in activeModels)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                var (count, total) = await CountAgreeingDetectorsAsync(
+                    readCtx, model, nowUtc, settings, ct);
+
+                modelsEvaluated++;
+                _metrics?.MLDriftAgreementCounted.Record(
+                    count,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+
+                // Persist agreement metric for downstream consumers (existing API contract).
+                var agreeKey = $"MLDriftAgreement:{model.Symbol}:{model.Timeframe}:AgreeingDetectors";
+                var checkedKey = $"MLDriftAgreement:{model.Symbol}:{model.Timeframe}:LastChecked";
+                await UpsertConfigAsync(writeCtx, agreeKey, count.ToString(CultureInfo.InvariantCulture), ct);
+                await UpsertConfigAsync(writeCtx, checkedKey, nowUtc.ToString("O", CultureInfo.InvariantCulture), ct);
+
+                _logger.LogDebug(
+                    "{Worker}: {Symbol}/{Timeframe} — {Count}/{Total} detectors agreeing (suppressed={Suppressed}).",
+                    WorkerName, model.Symbol, model.Timeframe, count, total, model.IsSuppressed);
+
+                if (count >= settings.ConsensusThreshold)
+                {
+                    if (await DispatchConsensusAlertAsync(writeCtx, model, count, total, alertCooldown, nowUtc, ct))
+                        consensusAlerts++;
+                }
+                else if (count == 0 && model.IsSuppressed)
+                {
+                    if (await DispatchAnomalyAlertAsync(writeCtx, model, total, alertCooldown, nowUtc, ct))
+                        anomalyAlerts++;
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "MLDriftAgreementWorker loop error");
+                _metrics?.WorkerErrors.Add(
+                    1,
+                    new KeyValuePair<string, object?>("worker", WorkerName),
+                    new KeyValuePair<string, object?>("reason", "ml_drift_agreement_model"),
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                _logger.LogWarning(ex,
+                    "{Worker}: agreement check failed for model {ModelId} ({Symbol}/{Timeframe}); continuing.",
+                    WorkerName, model.Id, model.Symbol, model.Timeframe);
             }
-
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
 
-        _logger.LogInformation("MLDriftAgreementWorker stopping.");
+        return new DriftAgreementCycleResult(
+            settings,
+            SkippedReason: null,
+            ModelsEvaluated: modelsEvaluated,
+            ConsensusAlertsRaised: consensusAlerts,
+            AnomalyAlertsRaised: anomalyAlerts);
     }
 
     /// <summary>
-    /// Checks cross-detector agreement for a single model and creates alerts when thresholds are met.
+    /// Counts how many of the five drift detectors are simultaneously firing for the
+    /// given model. Returns (count, totalDetectors).
     /// </summary>
-    private async Task CheckAgreementAsync(
-        MLModel                                 model,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        string                                  alertDest,
-        int                                     cusumWindowHours,
-        int                                     shiftWindowHours,
-        int                                     alertCooldown,
-        CancellationToken                       ct)
+    private static async Task<(int Count, int Total)> CountAgreeingDetectorsAsync(
+        DbContext readCtx,
+        ActiveModelSnapshot model,
+        DateTime nowUtc,
+        DriftAgreementWorkerSettings settings,
+        CancellationToken ct)
     {
-        var symbol = model.Symbol;
-        var tf     = model.Timeframe;
-        var now    = DateTime.UtcNow;
-        int agreeingDetectors = 0;
+        const int totalDetectors = 5;
+        int count = 0;
 
-        // ── 1. MLDriftMonitorWorker — consecutive failure counter > 0 ────────
-        var failKey = $"MLDrift:{symbol}:{tf}:ConsecutiveFailures";
-        int failCount = await GetConfigAsync<int>(readCtx, failKey, 0, ct);
-        if (failCount > 0) agreeingDetectors++;
+        // 1. MLDriftMonitorWorker — consecutive failure counter > 0
+        var failKey = $"MLDrift:{model.Symbol}:{model.Timeframe}:ConsecutiveFailures";
+        var failEntry = await readCtx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == failKey, ct);
+        if (failEntry?.Value is not null &&
+            int.TryParse(failEntry.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var failCount) &&
+            failCount > 0)
+        {
+            count++;
+        }
 
-        // ── 2. MLAdwinDriftWorker — ADWIN drift flag with future expiry ──────
-        var adwinKey = $"MLDrift:{symbol}:{tf}:AdwinDriftDetected";
-        string? adwinVal = await GetConfigValueAsync(readCtx, adwinKey, ct);
-        if (adwinVal is not null && DateTime.TryParse(adwinVal, out var adwinExpiry) && adwinExpiry > now)
-            agreeingDetectors++;
+        // 2. MLAdwinDriftWorker — typed MLDriftFlag with future expiry
+        bool adwinFlagged = await readCtx.Set<MLDriftFlag>()
+            .AsNoTracking()
+            .AnyAsync(f =>
+                f.Symbol == model.Symbol &&
+                f.Timeframe == model.Timeframe &&
+                f.DetectorType == "AdwinDrift" &&
+                f.ExpiresAtUtc > nowUtc, ct);
+        if (adwinFlagged) count++;
 
-        // ── 3. MLCusumDriftWorker — recent CUSUM alert ───────────────────────
-        var cusumCutoff = now.AddHours(-cusumWindowHours);
-        // Alert entity lacks a CreatedAt column; use LastTriggeredAt as proxy
+        // 3. MLCusumDriftWorker — recent CUSUM alert
+        var cusumCutoff = nowUtc.AddHours(-settings.CusumWindowHours);
         bool recentCusum = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == symbol &&
-                           a.AlertType == AlertType.MLModelDegraded &&
-                           !a.IsDeleted &&
-                           a.ConditionJson.Contains("\"DetectorType\":\"CUSUM\"") &&
-                           a.LastTriggeredAt != null &&
-                           a.LastTriggeredAt >= cusumCutoff, ct);
-        if (recentCusum) agreeingDetectors++;
+            .AsNoTracking()
+            .AnyAsync(a =>
+                a.Symbol == model.Symbol &&
+                a.AlertType == AlertType.MLModelDegraded &&
+                !a.IsDeleted &&
+                a.ConditionJson.Contains("\"DetectorType\":\"CUSUM\"") &&
+                a.LastTriggeredAt != null &&
+                a.LastTriggeredAt >= cusumCutoff, ct);
+        if (recentCusum) count++;
 
-        // ── 4. MLCovariateShiftWorker — recent covariate shift training run ──
-        var shiftCutoff = now.AddHours(-shiftWindowHours);
+        // 4. MLCovariateShiftWorker — recent covariate shift training run
+        var shiftCutoff = nowUtc.AddHours(-settings.ShiftWindowHours);
         bool recentCovariateShift = await readCtx.Set<MLTrainingRun>()
-            .AnyAsync(r => r.Symbol    == symbol &&
-                           r.Timeframe == tf     &&
-                           !r.IsDeleted &&
-                           r.DriftTriggerType == "CovariateShift" &&
-                           r.StartedAt >= shiftCutoff, ct);
-        if (recentCovariateShift) agreeingDetectors++;
+            .AsNoTracking()
+            .AnyAsync(r =>
+                r.Symbol == model.Symbol &&
+                r.Timeframe == model.Timeframe &&
+                !r.IsDeleted &&
+                r.DriftTriggerType == "CovariateShift" &&
+                r.StartedAt >= shiftCutoff, ct);
+        if (recentCovariateShift) count++;
 
-        // ── 5. MLMultiScaleDriftWorker — recent multi-scale drift training run
+        // 5. MLMultiScaleDriftWorker — recent multi-scale drift training run
         bool recentMultiScale = await readCtx.Set<MLTrainingRun>()
-            .AnyAsync(r => r.Symbol    == symbol &&
-                           r.Timeframe == tf     &&
-                           !r.IsDeleted &&
-                           r.DriftTriggerType == "MultiSignal" &&
-                           r.StartedAt >= shiftCutoff, ct);
-        if (recentMultiScale) agreeingDetectors++;
+            .AsNoTracking()
+            .AnyAsync(r =>
+                r.Symbol == model.Symbol &&
+                r.Timeframe == model.Timeframe &&
+                !r.IsDeleted &&
+                r.DriftTriggerType == "MultiSignal" &&
+                r.StartedAt >= shiftCutoff, ct);
+        if (recentMultiScale) count++;
 
-        // ── Persist agreement metric ────────────────────────────────────────
-        var agreeKey = $"MLDriftAgreement:{symbol}:{tf}:AgreeingDetectors";
-        var checkedKey = $"MLDriftAgreement:{symbol}:{tf}:LastChecked";
-        await UpsertConfigAsync(writeCtx, agreeKey, agreeingDetectors.ToString(), ct);
-        await UpsertConfigAsync(writeCtx, checkedKey, now.ToString("O"), ct);
+        return (count, totalDetectors);
+    }
 
-        _logger.LogDebug(
-            "DriftAgreement {Symbol}/{Tf}: {Count}/5 detectors agreeing (suppressed={Suppressed})",
-            symbol, tf, agreeingDetectors, model.IsSuppressed);
-
-        // ── Alert: >= 4 detectors agree — multi-detector drift consensus ────
-        if (agreeingDetectors >= 4)
+    private async Task<bool> DispatchConsensusAlertAsync(
+        DbContext writeCtx,
+        ActiveModelSnapshot model,
+        int agreeingDetectors,
+        int totalDetectors,
+        int alertCooldown,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string conditionJson = JsonSerializer.Serialize(new
         {
-            writeCtx.Set<Alert>().Add(new Alert
-            {
-                Symbol        = symbol,
-                AlertType     = AlertType.MLModelDegraded,
-                Severity      = AlertSeverity.Critical,
-                IsActive      = true,
-                ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    DetectorType      = "DriftAgreement",
-                    ModelId           = model.Id,
-                    Timeframe         = tf.ToString(),
-                    AgreeingDetectors = agreeingDetectors,
-                    TotalDetectors    = 5,
-                }),
-                DeduplicationKey = $"drift-agreement:{symbol}:{tf}",
-                CooldownSeconds  = alertCooldown,
-            });
-            await writeCtx.SaveChangesAsync(ct);
+            DetectorType = "DriftAgreement",
+            ModelId = model.Id,
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe.ToString(),
+            AgreeingDetectors = agreeingDetectors,
+            TotalDetectors = totalDetectors,
+            DetectedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture),
+        });
 
+        var alert = new Alert
+        {
+            Symbol = model.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            Severity = AlertSeverity.Critical,
+            IsActive = true,
+            ConditionJson = conditionJson,
+            DeduplicationKey = $"drift-agreement:{model.Symbol}:{model.Timeframe}",
+            CooldownSeconds = alertCooldown,
+        };
+
+        string message = string.Format(
+            CultureInfo.InvariantCulture,
+            "Multi-detector drift consensus on {0}/{1}: {2}/{3} detectors firing simultaneously.",
+            model.Symbol, model.Timeframe, agreeingDetectors, totalDetectors);
+
+        return await DispatchOrPersistAlertAsync(writeCtx, alert, message, ct,
+            tagSymbol: model.Symbol, tagTimeframe: model.Timeframe, kind: "consensus");
+    }
+
+    private async Task<bool> DispatchAnomalyAlertAsync(
+        DbContext writeCtx,
+        ActiveModelSnapshot model,
+        int totalDetectors,
+        int alertCooldown,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string conditionJson = JsonSerializer.Serialize(new
+        {
+            DetectorType = "DriftAgreementAnomaly",
+            ModelId = model.Id,
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe.ToString(),
+            AgreeingDetectors = 0,
+            TotalDetectors = totalDetectors,
+            ModelSuppressed = true,
+            Message = "Model suppressed but no detectors firing — potential threshold miscalibration",
+            DetectedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture),
+        });
+
+        var alert = new Alert
+        {
+            Symbol = model.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            Severity = AlertSeverity.High,
+            IsActive = true,
+            ConditionJson = conditionJson,
+            DeduplicationKey = $"drift-agreement-anomaly:{model.Symbol}:{model.Timeframe}",
+            CooldownSeconds = alertCooldown * 2,
+        };
+
+        string message = string.Format(
+            CultureInfo.InvariantCulture,
+            "Model suppressed but no detectors firing for {0}/{1} — potential threshold miscalibration.",
+            model.Symbol, model.Timeframe);
+
+        return await DispatchOrPersistAlertAsync(writeCtx, alert, message, ct,
+            tagSymbol: model.Symbol, tagTimeframe: model.Timeframe, kind: "anomaly");
+    }
+
+    private async Task<bool> DispatchOrPersistAlertAsync(
+        DbContext writeCtx,
+        Alert alert,
+        string message,
+        CancellationToken ct,
+        string tagSymbol,
+        Timeframe tagTimeframe,
+        string kind)
+    {
+        try
+        {
+            if (_alertDispatcher is not null)
+            {
+                await _alertDispatcher.DispatchAsync(alert, message, ct);
+            }
+            else
+            {
+                writeCtx.Set<Alert>().Add(alert);
+                await writeCtx.SaveChangesAsync(ct);
+            }
+            _metrics?.MLDriftAgreementAlertsDispatched.Add(
+                1,
+                new KeyValuePair<string, object?>("symbol", tagSymbol),
+                new KeyValuePair<string, object?>("timeframe", tagTimeframe.ToString()),
+                new KeyValuePair<string, object?>("kind", kind));
             _logger.LogWarning(
-                "Multi-detector drift consensus for {Symbol}/{Tf}: {Count}/5 detectors firing",
-                symbol, tf, agreeingDetectors);
+                "{Worker}: {Kind} alert dispatched for {Symbol}/{Timeframe}: {Message}",
+                WorkerName, kind, tagSymbol, tagTimeframe, message);
+            return true;
         }
-        // ── Alert: model suppressed but no detectors firing ─────────────────
-        else if (agreeingDetectors == 0 && model.IsSuppressed)
+        catch (Exception ex)
         {
-            writeCtx.Set<Alert>().Add(new Alert
-            {
-                Symbol        = symbol,
-                AlertType     = AlertType.MLModelDegraded,
-                Severity      = AlertSeverity.High,
-                IsActive      = true,
-                ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    DetectorType      = "DriftAgreementAnomaly",
-                    ModelId           = model.Id,
-                    Timeframe         = tf.ToString(),
-                    AgreeingDetectors = 0,
-                    ModelSuppressed   = true,
-                    Message           = "Model suppressed but no detectors firing — potential threshold miscalibration",
-                }),
-                DeduplicationKey = $"drift-agreement-anomaly:{symbol}:{tf}",
-                CooldownSeconds  = alertCooldown * 2,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-
-            _logger.LogWarning(
-                "Model suppressed but no detectors firing for {Symbol}/{Tf} — potential threshold miscalibration",
-                symbol, tf);
+            _logger.LogWarning(ex,
+                "{Worker}: failed to dispatch {Kind} alert for {Symbol}/{Timeframe}.",
+                WorkerName, kind, tagSymbol, tagTimeframe);
+            return false;
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    private static async Task<DriftAgreementWorkerSettings> LoadSettingsAsync(
+        DbContext db,
+        CancellationToken ct)
     {
-        var entry = await ctx.Set<EngineConfig>()
+        string[] keys =
+        [
+            CK_Enabled, CK_PollSecs, CK_CusumWindowH, CK_ShiftWindowH,
+            CK_ConsensusThresh, CK_LockTimeoutSecs, CK_DbCommandTimeoutSecs,
+        ];
+
+        var values = await db.Set<EngineConfig>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .Where(c => keys.Contains(c.Key))
+            .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
 
-        if (entry?.Value is null) return defaultValue;
-
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
-    }
-
-    private static async Task<string?> GetConfigValueAsync(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        CancellationToken                       ct)
-    {
-        return await ctx.Set<EngineConfig>()
-            .AsNoTracking()
-            .Where(c => c.Key == key)
-            .Select(c => c.Value)
-            .FirstOrDefaultAsync(ct);
+        return new DriftAgreementWorkerSettings(
+            Enabled: GetBool(values, CK_Enabled, true),
+            PollInterval: TimeSpan.FromSeconds(
+                ClampInt(GetInt(values, CK_PollSecs, DefaultPollSeconds), DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
+            CusumWindowHours: ClampInt(GetInt(values, CK_CusumWindowH, DefaultCusumWindowHours), DefaultCusumWindowHours, MinCusumWindowHours, MaxCusumWindowHours),
+            ShiftWindowHours: ClampInt(GetInt(values, CK_ShiftWindowH, DefaultShiftWindowHours), DefaultShiftWindowHours, MinShiftWindowHours, MaxShiftWindowHours),
+            ConsensusThreshold: ClampInt(GetInt(values, CK_ConsensusThresh, DefaultConsensusThreshold), DefaultConsensusThreshold, MinConsensusThreshold, MaxConsensusThreshold),
+            LockTimeoutSeconds: ClampInt(GetInt(values, CK_LockTimeoutSecs, DefaultLockTimeoutSeconds), DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
+            DbCommandTimeoutSeconds: ClampInt(GetInt(values, CK_DbCommandTimeoutSecs, DefaultDbCommandTimeoutSeconds), DefaultDbCommandTimeoutSeconds, MinDbCommandTimeoutSeconds, MaxDbCommandTimeoutSeconds));
     }
 
     private static Task UpsertConfigAsync(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        string                                  value,
-        CancellationToken                       ct)
+        DbContext ctx,
+        string key,
+        string value,
+        CancellationToken ct)
         => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(ctx, key, value, ct: ct);
+
+    private static bool GetBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+        if (bool.TryParse(raw, out var parsedBool)) return parsedBool;
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedInt))
+            return parsedInt != 0;
+        return defaultValue;
+    }
+
+    private static int GetInt(IReadOnlyDictionary<string, string> values, string key, int defaultValue)
+        => values.TryGetValue(key, out var raw) &&
+           int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed : defaultValue;
+
+    private static int ClampInt(int value, int fallback, int min, int max)
+        => value <= 0 ? fallback : Math.Min(Math.Max(value, min), max);
+
+    private readonly record struct ActiveModelSnapshot(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        bool IsSuppressed);
+
+    internal readonly record struct DriftAgreementWorkerSettings(
+        bool Enabled,
+        TimeSpan PollInterval,
+        int CusumWindowHours,
+        int ShiftWindowHours,
+        int ConsensusThreshold,
+        int LockTimeoutSeconds,
+        int DbCommandTimeoutSeconds);
+
+    internal readonly record struct DriftAgreementCycleResult(
+        DriftAgreementWorkerSettings Settings,
+        string? SkippedReason,
+        int ModelsEvaluated,
+        int ConsensusAlertsRaised,
+        int AnomalyAlertsRaised)
+    {
+        public static DriftAgreementCycleResult Skipped(
+            DriftAgreementWorkerSettings settings, string reason)
+            => new(settings, reason, 0, 0, 0);
+    }
 }

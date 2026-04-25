@@ -754,6 +754,13 @@ public partial class StrategyWorker :
                 _metrics.PrefetchQueryTimeouts.Add(1,
                     new("symbol", @event.Symbol),
                     new("query", "backtest_qualification"));
+                await _rejectionAuditor.RecordAsync(
+                    stage: "BacktestGate",
+                    reason: "qualification_query_timeout",
+                    symbol: @event.Symbol,
+                    source: nameof(StrategyWorker),
+                    detail: $"Backtest qualification query timed out after {prefetchTimeoutSeconds}s",
+                    ct: _stoppingToken);
                 backtestQualifiedIds = [];
             }
             catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
@@ -764,6 +771,13 @@ public partial class StrategyWorker :
                 _metrics.PrefetchQueryTimeouts.Add(1,
                     new("symbol", @event.Symbol),
                     new("query", "backtest_qualification"));
+                await _rejectionAuditor.RecordAsync(
+                    stage: "BacktestGate",
+                    reason: "qualification_query_error",
+                    symbol: @event.Symbol,
+                    source: nameof(StrategyWorker),
+                    detail: $"Backtest qualification query failed: {ex.GetType().Name}",
+                    ct: _stoppingToken);
                 backtestQualifiedIds = [];
             }
         }
@@ -986,6 +1000,17 @@ public partial class StrategyWorker :
                     _logger.LogDebug(
                         "Strategy {Id} ({Symbol}/{Tf}): no qualifying backtest — skipping signal generation",
                         strategy.Id, strategy.Symbol, strategy.Timeframe);
+                    _metrics.SignalsFiltered.Add(1,
+                        new("symbol", strategy.Symbol),
+                        new("stage", "backtest_qualification"));
+                    await _rejectionAuditor.RecordAsync(
+                        stage: "BacktestGate",
+                        reason: "backtest_not_qualified",
+                        symbol: strategy.Symbol,
+                        source: nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: "No recent completed backtest met the live qualification thresholds",
+                        ct: ct);
                     return;
                 }
 

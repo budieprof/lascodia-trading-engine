@@ -20,12 +20,14 @@ public sealed class EngineConfigExpiryWorkerTest
         await using var contextBundle = await NewContextAsync();
         var ctx = contextBundle.Ctx;
 
+        // ADWIN drift flags moved to the typed MLDriftFlag entity; they no longer
+        // appear in EngineConfig and so are no longer swept here. The remaining
+        // expiry-managed key family is :ExpiresAt.
         ctx.EngineConfigs.AddRange(
             NewConfig(1, "MLCooldown:EURUSD:H1:ExpiresAt", now.AddMinutes(-5).ToString("O")),
-            NewConfig(2, "MLDrift:EURUSD:H1:AdwinDriftDetected", now.AddMinutes(-1).ToString("O")),
-            NewConfig(3, "MLDegradation:EURUSD:DetectedAt", now.AddHours(-3).ToString("O")),
-            NewConfig(4, "MLDriftAgreement:EURUSD:H1:LastChecked", now.AddMinutes(-30).ToString("O")),
-            NewConfig(5, "MLCooldown:GBPUSD:H1:ExpiresAt", now.AddHours(2).ToString("O")));
+            NewConfig(2, "MLDegradation:EURUSD:DetectedAt", now.AddHours(-3).ToString("O")),
+            NewConfig(3, "MLDriftAgreement:EURUSD:H1:LastChecked", now.AddMinutes(-30).ToString("O")),
+            NewConfig(4, "MLCooldown:GBPUSD:H1:ExpiresAt", now.AddHours(2).ToString("O")));
         await ctx.SaveChangesAsync();
 
         using var provider = BuildProvider(ctx);
@@ -38,14 +40,13 @@ public sealed class EngineConfigExpiryWorkerTest
             .OrderBy(x => x.Id)
             .ToListAsync();
 
-        Assert.Equal(2, result.ExpiredEntryCount);
+        Assert.Equal(1, result.ExpiredEntryCount);
         Assert.Equal(0, result.StaleMetricsBlockCount);
         Assert.Equal(0, result.StaleMetricsEntryCount);
         Assert.True(rows[0].IsDeleted);
-        Assert.True(rows[1].IsDeleted);
+        Assert.False(rows[1].IsDeleted);
         Assert.False(rows[2].IsDeleted);
         Assert.False(rows[3].IsDeleted);
-        Assert.False(rows[4].IsDeleted);
     }
 
     [Fact]

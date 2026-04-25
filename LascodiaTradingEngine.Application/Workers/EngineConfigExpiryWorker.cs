@@ -18,10 +18,11 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///
 /// <para>
 /// The worker intentionally targets only explicit expiry-managed keys such as
-/// <c>MLCooldown:{Symbol}:{Tf}:ExpiresAt</c> and
-/// <c>MLDrift:{Symbol}:{Tf}:AdwinDriftDetected</c>. Other timestamp-valued config rows
-/// (for example <c>*:DetectedAt</c> and <c>*:LastChecked</c>) are operational state and
-/// must not be deleted just because they refer to a past moment in time.
+/// <c>MLCooldown:{Symbol}:{Tf}:ExpiresAt</c>. Other timestamp-valued config rows (for
+/// example <c>*:DetectedAt</c> and <c>*:LastChecked</c>) are operational state and must
+/// not be deleted just because they refer to a past moment in time. The earlier
+/// <c>MLDrift:*:AdwinDriftDetected</c> sweep was removed when ADWIN drift flags moved
+/// to the typed <see cref="MLDriftFlag"/> entity.
 /// </para>
 /// </summary>
 public sealed class EngineConfigExpiryWorker : BackgroundService
@@ -33,8 +34,6 @@ public sealed class EngineConfigExpiryWorker : BackgroundService
     private const string MetricsPrefix = "MLMetrics:";
     private const string MetricsLastUpdatedSuffix = ":LastUpdated";
     private const string ExpirySuffix = ":ExpiresAt";
-    private const string AdwinDriftPrefix = "MLDrift:";
-    private const string AdwinDriftSuffix = ":AdwinDriftDetected";
 
     private const int DefaultPollIntervalSeconds = 21600; // 6 hours
     private const int MinPollIntervalSeconds = 60;
@@ -276,8 +275,7 @@ public sealed class EngineConfigExpiryWorker : BackgroundService
             .Where(c => !c.IsDeleted
                      && c.Value != null
                      && c.Value != ""
-                     && (c.Key.EndsWith(ExpirySuffix)
-                      || (c.Key.StartsWith(AdwinDriftPrefix) && c.Key.EndsWith(AdwinDriftSuffix))))
+                     && c.Key.EndsWith(ExpirySuffix))
             .Select(c => new { c.Id, c.Key, c.Value })
             .ToListAsync(ct);
 

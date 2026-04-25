@@ -297,6 +297,9 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
             return;
 
         latestSnap.ConformalQHat = newQHat;
+        latestSnap.ConformalQHatBuy = newQHat;
+        latestSnap.ConformalQHatSell = newQHat;
+        latestSnap.ConformalCoverage = nominalCoverage;
         writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
         await writeCtx.SaveChangesAsync(ct);
 

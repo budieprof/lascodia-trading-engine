@@ -1,543 +1,1888 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
+using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Alerts;
+using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using LascodiaTradingEngine.Application.Common.Interfaces;
-using LascodiaTradingEngine.Application.MLModels.Shared;
-using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Runs bivariate Granger causality tests for each of the <see cref="MLFeatureHelper.FeatureCount"/>
-/// features of every active ML model, recording results in <see cref="MLCausalFeatureAudit"/>.
+/// Audits live ML model input features for predictive causality against resolved outcomes.
 /// </summary>
 /// <remarks>
-/// <para>
-/// <b>What is Granger causality?</b>
-/// A feature X is said to "Granger-cause" a target Y if past values of X improve the
-/// prediction of Y beyond what can be achieved by past values of Y alone. Formally, the test
-/// compares two autoregressive models:
-/// <list type="bullet">
-///   <item><b>Restricted (AR) model:</b> y_t = intercept + Σ_{l=1}^p α_l × y_{t-l} + ε_t</item>
-///   <item><b>Unrestricted model:</b> y_t = intercept + Σ_{l=1}^p α_l × y_{t-l}
-///             + Σ_{l=1}^p β_l × x_{t-l} + ε_t</item>
-/// </list>
-/// If including the lagged feature X significantly reduces residual sum of squares (RSS),
-/// X Granger-causes Y. The improvement is measured by an F-statistic:
-/// F = ((RSS_R − RSS_U) / p) / (RSS_U / (n − 2p − 1))
-/// where p is the lag order and n is the sample size.
-/// </para>
-/// <para>
-/// <b>Why use Granger causality for trading features?</b>
-/// Many technical indicators exhibit apparent predictive correlation with price moves due to
-/// shared underlying trending or momentum regimes. A feature that is highly correlated with
-/// price direction during a trending regime may have zero marginal predictive value once the
-/// autoregressive structure of returns is accounted for. Granger causality separates genuine
-/// leading indicators from spurious contemporaneous correlates.
-/// </para>
-/// <para>
-/// <b>Lag order selection:</b> AIC is used to select the optimal lag p in [1, <see cref="MaxLag"/>]:
-/// AIC(p) = n × log(RSS/n) + 2k, where k = 1 + 2p (intercept + 2p parameters in unrestricted model).
-/// The lag with the lowest AIC is used for the final F-test.
-/// </para>
-/// <para>
-/// <b>p-value approximation:</b> The exact F-distribution CDF is approximated via the
-/// Wilson-Hilferty transform converting F(d1, d2) to a chi-squared then to a standard normal.
-/// This is accurate for moderate n and is sufficient for the binary causal/non-causal
-/// classification at the 0.05 significance level.
-/// </para>
-/// <para>
-/// <b>Polling interval:</b> 7 days, with a 15-minute initial delay to let other workers
-/// initialise first. An initial delay avoids DB contention on startup.
-/// </para>
-/// <para>
-/// <b>Pipeline role:</b> <c>IsCausal = false</c> features are candidates for masking in
-/// the next training run via <c>HyperparamOverrides.DisabledFeatureIndices</c>.
-/// The <c>IsMaskedForTraining</c> flag is set by a separate operator approval step —
-/// this worker only diagnoses, it does not automatically mask.
-/// </para>
+/// The previous implementation had three major correctness issues:
+/// it rebuilt feature rows from recent candles instead of using the served live feature
+/// vectors, it ignored the resolved prediction outcomes for the return series, and it reset
+/// operator-managed <see cref="MLCausalFeatureAudit.IsMaskedForTraining"/> state on every run.
+///
+/// This worker uses authoritative resolved prediction logs with persisted
+/// <see cref="MLModelPredictionLog.RawFeaturesJson"/> plus signed
+/// <see cref="MLModelPredictionLog.ActualMagnitudePips"/> outcomes, preserves masking state
+/// across refreshes, and runs on the write side with distributed-lock and worker-health
+/// integration so it can be safely deployed in multi-instance production environments.
+///
+/// Statistical guarantees: per-feature Granger F-tests are corrected for multiple comparisons
+/// using the Benjamini-Hochberg procedure at <c>FdrAlpha</c>, so the family-wise false-discovery
+/// rate is bounded across the model's feature set rather than expanding linearly with feature
+/// count. The unrestricted/restricted regressions are solved via Cholesky decomposition of the
+/// ridge-regularised normal equations, which is exact for the SPD design matrix and roughly
+/// twice as fast as Gauss elimination.
+///
+/// Operational alarms: a <see cref="AlertType.MLMonitoringStale"/> alert fires when a model is
+/// skipped for more than <c>ConsecutiveSkipAlertThreshold</c> consecutive cycles (typically a
+/// broken prediction-logging pipeline). A <see cref="AlertType.MLModelDegraded"/> alert fires
+/// when a model's causal-feature ratio drops by more than <c>RegressionThreshold</c> from the
+/// previous cycle (typically a regime shift or a feature schema break). Both alert paths are
+/// gated by <c>MaxAlertsPerCycle</c>.
 /// </remarks>
-public class MLCausalFeatureWorker : BackgroundService
+public sealed class MLCausalFeatureWorker : BackgroundService
 {
-    private readonly ILogger<MLCausalFeatureWorker> _logger;
+    internal const string WorkerName = nameof(MLCausalFeatureWorker);
+
+    private const string DistributedLockKey = "workers:ml-causal-feature:cycle";
+    private const string StaleMonitoringDeduplicationPrefix = "ml-causal-stale:";
+    private const string RegressionDeduplicationPrefix = "ml-causal-regression:";
+    private const int AlertConditionMaxLength = 1000;
+
+    private const string CK_Enabled = "MLCausal:Enabled";
+    private const string CK_PollSecs = "MLCausal:PollIntervalSeconds";
+    private const string CK_WindowDays = "MLCausal:WindowDays";
+    private const string CK_MinSamples = "MLCausal:MinSamples";
+    private const string CK_MaxLogsPerModel = "MLCausal:MaxLogsPerModel";
+    private const string CK_MaxModelsPerCycle = "MLCausal:MaxModelsPerCycle";
+    private const string CK_MaxLag = "MLCausal:MaxLag";
+    private const string CK_PValueThreshold = "MLCausal:PValueThreshold";
+    private const string CK_LockTimeoutSeconds = "MLCausal:LockTimeoutSeconds";
+    private const string CK_FdrAlpha = "MLCausal:FdrAlpha";
+    private const string CK_ConsecutiveSkipAlertThreshold = "MLCausal:ConsecutiveSkipAlertThreshold";
+    private const string CK_RegressionThreshold = "MLCausal:RegressionThreshold";
+    private const string CK_MinPriorCausalForRegression = "MLCausal:MinPriorCausalForRegression";
+    private const string CK_MaxAlertsPerCycle = "MLCausal:MaxAlertsPerCycle";
+
+    private const int DefaultPollSeconds = 7 * 24 * 60 * 60;
+    private const int MinPollSeconds = 60;
+    private const int MaxPollSeconds = 30 * 24 * 60 * 60;
+
+    private const int DefaultWindowDays = 180;
+    private const int MinWindowDays = 1;
+    private const int MaxWindowDays = 3650;
+
+    private const int DefaultMinSamples = 80;
+    private const int MinMinSamples = 20;
+    private const int MaxMinSamples = 100_000;
+
+    private const int DefaultMaxLogsPerModel = 512;
+    private const int MinMaxLogsPerModel = 20;
+    private const int MaxMaxLogsPerModel = 100_000;
+
+    private const int DefaultMaxModelsPerCycle = 256;
+    private const int MinMaxModelsPerCycle = 1;
+    private const int MaxMaxModelsPerCycle = 10_000;
+
+    private const int DefaultMaxLag = 10;
+    private const int MinMaxLag = 1;
+    private const int MaxMaxLag = 30;
+
+    private const double DefaultPValueThreshold = 0.05;
+    private const double MinPValueThreshold = 0.000001;
+    private const double MaxPValueThreshold = 0.50;
+
+    private const int DefaultLockTimeoutSeconds = 0;
+    private const int MinLockTimeoutSeconds = 0;
+    private const int MaxLockTimeoutSeconds = 300;
+
+    private const double DefaultFdrAlpha = 0.05;
+    private const double MinFdrAlpha = 0.000001;
+    private const double MaxFdrAlpha = 0.50;
+
+    private const int DefaultConsecutiveSkipAlertThreshold = 2;
+    private const int MinConsecutiveSkipAlertThreshold = 1;
+    private const int MaxConsecutiveSkipAlertThreshold = 100;
+
+    private const double DefaultRegressionThreshold = 0.5;
+    private const double MinRegressionThreshold = 0.0;
+    private const double MaxRegressionThreshold = 1.0;
+
+    private const int DefaultMinPriorCausalForRegression = 5;
+    private const int MinMinPriorCausalForRegression = 1;
+    private const int MaxMinPriorCausalForRegression = 1000;
+
+    private const int DefaultMaxAlertsPerCycle = 10;
+    private const int MinMaxAlertsPerCycle = 0;
+    private const int MaxMaxAlertsPerCycle = 1000;
+
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<MLCausalFeatureWorker> _logger;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
 
-    /// <summary>Weekly polling interval — causal structure changes on a regime timescale.</summary>
-    private static readonly TimeSpan _interval     = TimeSpan.FromDays(7);
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
 
-    /// <summary>
-    /// Initial startup delay before the first cycle runs. Allows the host and dependent
-    /// services (e.g. EF Core migrations) to fully initialise before the first DB query.
-    /// </summary>
-    private static readonly TimeSpan _initialDelay = TimeSpan.FromMinutes(15);
+    private readonly record struct ActiveModelCandidate(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        byte[] ModelBytes);
 
-    /// <summary>Significance threshold for Granger causality (default 0.05).</summary>
-    private const double PValueThreshold = 0.05;
+    private readonly record struct PredictionFeatureLog(
+        long Id,
+        long MLModelId,
+        DateTime PredictedAt,
+        DateTime OutcomeRecordedAt,
+        decimal ActualMagnitudePips,
+        string RawFeaturesJson);
 
-    /// <summary>Maximum lag order evaluated during AIC-based lag selection.</summary>
-    private const int MaxLag = 10;
+    private readonly record struct CausalObservation(
+        double[] Features,
+        double RealisedReturn,
+        DateTime PredictedAt,
+        DateTime OutcomeRecordedAt);
 
-    /// <summary>
-    /// Number of recent resolved prediction log entries to use as the return series (y).
-    /// Using resolved logs (where ActualMagnitudePips is populated) ensures the return
-    /// series reflects real price outcomes rather than predicted values.
-    /// </summary>
-    private const int SeriesLength = 200;
+    private readonly record struct ParsedObservationSet(
+        List<CausalObservation> Observations,
+        int Malformed,
+        int WrongShape,
+        int NonFinite);
 
-    /// <summary>
-    /// Initialises the worker with a logger and DI scope factory.
-    /// </summary>
-    /// <param name="logger">Structured logger for Granger test diagnostics.</param>
-    /// <param name="scopeFactory">Factory used to create a fresh DI scope each weekly cycle.</param>
+    private readonly record struct ModelAuditOutcome(
+        bool Evaluated,
+        int SamplesUsed,
+        int AuditsWritten,
+        int CausalFeatures,
+        int PreservedMasks,
+        bool RegressionAlertDispatched,
+        bool StaleMonitoringAlertDispatched,
+        bool AlertBackpressureSkipped,
+        string? SkipReason)
+    {
+        public static ModelAuditOutcome Skipped(
+            string reason,
+            bool staleMonitoringAlertDispatched = false,
+            bool alertBackpressureSkipped = false)
+            => new(false, 0, 0, 0, 0, false, staleMonitoringAlertDispatched, alertBackpressureSkipped, reason);
+    }
+
+    private sealed class CycleContext
+    {
+        public required Dictionary<long, List<PredictionFeatureLog>> LogsByModelId { get; init; }
+        public required Dictionary<long, int> SkipStreaksByModelId { get; init; }
+        public required Dictionary<long, double> PriorCausalRatioByModelId { get; init; }
+        public required Dictionary<long, int> PriorCausalCountByModelId { get; init; }
+        public required HashSet<long> ActiveStaleAlertModelIds { get; init; }
+        public required HashSet<long> ActiveRegressionAlertModelIds { get; init; }
+        public required AlertBudget AlertBudget { get; init; }
+    }
+
+    private sealed class AlertBudget
+    {
+        private int _remaining;
+
+        public AlertBudget(int capacity)
+        {
+            _remaining = capacity;
+        }
+
+        public bool HasCapacity => _remaining > 0;
+
+        public bool TryConsume()
+        {
+            if (_remaining <= 0)
+                return false;
+
+            _remaining--;
+            return true;
+        }
+    }
+
     public MLCausalFeatureWorker(
         ILogger<MLCausalFeatureWorker> logger,
-        IServiceScopeFactory scopeFactory)
+        IServiceScopeFactory scopeFactory,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
-        _logger       = logger;
+        _logger = logger;
         _scopeFactory = scopeFactory;
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
-    /// <summary>
-    /// Entry point for the hosted service. Waits for the initial delay, then runs a weekly
-    /// loop delegating to <see cref="RunCycleAsync"/>. Errors are caught per cycle so the
-    /// loop continues after transient failures.
-    /// </summary>
-    /// <param name="stoppingToken">Cancellation token signalled when the host shuts down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLCausalFeatureWorker starting");
-        // Delay startup to allow the application host and DB to fully initialise.
-        await Task.Delay(_initialDelay, stoppingToken);
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Runs schema-aware Granger causality audits with Benjamini-Hochberg FDR control over authoritative live ML prediction logs while preserving operator-approved feature masking state.",
+            TimeSpan.FromSeconds(DefaultPollSeconds));
 
-        while (!stoppingToken.IsCancellationRequested)
+        var currentDelay = TimeSpan.FromSeconds(DefaultPollSeconds);
+
+        try
         {
-            try { await RunCycleAsync(stoppingToken); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "MLCausalFeatureWorker cycle failed"); }
+            try
+            {
+                var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName);
+                if (initialDelay > TimeSpan.Zero)
+                    await Task.Delay(initialDelay, _timeProvider, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
 
-            await Task.Delay(_interval, stoppingToken);
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                long cycleStarted = Stopwatch.GetTimestamp();
+
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+                    var result = await RunCycleAsync(stoppingToken);
+                    currentDelay = result.Settings.PollInterval;
+
+                    long durationMs = (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.CandidateModelCount);
+                    _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                    _metrics?.WorkerCycleDurationMs.Record(
+                        durationMs,
+                        new KeyValuePair<string, object?>("worker", WorkerName));
+                    _metrics?.MLCausalFeatureCycleDurationMs.Record(durationMs);
+
+                    if (result.SkippedReason is { Length: > 0 })
+                    {
+                        _logger.LogDebug(
+                            "{Worker}: cycle skipped ({Reason}).",
+                            WorkerName,
+                            result.SkippedReason);
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "{Worker}: candidates={Candidates}, evaluated={Evaluated}, skipped={Skipped}, failed={Failed}, auditsWritten={AuditsWritten}, causalFeatures={CausalFeatures}, preservedMasks={PreservedMasks}, regressionAlerts={RegressionAlerts}, staleMonitoringAlerts={StaleAlerts}, alertBackpressureSkipped={AlertBackpressureSkipped}.",
+                            WorkerName,
+                            result.CandidateModelCount,
+                            result.EvaluatedModelCount,
+                            result.SkippedModelCount,
+                            result.FailedModelCount,
+                            result.AuditsWrittenCount,
+                            result.CausalFeatureCount,
+                            result.PreservedMaskCount,
+                            result.RegressionAlertCount,
+                            result.StaleMonitoringAlertCount,
+                            result.AlertBackpressureSkippedCount);
+                    }
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _logger.LogInformation(
+                            "{Worker}: recovered after {Failures} consecutive failure(s).",
+                            WorkerName,
+                            _consecutiveFailures);
+                    }
+
+                    _consecutiveFailures = 0;
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _metrics?.WorkerErrors.Add(
+                        1,
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("reason", "ml_causal_feature_cycle"));
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                try
+                {
+                    await Task.Delay(CalculateDelay(currentDelay, _consecutiveFailures), _timeProvider, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopped.", WorkerName);
         }
     }
 
-    /// <summary>
-    /// Single cycle logic: resolves scoped DbContexts and runs <see cref="AuditModelAsync"/>
-    /// for each active ML model.
-    /// </summary>
-    /// <param name="ct">Cancellation token.</param>
-    private async Task RunCycleAsync(CancellationToken ct)
+    internal async Task<MLCausalFeatureCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        using var scope  = _scopeFactory.CreateScope();
-        var readCtx      = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var writeCtx     = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var readDb       = readCtx.GetDbContext();
-        var writeDb      = writeCtx.GetDbContext();
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var serviceProvider = scope.ServiceProvider;
+        var writeContext = serviceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var db = writeContext.GetDbContext();
+        var settings = await LoadSettingsAsync(db, ct);
 
-        var activeModels = await readDb.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted)
-            .ToListAsync(ct);
-
-        foreach (var model in activeModels)
+        if (!settings.Enabled)
         {
-            await AuditModelAsync(model, readDb, writeDb, ct);
+            _metrics?.MLCausalFeatureCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "disabled"));
+            return MLCausalFeatureCycleResult.Skipped(settings, "disabled");
+        }
+
+        if (_distributedLock is null)
+        {
+            _metrics?.MLCausalFeatureLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "unavailable"));
+
+            if (!_missingDistributedLockWarningEmitted)
+            {
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate causal-feature cycles are possible in multi-instance deployments.",
+                    WorkerName);
+                _missingDistributedLockWarningEmitted = true;
+            }
+        }
+        else
+        {
+            var cycleLock = await _distributedLock.TryAcquireAsync(
+                DistributedLockKey,
+                TimeSpan.FromSeconds(settings.LockTimeoutSeconds),
+                ct);
+
+            if (cycleLock is null)
+            {
+                _metrics?.MLCausalFeatureLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "busy"));
+                _metrics?.MLCausalFeatureCyclesSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "lock_busy"));
+                return MLCausalFeatureCycleResult.Skipped(settings, "lock_busy");
+            }
+
+            _metrics?.MLCausalFeatureLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "acquired"));
+
+            await using (cycleLock)
+            {
+                await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+                try
+                {
+                    return await RunCycleCoreAsync(serviceProvider, writeContext, db, settings, ct);
+                }
+                finally
+                {
+                    WorkerBulkhead.MLMonitoring.Release();
+                }
+            }
+        }
+
+        await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+        try
+        {
+            return await RunCycleCoreAsync(serviceProvider, writeContext, db, settings, ct);
+        }
+        finally
+        {
+            WorkerBulkhead.MLMonitoring.Release();
         }
     }
 
-    /// <summary>
-    /// Performs the full Granger causality audit for a single ML model.
-    /// Soft-deletes previous audit rows before inserting a fresh set so the table always
-    /// contains exactly one row per (model, feature) pair reflecting the latest computation.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// The "return series" (the y variable in the Granger test) is derived from
-    /// <c>MLModelPredictionLog.ActualMagnitudePips</c> — the realised price move magnitude
-    /// for predictions that have been resolved. This makes the test data-driven from actual
-    /// live trading outcomes rather than in-sample candle data.
-    /// </para>
-    /// <para>
-    /// Feature series (x variables) are reconstructed from candle data using the same
-    /// <see cref="MLFeatureHelper.BuildTrainingSamples"/> pipeline used at training time,
-    /// ensuring consistency between training-time and audit-time feature values.
-    /// </para>
-    /// </remarks>
-    /// <param name="model">The active ML model to audit.</param>
-    /// <param name="readDb">Read DbContext.</param>
-    /// <param name="writeDb">Write DbContext.</param>
-    /// <param name="ct">Cancellation token.</param>
-    private async Task AuditModelAsync(
-        MLModel model,
-        Microsoft.EntityFrameworkCore.DbContext readDb,
-        Microsoft.EntityFrameworkCore.DbContext writeDb,
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+        {
+            return baseInterval <= TimeSpan.Zero
+                ? TimeSpan.FromSeconds(DefaultPollSeconds)
+                : baseInterval;
+        }
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private async Task<MLCausalFeatureCycleResult> RunCycleCoreAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        MLCausalFeatureWorkerSettings settings,
         CancellationToken ct)
     {
-        // Load recent resolved prediction logs for the return series (y variable).
-        // ActualMagnitudePips must be non-null, meaning the trade has been closed/resolved.
-        var logs = await readDb.Set<MLModelPredictionLog>()
-            .Where(p => p.MLModelId == model.Id
-                     && p.ActualMagnitudePips != null
-                     && !p.IsDeleted)
-            .OrderByDescending(p => p.PredictedAt)
-            .Take(SeriesLength)
-            .Select(p => (double)(p.ActualMagnitudePips ?? 0))
+        var models = await db.Set<MLModel>()
+            .AsNoTracking()
+            .Where(model =>
+                model.IsActive &&
+                !model.IsDeleted &&
+                !model.IsMetaLearner &&
+                !model.IsMamlInitializer &&
+                model.ModelBytes != null)
+            .OrderBy(model => model.Symbol)
+            .ThenBy(model => model.Timeframe)
+            .ThenByDescending(model => model.TrainedAt)
+            .Take(settings.MaxModelsPerCycle)
+            .Select(model => new ActiveModelCandidate(
+                model.Id,
+                model.Symbol,
+                model.Timeframe,
+                model.ModelBytes!))
             .ToListAsync(ct);
 
-        if (logs.Count < 50)
+        _healthMonitor?.RecordBacklogDepth(WorkerName, models.Count);
+
+        if (models.Count == 0)
         {
-            // Insufficient resolved outcomes — the model may be too new or live trading
-            // has not produced enough completed trades yet.
-            _logger.LogDebug("Skipping Granger test for model {Id} — only {N} resolved logs", model.Id, logs.Count);
-            return;
+            _metrics?.MLCausalFeatureCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "no_active_models"));
+            return MLCausalFeatureCycleResult.Skipped(settings, "no_active_models");
         }
 
-        // Load candles for feature reconstruction.
-        // Extra candles (LookbackWindow + 5) are needed to warm up the indicator pipeline
-        // before the first valid feature vector can be computed.
-        var candles = await readDb.Set<Candle>()
-            .Where(c => c.Symbol    == model.Symbol
-                     && c.Timeframe == model.Timeframe
-                     && !c.IsDeleted)
-            .OrderByDescending(c => c.Timestamp)
-            .Take(SeriesLength + MLFeatureHelper.LookbackWindow + 5)
-            .OrderBy(c => c.Timestamp)
-            .ToListAsync(ct);
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var logsByModelId = await BatchLoadResolvedLogsAsync(db, models, settings, nowUtc, ct);
+        var perModelEngineConfig = await BatchLoadPerModelEngineConfigAsync(db, models, ct);
+        var activeStaleAlertIds = await BatchLoadActiveAlertModelIdsAsync(
+            db, models, StaleMonitoringDeduplicationPrefix, ct);
+        var activeRegressionAlertIds = await BatchLoadActiveAlertModelIdsAsync(
+            db, models, RegressionDeduplicationPrefix, ct);
 
-        if (candles.Count < MLFeatureHelper.LookbackWindow + 2) return;
-
-        var samples = MLFeatureHelper.BuildTrainingSamples(candles);
-        if (samples.Count < 50) return;
-
-        // Soft-delete existing audits for this model before replacing with fresh results.
-        // Using soft-delete preserves audit history for compliance while keeping the
-        // "active" view clean (IsDeleted = false → current cycle only).
-        var existing = await writeDb.Set<MLCausalFeatureAudit>()
-            .Where(a => a.MLModelId == model.Id && !a.IsDeleted)
-            .ToListAsync(ct);
-
-        foreach (var a in existing) a.IsDeleted = true;
-
-        // Use the realised price return magnitude as the y series.
-        // Magnitude is used rather than direction because Granger causality is a continuous
-        // time-series test and magnitude provides richer variance than a binary label.
-        var returnSeries = samples.Select(s => (double)s.Magnitude).ToArray();
-
-        for (int fi = 0; fi < MLFeatureHelper.FeatureCount; fi++)
+        var cycleCtx = new CycleContext
         {
-            var featureSeries = samples.Select(s => (double)s.Features[fi]).ToArray();
+            LogsByModelId = logsByModelId,
+            SkipStreaksByModelId = perModelEngineConfig.SkipStreaks,
+            PriorCausalRatioByModelId = perModelEngineConfig.CausalRatios,
+            PriorCausalCountByModelId = perModelEngineConfig.CausalCounts,
+            ActiveStaleAlertModelIds = activeStaleAlertIds,
+            ActiveRegressionAlertModelIds = activeRegressionAlertIds,
+            AlertBudget = new AlertBudget(settings.MaxAlertsPerCycle),
+        };
 
-            // Select the optimal lag order using AIC before running the F-test.
-            // This avoids the bias of using a fixed lag and adapts to each feature's
-            // autocorrelation structure.
-            int bestLag   = SelectLagByAic(returnSeries, featureSeries, MaxLag);
-            var (fStat, pValue) = GrangerFTest(returnSeries, featureSeries, bestLag);
+        int evaluatedModels = 0;
+        int skippedModels = 0;
+        int failedModels = 0;
+        int auditsWritten = 0;
+        int causalFeatures = 0;
+        int preservedMasks = 0;
+        int regressionAlerts = 0;
+        int staleAlerts = 0;
+        int backpressureSkipped = 0;
 
-            writeDb.Set<MLCausalFeatureAudit>().Add(new MLCausalFeatureAudit
+        foreach (var model in models)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
             {
-                MLModelId           = model.Id,
-                Symbol              = model.Symbol,
-                Timeframe           = model.Timeframe,
-                FeatureIndex        = fi,
-                FeatureName         = fi < MLFeatureHelper.FeatureNames.Length
-                                      ? MLFeatureHelper.FeatureNames[fi] : $"Feature_{fi}",
-                GrangerFStat        = (decimal)fStat,
-                GrangerPValue       = (decimal)pValue,
-                LagOrder            = bestLag,
-                // IsCausal = true when p-value is below the significance threshold (0.05).
-                // This means there is less than a 5% chance of observing this F-statistic
-                // if X has no Granger-causal relationship with Y.
-                IsCausal            = pValue < PValueThreshold,
-                // Masking is a separate manual/operator-approval step — this worker only diagnoses.
-                IsMaskedForTraining = false,
-                ComputedAt          = DateTime.UtcNow
-            });
+                var outcome = await AuditModelAsync(
+                    serviceProvider, writeContext, db, model, settings, cycleCtx, nowUtc, ct);
+
+                if (!outcome.Evaluated)
+                {
+                    skippedModels++;
+                    if (outcome.StaleMonitoringAlertDispatched) staleAlerts++;
+                    if (outcome.AlertBackpressureSkipped) backpressureSkipped++;
+                    _metrics?.MLCausalFeatureModelsSkipped.Add(
+                        1,
+                        new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
+                        new KeyValuePair<string, object?>("symbol", model.Symbol),
+                        new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                    continue;
+                }
+
+                evaluatedModels++;
+                auditsWritten += outcome.AuditsWritten;
+                causalFeatures += outcome.CausalFeatures;
+                preservedMasks += outcome.PreservedMasks;
+                if (outcome.RegressionAlertDispatched) regressionAlerts++;
+                if (outcome.AlertBackpressureSkipped) backpressureSkipped++;
+
+                _metrics?.MLCausalFeatureModelsEvaluated.Add(
+                    1,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                _metrics?.MLCausalFeatureAuditsWritten.Add(
+                    outcome.AuditsWritten,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                _metrics?.MLCausalFeatureResolvedSamples.Record(
+                    outcome.SamplesUsed,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                _metrics?.MLCausalFeatureCausalFeatures.Record(
+                    outcome.CausalFeatures,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failedModels++;
+                _metrics?.WorkerErrors.Add(
+                    1,
+                    new KeyValuePair<string, object?>("worker", WorkerName),
+                    new KeyValuePair<string, object?>("reason", "ml_causal_feature_model"));
+                _logger.LogWarning(
+                    ex,
+                    "{Worker}: failed to audit model {ModelId} ({Symbol}/{Timeframe}); continuing.",
+                    WorkerName,
+                    model.Id,
+                    model.Symbol,
+                    model.Timeframe);
+            }
         }
 
-        await writeDb.SaveChangesAsync(ct);
+        return new MLCausalFeatureCycleResult(
+            settings,
+            SkippedReason: null,
+            CandidateModelCount: models.Count,
+            EvaluatedModelCount: evaluatedModels,
+            SkippedModelCount: skippedModels,
+            FailedModelCount: failedModels,
+            AuditsWrittenCount: auditsWritten,
+            CausalFeatureCount: causalFeatures,
+            PreservedMaskCount: preservedMasks,
+            RegressionAlertCount: regressionAlerts,
+            StaleMonitoringAlertCount: staleAlerts,
+            AlertBackpressureSkippedCount: backpressureSkipped);
+    }
+
+    private static async Task<Dictionary<long, List<PredictionFeatureLog>>> BatchLoadResolvedLogsAsync(
+        DbContext db,
+        IReadOnlyList<ActiveModelCandidate> models,
+        MLCausalFeatureWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var modelIds = models.Select(model => model.Id).ToList();
+        var lookbackCutoff = nowUtc.AddDays(-settings.WindowDays);
+
+        var rows = await db.Set<MLModelPredictionLog>()
+            .AsNoTracking()
+            .Where(log =>
+                modelIds.Contains(log.MLModelId) &&
+                !log.IsDeleted &&
+                log.RawFeaturesJson != null &&
+                log.ActualMagnitudePips != null &&
+                log.OutcomeRecordedAt != null &&
+                log.OutcomeRecordedAt >= lookbackCutoff)
+            .Select(log => new PredictionFeatureLog(
+                log.Id,
+                log.MLModelId,
+                log.PredictedAt,
+                log.OutcomeRecordedAt!.Value,
+                log.ActualMagnitudePips!.Value,
+                log.RawFeaturesJson!))
+            .ToListAsync(ct);
+
+        var byModel = new Dictionary<long, List<PredictionFeatureLog>>();
+        foreach (var row in rows)
+        {
+            if (!byModel.TryGetValue(row.MLModelId, out var bucket))
+            {
+                bucket = [];
+                byModel[row.MLModelId] = bucket;
+            }
+            bucket.Add(row);
+        }
+
+        foreach (var bucket in byModel.Values)
+        {
+            bucket.Sort((a, b) =>
+            {
+                int cmp = b.OutcomeRecordedAt.CompareTo(a.OutcomeRecordedAt);
+                return cmp != 0 ? cmp : b.Id.CompareTo(a.Id);
+            });
+            if (bucket.Count > settings.MaxLogsPerModel)
+                bucket.RemoveRange(settings.MaxLogsPerModel, bucket.Count - settings.MaxLogsPerModel);
+        }
+
+        return byModel;
+    }
+
+    private readonly record struct PerModelEngineConfig(
+        Dictionary<long, int> SkipStreaks,
+        Dictionary<long, double> CausalRatios,
+        Dictionary<long, int> CausalCounts);
+
+    private static async Task<PerModelEngineConfig> BatchLoadPerModelEngineConfigAsync(
+        DbContext db,
+        IReadOnlyList<ActiveModelCandidate> models,
+        CancellationToken ct)
+    {
+        var keys = new List<string>(models.Count * 3);
+        foreach (var model in models)
+        {
+            keys.Add(SkipStreakKey(model.Id));
+            keys.Add(CausalRatioKey(model.Id));
+            keys.Add(CausalCountKey(model.Id));
+        }
+
+        var rows = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .IgnoreQueryFilters()
+            .Where(config => keys.Contains(config.Key))
+            .Select(config => new { config.Key, config.Value })
+            .ToListAsync(ct);
+
+        var skipStreaks = new Dictionary<long, int>();
+        var causalRatios = new Dictionary<long, double>();
+        var causalCounts = new Dictionary<long, int>();
+
+        foreach (var row in rows)
+        {
+            if (TryParseModelIdFromConfigKey(row.Key, ":ConsecutiveSkips", out var skipModelId)
+                && int.TryParse(row.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var skip))
+            {
+                skipStreaks[skipModelId] = skip;
+            }
+            else if (TryParseModelIdFromConfigKey(row.Key, ":CausalRatio", out var ratioModelId)
+                && double.TryParse(row.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var ratio)
+                && double.IsFinite(ratio))
+            {
+                causalRatios[ratioModelId] = ratio;
+            }
+            else if (TryParseModelIdFromConfigKey(row.Key, ":CausalCount", out var countModelId)
+                && int.TryParse(row.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count))
+            {
+                causalCounts[countModelId] = count;
+            }
+        }
+
+        return new PerModelEngineConfig(skipStreaks, causalRatios, causalCounts);
+    }
+
+    private static async Task<HashSet<long>> BatchLoadActiveAlertModelIdsAsync(
+        DbContext db,
+        IReadOnlyList<ActiveModelCandidate> models,
+        string deduplicationPrefix,
+        CancellationToken ct)
+    {
+        var dedupKeys = models
+            .Select(model => deduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture))
+            .ToList();
+
+        var rows = await db.Set<Alert>()
+            .AsNoTracking()
+            .Where(alert => !alert.IsDeleted
+                         && alert.IsActive
+                         && alert.DeduplicationKey != null
+                         && dedupKeys.Contains(alert.DeduplicationKey))
+            .Select(alert => alert.DeduplicationKey!)
+            .ToListAsync(ct);
+
+        var modelIds = new HashSet<long>();
+        foreach (var key in rows)
+        {
+            if (key.Length <= deduplicationPrefix.Length)
+                continue;
+            var span = key.AsSpan(deduplicationPrefix.Length);
+            if (long.TryParse(span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id))
+                modelIds.Add(id);
+        }
+        return modelIds;
+    }
+
+    private async Task<ModelAuditOutcome> AuditModelAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        MLCausalFeatureWorkerSettings settings,
+        CycleContext cycleCtx,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var snapshot = TryDeserializeSnapshot(model.ModelBytes);
+        if (snapshot is null)
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, cycleCtx, "snapshot_deserialize_failed", nowUtc, ct);
+
+        int auditedFeatureCount = ResolveAuditedFeatureCount(snapshot);
+        if (auditedFeatureCount < 1 || auditedFeatureCount > MLFeatureHelper.MaxAllowedFeatureCount)
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, cycleCtx, "unsupported_feature_schema", nowUtc, ct);
+
+        string[] featureNames = ResolveFeatureNames(snapshot, auditedFeatureCount);
+        if (featureNames.Length < auditedFeatureCount)
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, cycleCtx, "feature_names_unavailable", nowUtc, ct);
+
+        cycleCtx.LogsByModelId.TryGetValue(model.Id, out var resolvedLogs);
+        if (resolvedLogs is null || resolvedLogs.Count < settings.MinSamples)
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, cycleCtx, "insufficient_resolved_logs", nowUtc, ct);
+
+        var parsed = BuildObservationSet(resolvedLogs, auditedFeatureCount);
+        if (parsed.Observations.Count < settings.MinSamples)
+        {
+            _logger.LogDebug(
+                "{Worker}: skipping model {ModelId} ({Symbol}/{Timeframe}) due to insufficient usable causal rows. usable={Usable}, malformed={Malformed}, wrongShape={WrongShape}, nonFinite={NonFinite}.",
+                WorkerName,
+                model.Id,
+                model.Symbol,
+                model.Timeframe,
+                parsed.Observations.Count,
+                parsed.Malformed,
+                parsed.WrongShape,
+                parsed.NonFinite);
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, cycleCtx, "insufficient_usable_feature_rows", nowUtc, ct);
+        }
+
+        // Sort by predicted-event time so the F-test interprets lag in the model's own
+        // event-stream order. Note: lag here is array-index lag (1 = previous prediction),
+        // not clock-time lag. For irregularly sampled streams the two diverge; the audit
+        // result remains the right "does this feature improve the next event's prediction"
+        // signal even though it isn't a calendar-time test.
+        parsed.Observations.Sort(static (left, right) =>
+        {
+            int predictedCompare = left.PredictedAt.CompareTo(right.PredictedAt);
+            if (predictedCompare != 0)
+                return predictedCompare;
+            return left.OutcomeRecordedAt.CompareTo(right.OutcomeRecordedAt);
+        });
+
+        double[] realisedReturns = parsed.Observations.Select(o => o.RealisedReturn).ToArray();
+        if (realisedReturns.Length < settings.MinSamples)
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, cycleCtx, "insufficient_realised_returns", nowUtc, ct);
+
+        // Compute per-feature F-stat and raw p-value; defer the IsCausal decision until
+        // after Benjamini-Hochberg correction across the full feature set.
+        var perFeature = new (double FStat, double PValue, int Lag)[auditedFeatureCount];
+        for (int featureIndex = 0; featureIndex < auditedFeatureCount; featureIndex++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            double[] featureSeries = new double[parsed.Observations.Count];
+            for (int row = 0; row < parsed.Observations.Count; row++)
+                featureSeries[row] = parsed.Observations[row].Features[featureIndex];
+
+            int bestLag = SelectLagByAic(realisedReturns, featureSeries, settings.MaxLag);
+            var (fStat, pValue) = GrangerFTest(realisedReturns, featureSeries, bestLag);
+            perFeature[featureIndex] = (fStat, pValue, bestLag);
+        }
+
+        bool[] isCausal = ApplyBenjaminiHochberg(
+            perFeature.Select(x => x.PValue).ToArray(), settings.FdrAlpha);
+
+        // Existing audits keyed by (MLModelId, FeatureIndex). Tracked because we'll mutate
+        // them in place.
+        var existingAudits = await db.Set<MLCausalFeatureAudit>()
+            .Where(audit => audit.MLModelId == model.Id && !audit.IsDeleted)
+            .ToListAsync(ct);
+        var existingByIndex = existingAudits.ToDictionary(audit => audit.FeatureIndex);
+        var auditSet = db.Set<MLCausalFeatureAudit>();
+
+        int causalCount = 0;
+        int preservedMasks = 0;
+
+        for (int featureIndex = 0; featureIndex < auditedFeatureCount; featureIndex++)
+        {
+            var (fStat, pValue, bestLag) = perFeature[featureIndex];
+            bool causal = isCausal[featureIndex];
+            if (causal) causalCount++;
+
+            if (existingByIndex.TryGetValue(featureIndex, out var existing))
+            {
+                bool maskPreserved = existing.IsMaskedForTraining;
+                if (maskPreserved) preservedMasks++;
+
+                existing.FeatureName = featureNames[featureIndex];
+                existing.GrangerFStat = (decimal)fStat;
+                existing.GrangerPValue = (decimal)pValue;
+                existing.LagOrder = bestLag;
+                existing.IsCausal = causal;
+                existing.ComputedAt = nowUtc;
+                existing.IsDeleted = false;
+                existingByIndex.Remove(featureIndex);
+            }
+            else
+            {
+                auditSet.Add(new MLCausalFeatureAudit
+                {
+                    MLModelId = model.Id,
+                    Symbol = model.Symbol,
+                    Timeframe = model.Timeframe,
+                    FeatureIndex = featureIndex,
+                    FeatureName = featureNames[featureIndex],
+                    GrangerFStat = (decimal)fStat,
+                    GrangerPValue = (decimal)pValue,
+                    LagOrder = bestLag,
+                    IsCausal = causal,
+                    IsMaskedForTraining = false,
+                    ComputedAt = nowUtc,
+                    IsDeleted = false
+                });
+            }
+        }
+
+        // Indices that were audited last cycle but no longer fit the schema (e.g. the
+        // feature set shrank). Soft-delete them so the table doesn't carry stale rows.
+        foreach (var staleAudit in existingByIndex.Values)
+            staleAudit.IsDeleted = true;
+
+        // Persist the new causal-ratio + skip-streak reset alongside the audits in one
+        // commit so dashboards never observe a half-updated state.
+        double newRatio = auditedFeatureCount > 0 ? (double)causalCount / auditedFeatureCount : 0.0;
+        await EngineConfigUpsert.BatchUpsertAsync(
+            db,
+            new List<EngineConfigUpsertSpec>
+            {
+                new(SkipStreakKey(model.Id), "0", ConfigDataType.Int,
+                    "Consecutive cycles in which the causal-feature worker could not evaluate this model.",
+                    false),
+                new(CausalRatioKey(model.Id),
+                    newRatio.ToString("F4", CultureInfo.InvariantCulture),
+                    ConfigDataType.Decimal,
+                    "Latest causal-feature ratio (BH-FDR corrected) for this model.",
+                    false),
+                new(CausalCountKey(model.Id),
+                    causalCount.ToString(CultureInfo.InvariantCulture),
+                    ConfigDataType.Int,
+                    "Latest causal-feature count (BH-FDR corrected) for this model.",
+                    false),
+                new($"MLCausal:Model:{model.Id}:LastEvaluatedAt",
+                    nowUtc.ToString("O", CultureInfo.InvariantCulture),
+                    ConfigDataType.String,
+                    "UTC timestamp of the latest MLCausalFeatureWorker evaluation for this model.",
+                    false),
+            },
+            ct);
+
+        await writeContext.SaveChangesAsync(ct);
+
+        // Resolve any active stale-monitoring alert on successful evaluation.
+        if (cycleCtx.ActiveStaleAlertModelIds.Contains(model.Id))
+        {
+            var resolved = await ResolveAlertAsync(
+                serviceProvider, writeContext, db, model, StaleMonitoringDeduplicationPrefix, nowUtc, ct);
+            if (resolved)
+                cycleCtx.ActiveStaleAlertModelIds.Remove(model.Id);
+        }
+
+        // Regression detection: fire when prior evaluation reported a non-trivial number of
+        // causal features and the new ratio dropped by more than RegressionThreshold.
+        bool regressionAlertDispatched = false;
+        bool alertBackpressureSkipped = false;
+        if (cycleCtx.PriorCausalRatioByModelId.TryGetValue(model.Id, out var priorRatio)
+            && cycleCtx.PriorCausalCountByModelId.TryGetValue(model.Id, out var priorCausalCount)
+            && priorCausalCount >= settings.MinPriorCausalForRegression
+            && priorRatio > 0
+            && newRatio < priorRatio * (1.0 - settings.RegressionThreshold))
+        {
+            if (cycleCtx.AlertBudget.HasCapacity)
+            {
+                cycleCtx.AlertBudget.TryConsume();
+                regressionAlertDispatched = await UpsertAndDispatchRegressionAlertAsync(
+                    serviceProvider, writeContext, db, model, settings,
+                    priorRatio, newRatio, priorCausalCount, causalCount, nowUtc, ct);
+                if (regressionAlertDispatched)
+                    cycleCtx.ActiveRegressionAlertModelIds.Add(model.Id);
+            }
+            else
+            {
+                alertBackpressureSkipped = true;
+            }
+        }
+        else if (cycleCtx.ActiveRegressionAlertModelIds.Contains(model.Id))
+        {
+            // Causal ratio recovered; auto-resolve the active regression alert.
+            var resolved = await ResolveAlertAsync(
+                serviceProvider, writeContext, db, model, RegressionDeduplicationPrefix, nowUtc, ct);
+            if (resolved)
+                cycleCtx.ActiveRegressionAlertModelIds.Remove(model.Id);
+        }
 
         _logger.LogInformation(
-            "Granger audit complete for model {Id} ({Symbol}/{Timeframe}): {Causal}/{Total} causal features",
-            model.Id, model.Symbol, model.Timeframe,
-            samples.Count > 0 ? "?" : "0", MLFeatureHelper.FeatureCount);
+            "{Worker}: model {ModelId} ({Symbol}/{Timeframe}) audited {Features} features from {Samples} resolved live rows; causal={Causal} ({Ratio:P1}), preservedMasks={PreservedMasks}, regression={Regression}.",
+            WorkerName,
+            model.Id,
+            model.Symbol,
+            model.Timeframe,
+            auditedFeatureCount,
+            parsed.Observations.Count,
+            causalCount,
+            newRatio,
+            preservedMasks,
+            regressionAlertDispatched);
+
+        return new ModelAuditOutcome(
+            Evaluated: true,
+            SamplesUsed: parsed.Observations.Count,
+            AuditsWritten: auditedFeatureCount,
+            CausalFeatures: causalCount,
+            PreservedMasks: preservedMasks,
+            RegressionAlertDispatched: regressionAlertDispatched,
+            StaleMonitoringAlertDispatched: false,
+            AlertBackpressureSkipped: alertBackpressureSkipped,
+            SkipReason: null);
     }
 
-    // ── Granger F-test ────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Bivariate Granger F-test. Returns (F-statistic, approximate p-value).
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Compares two OLS regression models:
-    /// <list type="bullet">
-    ///   <item><b>Restricted (AR-only):</b> y_t ~ intercept + y_{t-1..p}</item>
-    ///   <item><b>Unrestricted:</b>         y_t ~ intercept + y_{t-1..p} + x_{t-1..p}</item>
-    /// </list>
-    /// F-statistic: F = ((RSS_R − RSS_U) / lag) / (RSS_U / (n − 2×lag − 1))
-    /// where lag = p, n = usable observations.
-    /// </para>
-    /// <para>
-    /// The p-value is approximated via the Wilson-Hilferty transform: the F(d1, d2)
-    /// distribution is converted to a chi-squared approximation, then to a standard
-    /// normal Z-score, and finally to a one-tailed probability using <see cref="NormalCdf"/>.
-    /// This approximation is accurate to within ±0.01 for the parameter ranges seen here.
-    /// </para>
-    /// Returns (0, 1.0) — i.e. no evidence of causality — for degenerate inputs
-    /// (too few observations, zero RSS).
-    /// </remarks>
-    /// <param name="y">Return/magnitude series (dependent variable).</param>
-    /// <param name="x">Feature series (candidate Granger-causing variable).</param>
-    /// <param name="lag">Lag order p selected by AIC.</param>
-    /// <returns>Tuple of (F-statistic, p-value) where low p-value indicates Granger causality.</returns>
-    private static (double fStat, double pValue) GrangerFTest(double[] y, double[] x, int lag)
+    private async Task<ModelAuditOutcome> HandleSkipAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        MLCausalFeatureWorkerSettings settings,
+        CycleContext cycleCtx,
+        string skipReason,
+        DateTime nowUtc,
+        CancellationToken ct)
     {
-        int n = Math.Min(y.Length, x.Length) - lag;
-        if (n <= 2 * lag + 1) return (0, 1);
+        int newStreak = cycleCtx.SkipStreaksByModelId.GetValueOrDefault(model.Id) + 1;
+        cycleCtx.SkipStreaksByModelId[model.Id] = newStreak;
 
-        // Compute RSS for both restricted and unrestricted models.
-        double rssR = ComputeRss(y, x, lag, includeX: false);
-        double rssU = ComputeRss(y, x, lag, includeX: true);
-
-        if (rssR <= 0 || rssU <= 0) return (0, 1);
-
-        // F = ((RSS_R - RSS_U) / q) / (RSS_U / df_U)
-        // where q = lag (number of restricted coefficients) and df_U = n - 2*lag - 1.
-        double fStat = ((rssR - rssU) / lag) / (rssU / (n - 2 * lag - 1));
-        fStat = Math.Max(fStat, 0); // Guard against floating-point negatives near zero.
-
-        // Approximate p-value via Wilson-Hilferty transform on F(d1=lag, d2=n-2*lag-1).
-        // The transform converts F to a chi-squared variate then to a normal Z-score.
-        double d1 = lag, d2 = n - 2 * lag - 1;
-        if (d2 <= 0) return (fStat, 1.0);
-
-        // Wilson-Hilferty: chi2 ≈ d1 * F * (1 - 2/(9*d1)) / sqrt(2/(9*d1))
-        double x2   = fStat * d1;
-        double chi2  = x2 * (1 - 2.0 / (9 * d1)) / Math.Sqrt(2.0 / (9 * d1));
-        double pValue = 1.0 - NormalCdf(chi2);
-
-        return (fStat, Math.Clamp(pValue, 0, 1));
-    }
-
-    /// <summary>
-    /// Computes the residual sum of squares (RSS) for an AR(p) or AR+X(p) regression
-    /// of <paramref name="y"/> on its own lags and (optionally) lagged <paramref name="x"/>.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Design matrix layout (columns):
-    /// [0] = intercept (1.0)
-    /// [1..lag] = y_{t-1} .. y_{t-lag}
-    /// [lag+1..2*lag] = x_{t-1} .. x_{t-lag}  (only when includeX = true)
-    /// </para>
-    /// <para>
-    /// OLS coefficients are solved via <see cref="OlsSolve"/> (normal equations with
-    /// ridge regularisation). RSS is then computed as Σ (y_i − ŷ_i)².
-    /// </para>
-    /// </remarks>
-    /// <param name="y">Dependent variable series.</param>
-    /// <param name="x">Independent feature series.</param>
-    /// <param name="lag">Number of lags to include.</param>
-    /// <param name="includeX">Whether to add lagged x columns to the design matrix.</param>
-    /// <returns>Residual sum of squares; returns <see cref="double.MaxValue"/> on degenerate input.</returns>
-    private static double ComputeRss(double[] y, double[] x, int lag, bool includeX)
-    {
-        int n = Math.Min(y.Length, x.Length) - lag;
-        if (n <= 0) return double.MaxValue;
-
-        // Build design matrix [1, y_lag1..lagP, (x_lag1..lagP if includeX)]
-        int cols = 1 + lag + (includeX ? lag : 0);
-        double[,] X = new double[n, cols];
-        double[]  Y = new double[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            int t = i + lag;
-            Y[i]    = y[t];
-            X[i, 0] = 1; // intercept column
-            for (int l = 1; l <= lag; l++)
-                X[i, l] = y[t - l];            // lagged y terms
-            if (includeX)
-                for (int l = 1; l <= lag; l++)
-                    X[i, lag + l] = x[t - l];  // lagged x terms (unrestricted model only)
-        }
-
-        var beta = OlsSolve(X, Y, n, cols);
-        double rss = 0;
-        for (int i = 0; i < n; i++)
-        {
-            double pred = 0;
-            for (int j = 0; j < cols; j++) pred += X[i, j] * beta[j];
-            double res = Y[i] - pred;
-            rss += res * res;
-        }
-        return rss;
-    }
-
-    /// <summary>
-    /// Solves the OLS normal equations (X'X)β = X'y using Gauss-Jordan elimination
-    /// with ridge regularisation (λ = 1e-6) for numerical stability.
-    /// </summary>
-    /// <remarks>
-    /// The design matrices are small (at most 1 + 2×MaxLag = 21 columns), so direct
-    /// Gauss-Jordan elimination is fast and avoids the overhead of a full SVD or QR
-    /// decomposition. Ridge regularisation prevents numerical singularities when
-    /// features are highly collinear.
-    /// </remarks>
-    /// <param name="X">Design matrix, shape [n, cols].</param>
-    /// <param name="y">Response vector, length n.</param>
-    /// <param name="n">Number of observations.</param>
-    /// <param name="cols">Number of columns (parameters).</param>
-    /// <returns>OLS coefficient vector β, length cols.</returns>
-    private static double[] OlsSolve(double[,] X, double[] y, int n, int cols)
-    {
-        // Normal equations: (X'X)β = X'y — small enough for direct solve
-        var xtx = new double[cols, cols];
-        var xty = new double[cols];
-
-        for (int i = 0; i < n; i++)
-        {
-            for (int j = 0; j < cols; j++)
+        await EngineConfigUpsert.BatchUpsertAsync(
+            db,
+            new List<EngineConfigUpsertSpec>
             {
-                xty[j] += X[i, j] * y[i];
-                for (int k = 0; k < cols; k++)
-                    xtx[j, k] += X[i, j] * X[i, k];
+                new(SkipStreakKey(model.Id),
+                    newStreak.ToString(CultureInfo.InvariantCulture),
+                    ConfigDataType.Int,
+                    "Consecutive cycles in which the causal-feature worker could not evaluate this model.",
+                    false),
+                new($"MLCausal:Model:{model.Id}:LastSkipReason",
+                    skipReason,
+                    ConfigDataType.String,
+                    "Reason the causal-feature worker last skipped this model.",
+                    false),
+                new($"MLCausal:Model:{model.Id}:LastEvaluatedAt",
+                    nowUtc.ToString("O", CultureInfo.InvariantCulture),
+                    ConfigDataType.String,
+                    "UTC timestamp of the latest MLCausalFeatureWorker evaluation attempt for this model.",
+                    false),
+            },
+            ct);
+
+        bool staleAlertDispatched = false;
+        bool alertBackpressureSkipped = false;
+        if (newStreak >= settings.ConsecutiveSkipAlertThreshold)
+        {
+            if (cycleCtx.AlertBudget.HasCapacity)
+            {
+                cycleCtx.AlertBudget.TryConsume();
+                staleAlertDispatched = await UpsertAndDispatchStaleMonitoringAlertAsync(
+                    serviceProvider, writeContext, db, model, settings, skipReason, newStreak, nowUtc, ct);
+                if (staleAlertDispatched)
+                    cycleCtx.ActiveStaleAlertModelIds.Add(model.Id);
+            }
+            else
+            {
+                alertBackpressureSkipped = true;
             }
         }
 
-        // Ridge regularisation (λ = 1e-6) adds a small positive constant to the diagonal
-        // of X'X, preventing singularity when predictors are near-collinear.
-        for (int j = 0; j < cols; j++) xtx[j, j] += 1e-6;
-
-        return SolveLinear(xtx, xty, cols);
+        return ModelAuditOutcome.Skipped(skipReason, staleAlertDispatched, alertBackpressureSkipped);
     }
 
-    /// <summary>
-    /// Solves the linear system Ax = b using Gauss-Jordan elimination with partial pivoting.
-    /// </summary>
-    /// <remarks>
-    /// Partial pivoting (choosing the row with the largest absolute value in the current
-    /// column as the pivot) improves numerical stability compared to naive Gaussian
-    /// elimination, especially for near-singular systems after ridge regularisation.
-    /// </remarks>
-    /// <param name="A">Square coefficient matrix, shape [n, n].</param>
-    /// <param name="b">Right-hand side vector, length n.</param>
-    /// <param name="n">System size.</param>
-    /// <returns>Solution vector x such that A × x ≈ b.</returns>
-    private static double[] SolveLinear(double[,] A, double[] b, int n)
+    private async Task<bool> UpsertAndDispatchStaleMonitoringAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        MLCausalFeatureWorkerSettings settings,
+        string skipReason,
+        int consecutiveSkips,
+        DateTime nowUtc,
+        CancellationToken ct)
     {
-        var x = new double[n];
-        // Build augmented matrix [A | b]
-        var mat = new double[n, n + 1];
-        for (int i = 0; i < n; i++)
+        string deduplicationKey = StaleMonitoringDeduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture);
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(candidate => !candidate.IsDeleted
+                                           && candidate.IsActive
+                                           && candidate.DeduplicationKey == deduplicationKey, ct);
+
+        DateTime? previousTriggeredAt = alert?.LastTriggeredAt;
+        string conditionJson = Truncate(JsonSerializer.Serialize(new
         {
-            for (int j = 0; j < n; j++) mat[i, j] = A[i, j];
-            mat[i, n] = b[i];
+            detector = "MLCausalFeature",
+            reason = "stale_monitoring",
+            modelId = model.Id,
+            symbol = model.Symbol,
+            timeframe = model.Timeframe.ToString(),
+            consecutiveSkips,
+            lastSkipReason = skipReason,
+            consecutiveSkipAlertThreshold = settings.ConsecutiveSkipAlertThreshold,
+            evaluatedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture)
+        }), AlertConditionMaxLength);
+
+        if (alert is null)
+        {
+            alert = new Alert
+            {
+                AlertType = AlertType.MLMonitoringStale,
+                DeduplicationKey = deduplicationKey,
+                IsActive = true
+            };
+            db.Set<Alert>().Add(alert);
+        }
+        else
+        {
+            alert.AlertType = AlertType.MLMonitoringStale;
         }
 
-        // Gauss-Jordan elimination with partial column pivoting.
-        for (int col = 0; col < n; col++)
+        ApplyAlertFields(alert, model.Symbol, AlertSeverity.High, settings.AlertCooldownSeconds, conditionJson);
+
+        try
         {
-            // Find pivot row (largest absolute value in current column).
-            int pivot = col;
-            for (int row = col + 1; row < n; row++)
-                if (Math.Abs(mat[row, col]) > Math.Abs(mat[pivot, col])) pivot = row;
+            await writeContext.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (IsLikelyAlertDeduplicationRace(serviceProvider, ex))
+        {
+            DetachIfAdded(db, alert);
+            alert = await db.Set<Alert>()
+                .FirstAsync(candidate => !candidate.IsDeleted
+                                      && candidate.IsActive
+                                      && candidate.DeduplicationKey == deduplicationKey, ct);
+            previousTriggeredAt ??= alert.LastTriggeredAt;
+            alert.AlertType = AlertType.MLMonitoringStale;
+            ApplyAlertFields(alert, model.Symbol, AlertSeverity.High, settings.AlertCooldownSeconds, conditionJson);
+            await writeContext.SaveChangesAsync(ct);
+        }
 
-            // Swap current row with pivot row.
-            for (int j = 0; j <= n; j++) (mat[col, j], mat[pivot, j]) = (mat[pivot, j], mat[col, j]);
+        if (previousTriggeredAt.HasValue &&
+            nowUtc - NormalizeUtc(previousTriggeredAt.Value) < TimeSpan.FromSeconds(settings.AlertCooldownSeconds))
+        {
+            return false;
+        }
 
-            double div = mat[col, col];
-            if (Math.Abs(div) < 1e-12) continue; // Skip near-zero pivot (degenerate column).
+        string message = $"ML causal-feature monitoring stale for model {model.Id} ({model.Symbol}/{model.Timeframe}): {consecutiveSkips} consecutive skipped cycles ({skipReason}). The prediction-logging pipeline may be broken or the model is no longer being served.";
+        var dispatcher = serviceProvider.GetRequiredService<IAlertDispatcher>();
+        try
+        {
+            await dispatcher.DispatchAsync(alert, message, ct);
+            await writeContext.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to dispatch causal-feature stale-monitoring alert for model {ModelId}.",
+                WorkerName,
+                model.Id);
+            return false;
+        }
+    }
 
-            // Normalise pivot row.
-            for (int j = col; j <= n; j++) mat[col, j] /= div;
+    private async Task<bool> UpsertAndDispatchRegressionAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        MLCausalFeatureWorkerSettings settings,
+        double priorRatio,
+        double newRatio,
+        int priorCausalCount,
+        int newCausalCount,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string deduplicationKey = RegressionDeduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture);
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(candidate => !candidate.IsDeleted
+                                           && candidate.IsActive
+                                           && candidate.DeduplicationKey == deduplicationKey, ct);
 
-            // Eliminate col from all other rows.
-            for (int row = 0; row < n; row++)
+        DateTime? previousTriggeredAt = alert?.LastTriggeredAt;
+        string conditionJson = Truncate(JsonSerializer.Serialize(new
+        {
+            detector = "MLCausalFeature",
+            reason = "causal_ratio_regression",
+            modelId = model.Id,
+            symbol = model.Symbol,
+            timeframe = model.Timeframe.ToString(),
+            priorCausalRatio = Math.Round(priorRatio, 6),
+            newCausalRatio = Math.Round(newRatio, 6),
+            priorCausalCount,
+            newCausalCount,
+            regressionThreshold = Math.Round(settings.RegressionThreshold, 6),
+            evaluatedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture)
+        }), AlertConditionMaxLength);
+
+        if (alert is null)
+        {
+            alert = new Alert
             {
-                if (row == col) continue;
-                double factor = mat[row, col];
-                for (int j = col; j <= n; j++) mat[row, j] -= factor * mat[col, j];
+                AlertType = AlertType.MLModelDegraded,
+                DeduplicationKey = deduplicationKey,
+                IsActive = true
+            };
+            db.Set<Alert>().Add(alert);
+        }
+        else
+        {
+            alert.AlertType = AlertType.MLModelDegraded;
+        }
+
+        ApplyAlertFields(alert, model.Symbol, AlertSeverity.High, settings.AlertCooldownSeconds, conditionJson);
+
+        try
+        {
+            await writeContext.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (IsLikelyAlertDeduplicationRace(serviceProvider, ex))
+        {
+            DetachIfAdded(db, alert);
+            alert = await db.Set<Alert>()
+                .FirstAsync(candidate => !candidate.IsDeleted
+                                      && candidate.IsActive
+                                      && candidate.DeduplicationKey == deduplicationKey, ct);
+            previousTriggeredAt ??= alert.LastTriggeredAt;
+            alert.AlertType = AlertType.MLModelDegraded;
+            ApplyAlertFields(alert, model.Symbol, AlertSeverity.High, settings.AlertCooldownSeconds, conditionJson);
+            await writeContext.SaveChangesAsync(ct);
+        }
+
+        if (previousTriggeredAt.HasValue &&
+            nowUtc - NormalizeUtc(previousTriggeredAt.Value) < TimeSpan.FromSeconds(settings.AlertCooldownSeconds))
+        {
+            return false;
+        }
+
+        string message = $"ML causal-feature ratio regressed for model {model.Id} ({model.Symbol}/{model.Timeframe}): {priorRatio:P1} ({priorCausalCount} features) → {newRatio:P1} ({newCausalCount} features). Possible regime shift, broken feature, or upstream data drift.";
+        var dispatcher = serviceProvider.GetRequiredService<IAlertDispatcher>();
+        try
+        {
+            await dispatcher.DispatchAsync(alert, message, ct);
+            await writeContext.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to dispatch causal-feature regression alert for model {ModelId}.",
+                WorkerName,
+                model.Id);
+            return false;
+        }
+    }
+
+    private async Task<bool> ResolveAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        string deduplicationPrefix,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string deduplicationKey = deduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture);
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(candidate => !candidate.IsDeleted
+                                           && candidate.IsActive
+                                           && candidate.DeduplicationKey == deduplicationKey, ct);
+
+        if (alert is null)
+            return false;
+
+        var dispatcher = serviceProvider.GetRequiredService<IAlertDispatcher>();
+        if (alert.LastTriggeredAt.HasValue)
+        {
+            try
+            {
+                await dispatcher.TryAutoResolveAsync(alert, conditionStillActive: false, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(
+                    ex,
+                    "{Worker}: failed to auto-resolve alert {DeduplicationKey} for model {ModelId}.",
+                    WorkerName,
+                    deduplicationKey,
+                    model.Id);
             }
         }
 
-        for (int i = 0; i < n; i++) x[i] = mat[i, n];
-        return x;
+        alert.IsActive = false;
+        alert.AutoResolvedAt ??= nowUtc;
+        await writeContext.SaveChangesAsync(ct);
+        return true;
+    }
+
+    private static void ApplyAlertFields(
+        Alert alert,
+        string symbol,
+        AlertSeverity severity,
+        int cooldownSeconds,
+        string conditionJson)
+    {
+        alert.Symbol = symbol;
+        alert.Severity = severity;
+        alert.CooldownSeconds = cooldownSeconds;
+        alert.AutoResolvedAt = null;
+        alert.ConditionJson = conditionJson;
+    }
+
+    private static ParsedObservationSet BuildObservationSet(
+        IReadOnlyList<PredictionFeatureLog> logs,
+        int featureCount)
+    {
+        int malformed = 0;
+        int wrongShape = 0;
+        int nonFinite = 0;
+        var observations = new List<CausalObservation>(logs.Count);
+
+        foreach (var log in logs)
+        {
+            double[]? features;
+            try
+            {
+                features = JsonSerializer.Deserialize<double[]>(log.RawFeaturesJson, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                malformed++;
+                continue;
+            }
+
+            if (features is null || features.Length < featureCount)
+            {
+                wrongShape++;
+                continue;
+            }
+
+            var row = new double[featureCount];
+            bool finite = double.IsFinite((double)log.ActualMagnitudePips);
+            for (int i = 0; finite && i < featureCount; i++)
+            {
+                double value = features[i];
+                if (!double.IsFinite(value))
+                {
+                    finite = false;
+                    break;
+                }
+                row[i] = value;
+            }
+
+            if (!finite)
+            {
+                nonFinite++;
+                continue;
+            }
+
+            observations.Add(new CausalObservation(
+                row,
+                (double)log.ActualMagnitudePips,
+                log.PredictedAt,
+                log.OutcomeRecordedAt));
+        }
+
+        return new ParsedObservationSet(observations, malformed, wrongShape, nonFinite);
+    }
+
+    internal static int ResolveAuditedFeatureCount(ModelSnapshot snapshot)
+    {
+        int resolvedFeatureCount = snapshot.ResolveExpectedInputFeatures();
+        int auditedFeatureCount = snapshot.InteractionBaseFeatureCount > 0
+            ? snapshot.InteractionBaseFeatureCount
+            : resolvedFeatureCount;
+
+        int schemaVersion = snapshot.ResolveFeatureSchemaVersion();
+        if (schemaVersion >= 7 && snapshot.InteractionBaseFeatureCount <= 0)
+            auditedFeatureCount = Math.Min(auditedFeatureCount, MLFeatureHelper.FeatureCountV6);
+
+        auditedFeatureCount = Math.Min(auditedFeatureCount, resolvedFeatureCount);
+        return auditedFeatureCount;
     }
 
     /// <summary>
-    /// Selects the optimal lag order for the Granger test using the Akaike Information
-    /// Criterion (AIC) over lags 1 through <paramref name="maxLag"/>.
+    /// Benjamini-Hochberg step-up procedure controlling the false-discovery rate at
+    /// <paramref name="alpha"/>. Returns a parallel array marking which p-values are
+    /// significant after correction. With <c>m</c> features and target FDR <c>alpha</c>,
+    /// the largest k such that <c>p_(k) ≤ k·alpha/m</c> (sorted ascending) determines the
+    /// rejection threshold; all p-values ≤ <c>p_(k)</c> are flagged significant.
     /// </summary>
-    /// <remarks>
-    /// AIC = n × log(RSS/n) + 2k
-    /// where k = 1 + 2×lag (intercept + lag AR terms + lag feature terms in unrestricted model)
-    /// and n = usable observations at this lag.
-    /// AIC penalises model complexity, balancing fit quality against overfitting.
-    /// Lower AIC is better; the lag with the minimum AIC is returned.
-    /// Returns lag = 1 when no valid AIC can be computed (too few observations).
-    /// </remarks>
-    /// <param name="y">Return series (dependent variable).</param>
-    /// <param name="x">Feature series (independent variable).</param>
-    /// <param name="maxLag">Maximum lag order to evaluate.</param>
-    /// <returns>Optimal lag order in [1, maxLag].</returns>
-    private static int SelectLagByAic(double[] y, double[] x, int maxLag)
+    internal static bool[] ApplyBenjaminiHochberg(double[] pValues, double alpha)
     {
-        int    best    = 1;
-        double bestAic = double.MaxValue;
+        int m = pValues.Length;
+        var result = new bool[m];
+        if (m == 0) return result;
+
+        var indexed = new (int Index, double PValue)[m];
+        for (int i = 0; i < m; i++)
+            indexed[i] = (i, double.IsFinite(pValues[i]) ? pValues[i] : 1.0);
+
+        Array.Sort(indexed, static (a, b) => a.PValue.CompareTo(b.PValue));
+
+        int largestRejected = -1;
+        for (int rank = 0; rank < m; rank++)
+        {
+            double threshold = (rank + 1) * alpha / m;
+            if (indexed[rank].PValue <= threshold)
+                largestRejected = rank;
+        }
+
+        if (largestRejected < 0) return result;
+
+        for (int rank = 0; rank <= largestRejected; rank++)
+            result[indexed[rank].Index] = true;
+        return result;
+    }
+
+    internal static (double fStat, double pValue) GrangerFTest(double[] y, double[] x, int lag)
+    {
+        int n = Math.Min(y.Length, x.Length) - lag;
+        if (lag <= 0 || n <= (2 * lag + 1))
+            return (0.0, 1.0);
+
+        double rssRestricted = ComputeRss(y, x, lag, includeX: false);
+        double rssUnrestricted = ComputeRss(y, x, lag, includeX: true);
+        if (!double.IsFinite(rssRestricted) || !double.IsFinite(rssUnrestricted) || rssRestricted <= 0.0 || rssUnrestricted <= 0.0)
+            return (0.0, 1.0);
+
+        double numerator = (rssRestricted - rssUnrestricted) / lag;
+        double denominator = rssUnrestricted / (n - 2.0 * lag - 1.0);
+        if (!double.IsFinite(numerator) || !double.IsFinite(denominator) || denominator <= 0.0)
+            return (0.0, 1.0);
+
+        double fStat = Math.Max(0.0, numerator / denominator);
+        double pValue = FSurvival(fStat, lag, n - 2.0 * lag - 1.0);
+        return (fStat, Math.Clamp(pValue, 0.0, 1.0));
+    }
+
+    internal static int SelectLagByAic(double[] y, double[] x, int maxLag)
+    {
+        int bestLag = 1;
+        double bestAic = double.PositiveInfinity;
 
         for (int lag = 1; lag <= maxLag; lag++)
         {
             int n = Math.Min(y.Length, x.Length) - lag;
-            if (n <= 2 * lag + 1) break; // Not enough observations for this lag order.
+            if (n <= (2 * lag + 1))
+                break;
 
             double rss = ComputeRss(y, x, lag, includeX: true);
-            int    k   = 1 + 2 * lag; // number of free parameters in unrestricted model
-            double aic = n * Math.Log(rss / n) + 2 * k;
+            if (!double.IsFinite(rss) || rss <= 0.0)
+                continue;
 
-            if (aic < bestAic) { bestAic = aic; best = lag; }
+            int parameterCount = 1 + (2 * lag);
+            double aic = n * Math.Log(rss / n) + (2.0 * parameterCount);
+            if (aic < bestAic)
+            {
+                bestAic = aic;
+                bestLag = lag;
+            }
         }
 
-        return best;
+        return bestLag;
+    }
+
+    private static double ComputeRss(double[] y, double[] x, int lag, bool includeX)
+    {
+        int n = Math.Min(y.Length, x.Length) - lag;
+        if (n <= 0)
+            return double.PositiveInfinity;
+
+        int columnCount = 1 + lag + (includeX ? lag : 0);
+        var xtx = new double[columnCount, columnCount];
+        var xty = new double[columnCount];
+
+        Span<double> designRow = stackalloc double[1 + (2 * MaxMaxLag)];
+        for (int row = 0; row < n; row++)
+        {
+            int t = row + lag;
+            designRow[0] = 1.0;
+
+            for (int l = 1; l <= lag; l++)
+                designRow[l] = y[t - l];
+
+            if (includeX)
+            {
+                for (int l = 1; l <= lag; l++)
+                    designRow[lag + l] = x[t - l];
+            }
+
+            for (int i = 0; i < columnCount; i++)
+            {
+                xty[i] += designRow[i] * y[t];
+                for (int j = 0; j < columnCount; j++)
+                    xtx[i, j] += designRow[i] * designRow[j];
+            }
+        }
+
+        // Ridge regularisation: XᵀX + λI is strictly positive definite, which is the
+        // precondition Cholesky needs. λ is small enough not to bias the F-test
+        // meaningfully but large enough to absorb floating-point noise on near-singular
+        // designs (e.g. constant features or perfect collinearity between lags).
+        for (int i = 0; i < columnCount; i++)
+            xtx[i, i] += 1e-6;
+
+        var beta = SolveSpdLinearSystem(xtx, xty);
+        if (beta is null)
+            return double.PositiveInfinity;
+
+        double rss = 0.0;
+        for (int row = 0; row < n; row++)
+        {
+            int t = row + lag;
+            designRow[0] = 1.0;
+            for (int l = 1; l <= lag; l++)
+                designRow[l] = y[t - l];
+
+            if (includeX)
+            {
+                for (int l = 1; l <= lag; l++)
+                    designRow[lag + l] = x[t - l];
+            }
+
+            double prediction = 0.0;
+            for (int i = 0; i < columnCount; i++)
+                prediction += designRow[i] * beta[i];
+
+            double residual = y[t] - prediction;
+            rss += residual * residual;
+        }
+
+        return rss;
     }
 
     /// <summary>
-    /// Cumulative distribution function (CDF) of the standard normal distribution N(0,1).
+    /// Solves the symmetric positive-definite system <c>A β = b</c> via Cholesky
+    /// decomposition (<c>A = L Lᵀ</c>) followed by forward and back substitution.
+    /// Roughly twice as fast as Gaussian elimination and numerically stable for the
+    /// ridge-regularised normal equations <c>XᵀX + λI</c>. Returns <c>null</c> if the
+    /// matrix is not positive-definite (which should not happen with the ridge in place,
+    /// but is handled defensively).
     /// </summary>
-    /// <remarks>
-    /// Uses the error function identity: Φ(z) = 0.5 × (1 + erf(z / √2)).
-    /// Clamped to [0, 1] for |z| &gt; 8 to avoid floating-point underflow.
-    /// </remarks>
-    /// <param name="z">Standard normal variate.</param>
-    /// <returns>P(Z ≤ z) for Z ~ N(0,1), in [0, 1].</returns>
-    private static double NormalCdf(double z)
+    internal static double[]? SolveSpdLinearSystem(double[,] a, double[] b)
     {
-        // Abramowitz and Stegun approximation (fast and sufficient for p-value ranking)
-        if (z < -8) return 0;
-        if (z >  8) return 1;
-        double p = 0.5 * (1 + Erf(z / Math.Sqrt(2)));
-        return p;
+        int n = b.Length;
+        var l = new double[n, n];
+
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = 0; j <= i; j++)
+            {
+                double sum = a[i, j];
+                for (int k = 0; k < j; k++)
+                    sum -= l[i, k] * l[j, k];
+
+                if (i == j)
+                {
+                    if (sum <= 0.0 || !double.IsFinite(sum))
+                        return null;
+                    l[i, j] = Math.Sqrt(sum);
+                }
+                else
+                {
+                    l[i, j] = sum / l[j, j];
+                }
+            }
+        }
+
+        // Forward substitution: L y = b.
+        var y = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            double sum = b[i];
+            for (int k = 0; k < i; k++)
+                sum -= l[i, k] * y[k];
+            y[i] = sum / l[i, i];
+        }
+
+        // Back substitution: Lᵀ β = y.
+        var beta = new double[n];
+        for (int i = n - 1; i >= 0; i--)
+        {
+            double sum = y[i];
+            for (int k = i + 1; k < n; k++)
+                sum -= l[k, i] * beta[k];
+            beta[i] = sum / l[i, i];
+        }
+
+        return beta;
     }
 
-    /// <summary>
-    /// Computes the error function erf(x) using the Abramowitz and Stegun polynomial
-    /// approximation (maximum error: 1.5 × 10⁻⁷).
-    /// </summary>
-    /// <remarks>
-    /// Reference: Abramowitz and Stegun, "Handbook of Mathematical Functions", formula 7.1.26.
-    /// Coefficients: a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027,
-    ///               a5=1.061405429, p=0.3275911.
-    /// The function is odd: erf(-x) = -erf(x), so only non-negative x is computed directly.
-    /// </remarks>
-    /// <param name="x">Input value.</param>
-    /// <returns>erf(x) in [-1, 1].</returns>
-    private static double Erf(double x)
+    private static double FSurvival(double f, double df1, double df2)
     {
-        const double a1 =  0.254829592, a2 = -0.284496736, a3 =  1.421413741;
-        const double a4 = -1.453152027, a5 =  1.061405429, p  =  0.3275911;
-        double sign = x >= 0 ? 1 : -1;
-        x = Math.Abs(x);
-        double t = 1 / (1 + p * x);
-        // Polynomial approximation of (1 - erf(x)) × exp(x²)
-        double y = 1 - (a1*t + a2*t*t + a3*t*t*t + a4*t*t*t*t + a5*t*t*t*t*t) * Math.Exp(-x*x);
-        return sign * y;
+        if (!double.IsFinite(f) || f <= 0.0 || df1 <= 0.0 || df2 <= 0.0)
+            return 1.0;
+
+        double x = df2 / (df2 + df1 * f);
+        return RegularizedIncompleteBeta(x, df2 / 2.0, df1 / 2.0);
     }
+
+    private static double RegularizedIncompleteBeta(double x, double a, double b)
+    {
+        if (x <= 0.0)
+            return 0.0;
+        if (x >= 1.0)
+            return 1.0;
+
+        double front = Math.Exp(
+            LogGamma(a + b) - LogGamma(a) - LogGamma(b)
+            + a * Math.Log(x)
+            + b * Math.Log(1.0 - x));
+
+        if (x < (a + 1.0) / (a + b + 2.0))
+            return Math.Clamp(front * BetaContinuedFraction(a, b, x) / a, 0.0, 1.0);
+
+        double complement = front * BetaContinuedFraction(b, a, 1.0 - x) / b;
+        return Math.Clamp(1.0 - complement, 0.0, 1.0);
+    }
+
+    private static double BetaContinuedFraction(double a, double b, double x)
+    {
+        const int maxIterations = 200;
+        const double epsilon = 3.0e-14;
+        const double fpMin = 1.0e-300;
+
+        double qab = a + b;
+        double qap = a + 1.0;
+        double qam = a - 1.0;
+        double c = 1.0;
+        double d = 1.0 - qab * x / qap;
+        if (Math.Abs(d) < fpMin)
+            d = fpMin;
+        d = 1.0 / d;
+        double h = d;
+
+        for (int m = 1; m <= maxIterations; m++)
+        {
+            int m2 = 2 * m;
+            double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+            d = 1.0 + aa * d;
+            if (Math.Abs(d) < fpMin)
+                d = fpMin;
+            c = 1.0 + aa / c;
+            if (Math.Abs(c) < fpMin)
+                c = fpMin;
+            d = 1.0 / d;
+            h *= d * c;
+
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+            d = 1.0 + aa * d;
+            if (Math.Abs(d) < fpMin)
+                d = fpMin;
+            c = 1.0 + aa / c;
+            if (Math.Abs(c) < fpMin)
+                c = fpMin;
+            d = 1.0 / d;
+            double delta = d * c;
+            h *= delta;
+
+            if (Math.Abs(delta - 1.0) <= epsilon)
+                break;
+        }
+
+        return h;
+    }
+
+    private static double LogGamma(double x)
+    {
+        double[] coefficients =
+        [
+            676.5203681218851,
+            -1259.1392167224028,
+            771.32342877765313,
+            -176.61502916214059,
+            12.507343278686905,
+            -0.13857109526572012,
+            9.9843695780195716e-6,
+            1.5056327351493116e-7
+        ];
+
+        if (x < 0.5)
+            return Math.Log(Math.PI) - Math.Log(Math.Sin(Math.PI * x)) - LogGamma(1.0 - x);
+
+        x -= 1.0;
+        double sum = 0.99999999999980993;
+        for (int i = 0; i < coefficients.Length; i++)
+            sum += coefficients[i] / (x + i + 1.0);
+
+        double t = x + coefficients.Length - 0.5;
+        return 0.9189385332046727 + ((x + 0.5) * Math.Log(t)) - t + Math.Log(sum);
+    }
+
+    private async Task<MLCausalFeatureWorkerSettings> LoadSettingsAsync(DbContext db, CancellationToken ct)
+    {
+        string[] keys =
+        [
+            CK_Enabled,
+            CK_PollSecs,
+            CK_WindowDays,
+            CK_MinSamples,
+            CK_MaxLogsPerModel,
+            CK_MaxModelsPerCycle,
+            CK_MaxLag,
+            CK_PValueThreshold,
+            CK_LockTimeoutSeconds,
+            CK_FdrAlpha,
+            CK_ConsecutiveSkipAlertThreshold,
+            CK_RegressionThreshold,
+            CK_MinPriorCausalForRegression,
+            CK_MaxAlertsPerCycle,
+        ];
+
+        var values = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(config => keys.Contains(config.Key))
+            .ToDictionaryAsync(config => config.Key, config => config.Value, ct);
+
+        int alertCooldownSeconds = await AlertCooldownDefaults.GetCooldownAsync(
+            db,
+            AlertCooldownDefaults.CK_MLMonitoring,
+            AlertCooldownDefaults.Default_MLMonitoring,
+            ct);
+
+        return new MLCausalFeatureWorkerSettings(
+            Enabled: GetBool(values, CK_Enabled, true),
+            PollInterval: TimeSpan.FromSeconds(ClampInt(
+                GetInt(values, CK_PollSecs, DefaultPollSeconds),
+                DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
+            WindowDays: ClampInt(
+                GetInt(values, CK_WindowDays, DefaultWindowDays),
+                DefaultWindowDays, MinWindowDays, MaxWindowDays),
+            MinSamples: ClampInt(
+                GetInt(values, CK_MinSamples, DefaultMinSamples),
+                DefaultMinSamples, MinMinSamples, MaxMinSamples),
+            MaxLogsPerModel: ClampInt(
+                GetInt(values, CK_MaxLogsPerModel, DefaultMaxLogsPerModel),
+                DefaultMaxLogsPerModel, MinMaxLogsPerModel, MaxMaxLogsPerModel),
+            MaxModelsPerCycle: ClampInt(
+                GetInt(values, CK_MaxModelsPerCycle, DefaultMaxModelsPerCycle),
+                DefaultMaxModelsPerCycle, MinMaxModelsPerCycle, MaxMaxModelsPerCycle),
+            MaxLag: ClampInt(
+                GetInt(values, CK_MaxLag, DefaultMaxLag),
+                DefaultMaxLag, MinMaxLag, MaxMaxLag),
+            PValueThreshold: ClampDouble(
+                GetDouble(values, CK_PValueThreshold, DefaultPValueThreshold),
+                DefaultPValueThreshold, MinPValueThreshold, MaxPValueThreshold),
+            LockTimeoutSeconds: ClampIntAllowingZero(
+                GetInt(values, CK_LockTimeoutSeconds, DefaultLockTimeoutSeconds),
+                DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
+            FdrAlpha: ClampDouble(
+                GetDouble(values, CK_FdrAlpha, DefaultFdrAlpha),
+                DefaultFdrAlpha, MinFdrAlpha, MaxFdrAlpha),
+            ConsecutiveSkipAlertThreshold: ClampInt(
+                GetInt(values, CK_ConsecutiveSkipAlertThreshold, DefaultConsecutiveSkipAlertThreshold),
+                DefaultConsecutiveSkipAlertThreshold,
+                MinConsecutiveSkipAlertThreshold,
+                MaxConsecutiveSkipAlertThreshold),
+            RegressionThreshold: ClampDoubleAllowingZero(
+                GetDouble(values, CK_RegressionThreshold, DefaultRegressionThreshold),
+                DefaultRegressionThreshold, MinRegressionThreshold, MaxRegressionThreshold),
+            MinPriorCausalForRegression: ClampInt(
+                GetInt(values, CK_MinPriorCausalForRegression, DefaultMinPriorCausalForRegression),
+                DefaultMinPriorCausalForRegression,
+                MinMinPriorCausalForRegression,
+                MaxMinPriorCausalForRegression),
+            MaxAlertsPerCycle: ClampIntAllowingZero(
+                GetInt(values, CK_MaxAlertsPerCycle, DefaultMaxAlertsPerCycle),
+                DefaultMaxAlertsPerCycle, MinMaxAlertsPerCycle, MaxMaxAlertsPerCycle),
+            AlertCooldownSeconds: Math.Max(1, alertCooldownSeconds));
+    }
+
+    private static ModelSnapshot? TryDeserializeSnapshot(byte[] modelBytes)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<ModelSnapshot>(modelBytes, JsonOptions);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string[] ResolveFeatureNames(ModelSnapshot snapshot, int featureCount)
+    {
+        if (snapshot.Features.Length >= featureCount)
+            return snapshot.Features.Take(featureCount).ToArray();
+
+        return MLFeatureHelper.ResolveFeatureNames(featureCount);
+    }
+
+    private static string SkipStreakKey(long modelId)
+        => $"MLCausal:Model:{modelId.ToString(CultureInfo.InvariantCulture)}:ConsecutiveSkips";
+
+    private static string CausalRatioKey(long modelId)
+        => $"MLCausal:Model:{modelId.ToString(CultureInfo.InvariantCulture)}:CausalRatio";
+
+    private static string CausalCountKey(long modelId)
+        => $"MLCausal:Model:{modelId.ToString(CultureInfo.InvariantCulture)}:CausalCount";
+
+    private static bool TryParseModelIdFromConfigKey(string key, string suffix, out long modelId)
+    {
+        modelId = 0;
+        const string prefix = "MLCausal:Model:";
+        if (!key.StartsWith(prefix, StringComparison.Ordinal)
+            || !key.EndsWith(suffix, StringComparison.Ordinal))
+            return false;
+
+        int idStart = prefix.Length;
+        int idEnd = key.Length - suffix.Length;
+        if (idEnd <= idStart)
+            return false;
+        return long.TryParse(
+            key.AsSpan(idStart, idEnd - idStart),
+            NumberStyles.Integer,
+            CultureInfo.InvariantCulture,
+            out modelId);
+    }
+
+    private static string Truncate(string value, int maxLength)
+        => value.Length <= maxLength ? value : value[..maxLength];
+
+    private static DateTime NormalizeUtc(DateTime timestamp)
+        => timestamp.Kind == DateTimeKind.Utc
+            ? timestamp
+            : DateTime.SpecifyKind(timestamp, DateTimeKind.Utc);
+
+    private static bool IsLikelyAlertDeduplicationRace(IServiceProvider serviceProvider, DbUpdateException ex)
+    {
+        var classifier = serviceProvider.GetService<IDatabaseExceptionClassifier>();
+        if (classifier?.IsUniqueConstraintViolation(ex) == true)
+            return true;
+
+        string message = ex.InnerException?.Message ?? ex.Message;
+        return message.Contains("DeduplicationKey", StringComparison.OrdinalIgnoreCase) &&
+               (message.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("unique", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void DetachIfAdded(DbContext db, Alert alert)
+    {
+        var entry = db.Entry(alert);
+        if (entry.State is EntityState.Added or EntityState.Modified)
+            entry.State = EntityState.Detached;
+    }
+
+    private static bool GetBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+
+        if (bool.TryParse(raw, out var parsedBool))
+            return parsedBool;
+
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedInt))
+            return parsedInt != 0;
+
+        return defaultValue;
+    }
+
+    private static int GetInt(IReadOnlyDictionary<string, string> values, string key, int defaultValue)
+    {
+        return values.TryGetValue(key, out var raw)
+            && int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : defaultValue;
+    }
+
+    private static double GetDouble(IReadOnlyDictionary<string, string> values, string key, double defaultValue)
+    {
+        return values.TryGetValue(key, out var raw)
+            && double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : defaultValue;
+    }
+
+    private static int ClampInt(int value, int fallback, int min, int max)
+    {
+        if (value <= 0)
+            return fallback;
+
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static int ClampIntAllowingZero(int value, int fallback, int min, int max)
+    {
+        if (value < 0)
+            return fallback;
+
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static double ClampDouble(double value, double fallback, double min, double max)
+    {
+        if (!double.IsFinite(value) || value <= 0.0)
+            return fallback;
+
+        return Math.Min(Math.Max(value, min), max);
+    }
+
+    private static double ClampDoubleAllowingZero(double value, double fallback, double min, double max)
+    {
+        if (!double.IsFinite(value) || value < 0.0)
+            return fallback;
+
+        return Math.Min(Math.Max(value, min), max);
+    }
+}
+
+internal sealed record MLCausalFeatureWorkerSettings(
+    bool Enabled,
+    TimeSpan PollInterval,
+    int WindowDays,
+    int MinSamples,
+    int MaxLogsPerModel,
+    int MaxModelsPerCycle,
+    int MaxLag,
+    double PValueThreshold,
+    int LockTimeoutSeconds,
+    double FdrAlpha,
+    int ConsecutiveSkipAlertThreshold,
+    double RegressionThreshold,
+    int MinPriorCausalForRegression,
+    int MaxAlertsPerCycle,
+    int AlertCooldownSeconds);
+
+internal sealed record MLCausalFeatureCycleResult(
+    MLCausalFeatureWorkerSettings Settings,
+    string? SkippedReason,
+    int CandidateModelCount,
+    int EvaluatedModelCount,
+    int SkippedModelCount,
+    int FailedModelCount,
+    int AuditsWrittenCount,
+    int CausalFeatureCount,
+    int PreservedMaskCount,
+    int RegressionAlertCount,
+    int StaleMonitoringAlertCount,
+    int AlertBackpressureSkippedCount)
+{
+    public static MLCausalFeatureCycleResult Skipped(MLCausalFeatureWorkerSettings settings, string reason)
+        => new(
+            settings,
+            reason,
+            CandidateModelCount: 0,
+            EvaluatedModelCount: 0,
+            SkippedModelCount: 0,
+            FailedModelCount: 0,
+            AuditsWrittenCount: 0,
+            CausalFeatureCount: 0,
+            PreservedMaskCount: 0,
+            RegressionAlertCount: 0,
+            StaleMonitoringAlertCount: 0,
+            AlertBackpressureSkippedCount: 0);
 }

@@ -75,7 +75,7 @@ public sealed class RejectionReasonAggregator : IRejectionReasonAggregator
         var rows = await db.Set<StrategyGenerationFailure>()
             .AsNoTracking()
             .Where(f => !f.IsDeleted && f.CreatedAtUtc >= cutoff)
-            .Select(f => new { f.StrategyType, f.FailureReason })
+            .Select(f => new { f.StrategyType, f.FailureStage, f.FailureReason })
             .ToListAsync(ct);
 
         if (rows.Count == 0)
@@ -93,7 +93,9 @@ public sealed class RejectionReasonAggregator : IRejectionReasonAggregator
             foreach (var row in group)
             {
                 total++;
-                var cls = Classify(row.FailureReason);
+                var cls = Classify(row.FailureStage);
+                if (cls == RejectionClass.Unknown)
+                    cls = Classify(row.FailureReason);
                 if (cls == RejectionClass.Underfit) underfit++;
                 else if (cls == RejectionClass.Overfit) overfit++;
             }

@@ -307,7 +307,7 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
         services.AddScoped<ICpcEncoderGateEvaluator, CpcEncoderGateEvaluator>();
         services.AddScoped<ICpcEncoderPromotionService>(_ => new CpcEncoderPromotionService());
         services.AddLogging();
-        services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
+        services.AddSingleton<IDistributedLock, LeaseBasedDistributedLock>();
         services.AddSingleton<IDatabaseExceptionClassifier, PostgresDatabaseExceptionClassifier>();
         var provider = services.BuildServiceProvider();
 

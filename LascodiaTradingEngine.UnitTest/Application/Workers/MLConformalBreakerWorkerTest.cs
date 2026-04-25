@@ -587,6 +587,154 @@ public class MLConformalBreakerWorkerTest
         Assert.All(breakers, b => Assert.True(b.IsActive));
     }
 
+    [Fact]
+    public async Task RunAsync_Expired_Breaker_Can_Retrip_In_Same_Cycle()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: true);
+        var expiredBreaker = CreateBreaker(model.Id, id: 40, suspendedAt: now.AddHours(-6), resumeAt: now.AddMinutes(-1));
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalBreakerLog>().Add(expiredBreaker);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddMinutes(-30), covered: false, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions(), new CapturingAlertDispatcher());
+        await worker.RunAsync(CancellationToken.None);
+
+        var breakers = await db.Set<MLConformalBreakerLog>()
+            .OrderBy(b => b.Id)
+            .ToListAsync();
+
+        Assert.Equal(2, breakers.Count);
+        Assert.False(breakers.Single(b => b.Id == expiredBreaker.Id).IsActive);
+        Assert.True(breakers.Single(b => b.Id != expiredBreaker.Id).IsActive);
+        Assert.True(await db.Set<MLModel>().Where(m => m.Id == model.Id).Select(m => m.IsSuppressed).SingleAsync());
+    }
+
+    [Fact]
+    public async Task RunAsync_Uses_Served_CalibrationId_Threshold_When_Log_Threshold_Is_Missing()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+
+        db.Set<MLConformalCalibration>().AddRange(
+            new MLConformalCalibration
+            {
+                Id = 200,
+                MLModelId = model.Id,
+                Symbol = model.Symbol,
+                Timeframe = model.Timeframe,
+                CalibrationSamples = 30,
+                TargetCoverage = 0.90,
+                CoverageThreshold = 0.80,
+                CalibratedAt = now.AddDays(-2)
+            },
+            new MLConformalCalibration
+            {
+                Id = 201,
+                MLModelId = model.Id,
+                Symbol = model.Symbol,
+                Timeframe = model.Timeframe,
+                CalibrationSamples = 30,
+                TargetCoverage = 0.90,
+                CoverageThreshold = 0.30,
+                CalibratedAt = now.AddDays(-1)
+            });
+
+        for (int i = 0; i < 30; i++)
+        {
+            db.Set<MLModelPredictionLog>().Add(new MLModelPredictionLog
+            {
+                MLModelId = model.Id,
+                Symbol = model.Symbol,
+                Timeframe = model.Timeframe,
+                TradeSignalId = 500 + i,
+                ActualDirection = TradeDirection.Buy,
+                OutcomeRecordedAt = now.AddMinutes(-60 + i),
+                ConformalNonConformityScore = 0.70,
+                MLConformalCalibrationId = 200
+            });
+        }
+
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLConformalBreakerLog>().ToListAsync());
+        Assert.False(await db.Set<MLModel>().Where(m => m.Id == model.Id).Select(m => m.IsSuppressed).SingleAsync());
+    }
+
+    [Fact]
+    public async Task RunAsync_Reuses_Existing_Active_Alert_On_Retrip()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        db.Set<Alert>().Add(new Alert
+        {
+            Id = 90,
+            AlertType = AlertType.MLModelDegraded,
+            Symbol = model.Symbol,
+            IsActive = true,
+            Severity = AlertSeverity.High,
+            DeduplicationKey = $"MLConformalBreaker:{model.Id}:{model.Symbol}:{model.Timeframe}",
+            CooldownSeconds = 3600,
+            LastTriggeredAt = now.AddHours(-2),
+            ConditionJson = "{}"
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions(), new CapturingAlertDispatcher());
+        await worker.RunAsync(CancellationToken.None);
+
+        var alerts = await db.Set<Alert>()
+            .OrderBy(a => a.Id)
+            .ToListAsync();
+        Assert.Single(alerts);
+        Assert.True(alerts[0].IsActive);
+    }
+
+    [Fact]
+    public async Task RunAsync_Recovery_Resolves_Active_Alert()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: true);
+        var breaker = CreateBreaker(model.Id, suspendedAt: now.AddHours(-2), resumeAt: now.AddHours(8));
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalBreakerLog>().Add(breaker);
+        db.Set<Alert>().Add(new Alert
+        {
+            Id = 91,
+            AlertType = AlertType.MLModelDegraded,
+            Symbol = model.Symbol,
+            IsActive = true,
+            Severity = AlertSeverity.High,
+            DeduplicationKey = $"MLConformalBreaker:{model.Id}:{model.Symbol}:{model.Timeframe}",
+            CooldownSeconds = 3600,
+            LastTriggeredAt = now.AddMinutes(-5),
+            ConditionJson = "{}"
+        });
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, breaker.SuspendedAt.AddMinutes(1), covered: true, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions(), new CapturingAlertDispatcher());
+        await worker.RunAsync(CancellationToken.None);
+
+        var alert = await db.Set<Alert>().SingleAsync(a => a.Id == 91);
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()
@@ -640,7 +788,7 @@ public class MLConformalBreakerWorkerTest
             Mock.Of<ILogger<MLConformalBreakerWorker>>(),
             options ?? new MLConformalBreakerOptions(),
             new TradingMetrics(new TestMeterFactory()),
-            alertDispatcher ?? Mock.Of<IAlertDispatcher>(),
+            alertDispatcher ?? new CapturingAlertDispatcher(),
             new MLConformalCoverageEvaluator(),
             new MLConformalPredictionLogReader(),
             new MLConformalCalibrationReader(),
@@ -753,12 +901,17 @@ public class MLConformalBreakerWorkerTest
 
         public Task DispatchAsync(Alert alert, string message, CancellationToken ct)
         {
+            alert.LastTriggeredAt = DateTime.UtcNow;
             Dispatched.Add((alert, message));
             return Task.CompletedTask;
         }
 
         public Task TryAutoResolveAsync(Alert alert, bool conditionStillActive, CancellationToken ct)
-            => Task.CompletedTask;
+        {
+            if (!conditionStillActive && !alert.AutoResolvedAt.HasValue)
+                alert.AutoResolvedAt = DateTime.UtcNow;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class ThrowingAlertDispatcher : IAlertDispatcher

@@ -10,7 +10,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Periodically prunes append-only audit tables that would otherwise grow
-/// unbounded. Two tables in scope today:
+/// unbounded. Tables in scope:
 /// <list type="bullet">
 ///   <item><see cref="SignalRejectionAudit"/> — one row per suppressed
 ///         signal; at 100+ ticks/sec fanout this can reach millions of rows
@@ -18,6 +18,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item><see cref="ReconciliationRun"/> — one row per EA snapshot
 ///         reconciliation; tens of thousands per month. Default retention:
 ///         180 days.</item>
+///   <item><see cref="MLAdwinDriftLog"/> — one row per active model per
+///         ADWIN cycle (~256 rows/day); accumulates ~95k rows per year.
+///         Default retention: 365 days. Operators tuning <c>Delta</c> from
+///         historical false-positive rate should query within the window.</item>
 /// </list>
 ///
 /// <para>
@@ -51,6 +55,7 @@ public sealed class AuditRetentionWorker : BackgroundService
     private const string CK_BatchSize             = "Retention:BatchSize";
     private const string CK_SignalRejectionDays   = "Retention:SignalRejectionAuditDays";
     private const string CK_ReconciliationDays    = "Retention:ReconciliationRunDays";
+    private const string CK_MLAdwinDriftLogDays   = "Retention:MLAdwinDriftLogDays";
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<AuditRetentionWorker> _logger;
@@ -89,8 +94,9 @@ public sealed class AuditRetentionWorker : BackgroundService
                 int batchSize          = await ReadIntConfigAsync(db, CK_BatchSize,           10_000, stoppingToken);
                 int signalRejectionDays = await ReadIntConfigAsync(db, CK_SignalRejectionDays, 90,  stoppingToken);
                 int reconciliationDays  = await ReadIntConfigAsync(db, CK_ReconciliationDays,  180, stoppingToken);
+                int mlAdwinDriftLogDays = await ReadIntConfigAsync(db, CK_MLAdwinDriftLogDays, 365, stoppingToken);
 
-                await RunCycleAsync(scope, batchSize, signalRejectionDays, reconciliationDays, stoppingToken);
+                await RunCycleAsync(scope, batchSize, signalRejectionDays, reconciliationDays, mlAdwinDriftLogDays, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -118,6 +124,7 @@ public sealed class AuditRetentionWorker : BackgroundService
         int batchSize,
         int signalRejectionDays,
         int reconciliationDays,
+        int mlAdwinDriftLogDays,
         CancellationToken ct)
     {
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
@@ -140,14 +147,22 @@ public sealed class AuditRetentionWorker : BackgroundService
             tableTag: "ReconciliationRun",
             ct);
 
-        if (signalRejectionDeleted > 0 || reconciliationDeleted > 0)
+        long mlAdwinDriftLogDeleted = await PruneTableAsync(
+            db.Set<MLAdwinDriftLog>(),
+            cutoff: now.AddDays(-Math.Max(1, mlAdwinDriftLogDays)),
+            dateSelector: r => r.DetectedAt,
+            batchSize,
+            tableTag: "MLAdwinDriftLog",
+            ct);
+
+        if (signalRejectionDeleted > 0 || reconciliationDeleted > 0 || mlAdwinDriftLogDeleted > 0)
         {
             _logger.LogInformation(
-                "AuditRetentionWorker: deleted {SigRej} SignalRejectionAudit rows, {Recon} ReconciliationRun rows",
-                signalRejectionDeleted, reconciliationDeleted);
+                "AuditRetentionWorker: deleted {SigRej} SignalRejectionAudit, {Recon} ReconciliationRun, {Adwin} MLAdwinDriftLog rows",
+                signalRejectionDeleted, reconciliationDeleted, mlAdwinDriftLogDeleted);
         }
 
-        return new RetentionCycleResult(signalRejectionDeleted, reconciliationDeleted);
+        return new RetentionCycleResult(signalRejectionDeleted, reconciliationDeleted, mlAdwinDriftLogDeleted);
     }
 
     private async Task<long> PruneTableAsync<TEntity>(
@@ -238,5 +253,6 @@ public sealed class AuditRetentionWorker : BackgroundService
     /// <summary>Outcome of one retention cycle — counts per table.</summary>
     internal readonly record struct RetentionCycleResult(
         long SignalRejectionDeleted,
-        long ReconciliationDeleted);
+        long ReconciliationDeleted,
+        long MLAdwinDriftLogDeleted);
 }

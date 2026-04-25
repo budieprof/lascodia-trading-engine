@@ -1,8 +1,16 @@
+using System.Text;
 using Microsoft.EntityFrameworkCore;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Common.Utilities;
+
+public readonly record struct EngineConfigUpsertSpec(
+    string Key,
+    string Value,
+    ConfigDataType DataType = ConfigDataType.String,
+    string? Description = null,
+    bool IsHotReloadable = true);
 
 /// <summary>
 /// Race-safe upsert helper for <c>EngineConfig</c>. Uses PostgreSQL's atomic
@@ -16,26 +24,29 @@ namespace LascodiaTradingEngine.Application.Common.Utilities;
 /// violation. That exception escapes out of the worker's processing loop
 /// and causes the training run (or whatever caller) to be re-queued for
 /// retry, consuming all 3 attempts and permanently failing.
+///
+/// All paths share the same conflict-resolution semantics:
+/// <list type="bullet">
+///   <item>Value, DataType, IsHotReloadable, LastUpdatedAt always overwrite.</item>
+///   <item>Description preserves the existing value when the new value is null
+///         (<c>COALESCE(new, existing)</c>) and overwrites when non-null.</item>
+///   <item>IsDeleted is reset to false to resurrect soft-deleted rows so
+///         downstream readers using the standard soft-delete filter see them.</item>
+/// </list>
 /// </summary>
 public static class EngineConfigUpsert
 {
     private const string PostgresProvider = "Npgsql.EntityFrameworkCore.PostgreSQL";
 
-    /// <summary>
-    /// Atomically upserts a single <c>EngineConfig</c> key/value via a single
-    /// parameterised SQL statement. Safe to call concurrently from multiple
-    /// workers on the same key without coordination.
-    ///
-    /// <para>
-    /// <b>Soft-delete resurrection:</b> if the row exists with <c>IsDeleted=true</c>
-    /// (e.g. archived by a cleanup worker), the <c>DO UPDATE</c> branch resets
-    /// <c>IsDeleted</c> to <c>false</c> so the new value is visible to readers that
-    /// apply the standard soft-delete filter. Without this, every subsequent upsert
-    /// silently updated the <c>Value</c> but the row stayed invisible, causing
-    /// write-then-read-nothing loops (observed in MLDegradationModeWorker
-    /// "DetectedAt is missing or invalid" firing every cycle).
-    /// </para>
-    /// </summary>
+    private const string ConflictUpdateClause =
+        " ON CONFLICT (\"Key\") DO UPDATE SET " +
+        "\"Value\" = EXCLUDED.\"Value\", " +
+        "\"DataType\" = EXCLUDED.\"DataType\", " +
+        "\"Description\" = COALESCE(EXCLUDED.\"Description\", \"EngineConfig\".\"Description\"), " +
+        "\"IsHotReloadable\" = EXCLUDED.\"IsHotReloadable\", " +
+        "\"LastUpdatedAt\" = EXCLUDED.\"LastUpdatedAt\", " +
+        "\"IsDeleted\" = false";
+
     public static Task UpsertAsync(
         DbContext ctx,
         string key,
@@ -44,63 +55,131 @@ public static class EngineConfigUpsert
         string? description = null,
         bool isHotReloadable = true,
         CancellationToken ct = default)
-    {
-        if (!string.Equals(ctx.Database.ProviderName, PostgresProvider, StringComparison.Ordinal))
-        {
-            return UpsertTrackedAsync(ctx, key, value, dataType, description, isHotReloadable, ct);
-        }
-
-        var dataTypeName = dataType.ToString();
-        var now = DateTime.UtcNow;
-        return ctx.Database.ExecuteSqlInterpolatedAsync($@"
-            INSERT INTO ""EngineConfig""
-                (""Key"", ""Value"", ""DataType"", ""Description"", ""IsHotReloadable"", ""LastUpdatedAt"", ""OutboxId"", ""IsDeleted"")
-            VALUES
-                ({key}, {value}, {dataTypeName}, {description}, {isHotReloadable}, {now}, gen_random_uuid(), false)
-            ON CONFLICT (""Key"") DO UPDATE SET
-                ""Value"" = EXCLUDED.""Value"",
-                ""LastUpdatedAt"" = EXCLUDED.""LastUpdatedAt"",
-                ""IsDeleted"" = false",
+        => BatchUpsertAsync(
+            ctx,
+            new[] { new EngineConfigUpsertSpec(key, value, dataType, description, isHotReloadable) },
             ct);
+
+    /// <summary>
+    /// Atomically upserts many <c>EngineConfig</c> rows in a single round-trip.
+    /// On Postgres, emits one <c>INSERT ... VALUES (...), (...) ON CONFLICT DO UPDATE</c>;
+    /// on other providers, batches tracked changes and saves once. Late duplicate keys
+    /// in the input win.
+    /// </summary>
+    public static Task BatchUpsertAsync(
+        DbContext ctx,
+        IReadOnlyList<EngineConfigUpsertSpec> specs,
+        CancellationToken ct = default)
+    {
+        if (specs.Count == 0)
+            return Task.CompletedTask;
+
+        var deduped = DedupeKeepingLast(specs);
+
+        return string.Equals(ctx.Database.ProviderName, PostgresProvider, StringComparison.Ordinal)
+            ? BatchUpsertPostgresAsync(ctx, deduped, ct)
+            : BatchUpsertTrackedAsync(ctx, deduped, ct);
     }
 
-    private static async Task UpsertTrackedAsync(
+    private static List<EngineConfigUpsertSpec> DedupeKeepingLast(IReadOnlyList<EngineConfigUpsertSpec> specs)
+    {
+        var lastIndexByKey = new Dictionary<string, int>(specs.Count);
+        for (int i = 0; i < specs.Count; i++)
+            lastIndexByKey[specs[i].Key] = i;
+
+        var deduped = new List<EngineConfigUpsertSpec>(lastIndexByKey.Count);
+        for (int i = 0; i < specs.Count; i++)
+        {
+            if (lastIndexByKey[specs[i].Key] == i)
+                deduped.Add(specs[i]);
+        }
+        return deduped;
+    }
+
+    private static Task BatchUpsertPostgresAsync(
         DbContext ctx,
-        string key,
-        string value,
-        ConfigDataType dataType,
-        string? description,
-        bool isHotReloadable,
+        IReadOnlyList<EngineConfigUpsertSpec> specs,
+        CancellationToken ct)
+    {
+        var sql = new StringBuilder(
+            "INSERT INTO \"EngineConfig\" " +
+            "(\"Key\", \"Value\", \"DataType\", \"Description\", \"IsHotReloadable\", \"LastUpdatedAt\", \"OutboxId\", \"IsDeleted\") VALUES ");
+
+        var sqlBuilder = new ParameterizedSqlBuilder();
+        string nowPlaceholder = sqlBuilder.AddParameter(DateTime.UtcNow);
+
+        for (int i = 0; i < specs.Count; i++)
+        {
+            var spec = specs[i];
+            if (i > 0) sql.Append(", ");
+            sql.Append('(')
+                .Append(sqlBuilder.AddParameter(spec.Key)).Append(", ")
+                .Append(sqlBuilder.AddParameter(spec.Value)).Append(", ")
+                .Append(sqlBuilder.AddParameter(spec.DataType.ToString())).Append(", ")
+                .Append(sqlBuilder.AddParameter(spec.Description)).Append(", ")
+                .Append(sqlBuilder.AddParameter(spec.IsHotReloadable)).Append(", ")
+                .Append(nowPlaceholder).Append(", ")
+                .Append("gen_random_uuid(), false)");
+        }
+
+        sql.Append(ConflictUpdateClause);
+
+        return ctx.Database.ExecuteSqlRawAsync(sql.ToString(), sqlBuilder.Parameters, ct);
+    }
+
+    private static async Task BatchUpsertTrackedAsync(
+        DbContext ctx,
+        IReadOnlyList<EngineConfigUpsertSpec> specs,
         CancellationToken ct)
     {
         var now = DateTime.UtcNow;
-        var entry = await ctx.Set<EngineConfig>()
-            .IgnoreQueryFilters()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+        var keys = specs.Select(spec => spec.Key).ToList();
 
-        if (entry is null)
+        var existing = await ctx.Set<EngineConfig>()
+            .IgnoreQueryFilters()
+            .Where(config => keys.Contains(config.Key))
+            .ToDictionaryAsync(config => config.Key, ct);
+
+        foreach (var spec in specs)
         {
-            ctx.Set<EngineConfig>().Add(new EngineConfig
+            if (existing.TryGetValue(spec.Key, out var entry))
             {
-                Key = key,
-                Value = value,
-                DataType = dataType,
-                Description = description,
-                IsHotReloadable = isHotReloadable,
-                LastUpdatedAt = now,
-                IsDeleted = false
-            });
-        }
-        else
-        {
-            entry.Value = value;
-            entry.DataType = dataType;
-            entry.Description = description ?? entry.Description;
-            entry.IsHotReloadable = isHotReloadable;
-            entry.LastUpdatedAt = now;
-            entry.IsDeleted = false;
+                entry.Value = spec.Value;
+                entry.DataType = spec.DataType;
+                entry.Description = spec.Description ?? entry.Description;
+                entry.IsHotReloadable = spec.IsHotReloadable;
+                entry.LastUpdatedAt = now;
+                entry.IsDeleted = false;
+            }
+            else
+            {
+                ctx.Set<EngineConfig>().Add(new EngineConfig
+                {
+                    Key = spec.Key,
+                    Value = spec.Value,
+                    DataType = spec.DataType,
+                    Description = spec.Description,
+                    IsHotReloadable = spec.IsHotReloadable,
+                    LastUpdatedAt = now,
+                    IsDeleted = false
+                });
+            }
         }
 
         await ctx.SaveChangesAsync(ct);
+    }
+
+    private sealed class ParameterizedSqlBuilder
+    {
+        private readonly List<object?> _parameters = new();
+
+        public IReadOnlyList<object?> Parameters => _parameters;
+
+        public string AddParameter(object? value)
+        {
+            int index = _parameters.Count;
+            _parameters.Add(value);
+            return "{" + index.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
+        }
     }
 }

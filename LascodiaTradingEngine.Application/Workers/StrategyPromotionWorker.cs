@@ -11,6 +11,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.StrategyGeneration;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -84,6 +85,9 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
     private const string CK_AutoActivate        = "StrategyPromotion:AutoActivateEnabled";
     private const string CK_MaxActivePerSymbol  = "StrategyPromotion:MaxActivePerSymbol";
     private const string CK_MinLiveVsBacktestSharpeRatio = "StrategyPromotion:MinLiveVsBacktestSharpeRatio";
+    private const string CK_ChampionChallengerEnabled = "StrategyPromotion:ChampionChallengerEnabled";
+    private const string CK_MinChallengerQualityDelta = "StrategyPromotion:MinChallengerQualityScoreDelta";
+    private const string CK_MinChallengerSelectionDelta = "StrategyPromotion:MinChallengerSelectionScoreDelta";
 
     private const int DefaultPollMinutes = 60;
 
@@ -177,6 +181,9 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
         int minHealthySnapshots  = Math.Max(1, await GetConfigAsync(db, CK_MinHealthySnapshots, 3, ct));
         bool autoActivateEnabled = await GetConfigAsync(db, CK_AutoActivate, true, ct);
         int maxActivePerSymbol   = Math.Max(1, await GetConfigAsync(db, CK_MaxActivePerSymbol, 5, ct));
+        bool championChallengerEnabled = await GetConfigAsync(db, CK_ChampionChallengerEnabled, true, ct);
+        double minChallengerQualityDelta = Math.Max(0.0, await GetConfigAsync(db, CK_MinChallengerQualityDelta, 0.0, ct));
+        double minChallengerSelectionDelta = Math.Max(0.0, await GetConfigAsync(db, CK_MinChallengerSelectionDelta, 0.0, ct));
         // Live-vs-backtest Sharpe ratio floor. When >0, promotion requires the average Sharpe
         // across recent healthy snapshots to be at least this fraction of the strategy's best
         // completed backtest Sharpe. Guards against strategies that looked good in backtest
@@ -383,12 +390,23 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
             return;
         }
 
-        // Per-symbol active count for cap enforcement
-        var activeCountBySymbol = await db.Set<Strategy>()
+        // Per-symbol active cohort for capacity and champion/challenger enforcement.
+        var activeStrategies = await db.Set<Strategy>()
             .Where(s => !s.IsDeleted && s.Status == StrategyStatus.Active)
-            .GroupBy(s => s.Symbol)
-            .Select(g => new { Symbol = g.Key, Count = g.Count() })
-            .ToDictionaryAsync(g => g.Symbol, g => g.Count, ct);
+            .Select(s => new
+            {
+                s.Id,
+                s.Name,
+                s.Symbol,
+                s.ScreeningMetricsJson,
+            })
+            .ToListAsync(ct);
+        var activeCountBySymbol = activeStrategies
+            .GroupBy(s => s.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+        var activeStrategiesBySymbol = activeStrategies
+            .GroupBy(s => s.Symbol, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
 
         foreach (var strategy in approvedStrategies)
         {
@@ -400,6 +418,42 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                 _logger.LogDebug(
                     "StrategyPromotionWorker: strategy {Id} ({Name}) skipped — {Symbol} already has {Count}/{Max} active strategies",
                     strategy.Id, strategy.Name, strategy.Symbol, currentActive, maxActivePerSymbol);
+                continue;
+            }
+
+            if (championChallengerEnabled
+                && activeStrategiesBySymbol.TryGetValue(strategy.Symbol, out var activeCohort)
+                && !PassesChampionChallengerGate(
+                    strategy,
+                    activeCohort.Select(s => (s.Id, s.Name, s.ScreeningMetricsJson)).ToList(),
+                    minChallengerQualityDelta,
+                    minChallengerSelectionDelta,
+                    out var challengerReason))
+            {
+                _metrics.PromotionGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "champion_challenger"));
+                _logger.LogInformation(
+                    "StrategyPromotionWorker: strategy {Id} ({Name}) held at Approved by champion/challenger gate — {Reason}",
+                    strategy.Id,
+                    strategy.Name,
+                    challengerReason);
+                try
+                {
+                    await mediator.Send(new LogDecisionCommand
+                    {
+                        EntityType = "Strategy",
+                        EntityId = strategy.Id,
+                        DecisionType = "PromotionGate",
+                        Outcome = "Rejected",
+                        Reason = challengerReason,
+                        Source = "StrategyPromotionWorker"
+                    }, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "StrategyPromotionWorker: audit log failed for strategy {Id} champion/challenger rejection (non-fatal)",
+                        strategy.Id);
+                }
                 continue;
             }
 
@@ -470,5 +524,48 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
 
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    private static bool PassesChampionChallengerGate(
+        Strategy candidate,
+        IReadOnlyCollection<(long Id, string Name, string? ScreeningMetricsJson)> activeCohort,
+        double minQualityDelta,
+        double minSelectionDelta,
+        out string reason)
+    {
+        var candidateMetrics = ScreeningMetrics.FromJson(candidate.ScreeningMetricsJson);
+        if (candidateMetrics == null)
+        {
+            reason = "No candidate scorecard available; champion/challenger gate not applicable.";
+            return true;
+        }
+
+        var activeMetrics = activeCohort
+            .Select(s => (s.Id, s.Name, Metrics: ScreeningMetrics.FromJson(s.ScreeningMetricsJson)))
+            .Where(s => s.Metrics != null && (s.Metrics.QualityScore > 0 || Math.Abs(s.Metrics.SelectionScore) > 0.0001))
+            .ToList();
+        if (activeMetrics.Count == 0)
+        {
+            reason = "No active scorecards available; champion/challenger gate not applicable.";
+            return true;
+        }
+
+        double bestQuality = activeMetrics.Max(s => s.Metrics!.QualityScore);
+        double bestSelection = activeMetrics.Max(s => s.Metrics!.SelectionScore);
+        bool qualityPass = candidateMetrics.QualityScore > 0
+            && candidateMetrics.QualityScore >= bestQuality + minQualityDelta;
+        bool selectionPass = Math.Abs(candidateMetrics.SelectionScore) > 0.0001
+            && candidateMetrics.SelectionScore >= bestSelection + minSelectionDelta;
+
+        if (qualityPass || selectionPass)
+        {
+            reason = "Candidate beat the active cohort on quality or selection score.";
+            return true;
+        }
+
+        reason =
+            $"Candidate score below active champion: quality {candidateMetrics.QualityScore:F2} < {bestQuality + minQualityDelta:F2}, " +
+            $"selection {candidateMetrics.SelectionScore:F2} < {bestSelection + minSelectionDelta:F2}.";
+        return false;
     }
 }

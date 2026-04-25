@@ -1,317 +1,710 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Detects conflicting ML predictions for strongly correlated currency pairs and raises
-/// an alert, preventing the trading engine from simultaneously taking opposing positions
-/// that would partially cancel each other out or expose hidden correlated risk.
-///
-/// <b>Problem:</b> EURUSD and GBPUSD are typically 70–85% correlated. If the EURUSD model
-/// predicts Buy while the GBPUSD model predicts Sell within the same evaluation window,
-/// at least one prediction is almost certainly wrong. Acting on both signals without
-/// investigation compounds directional risk.
-///
-/// <b>Algorithm:</b>
-/// <list type="number">
-///   <item>Read the pair correlation map from <c>EngineConfig</c> key
-///         <c>MLCorrelation:PairMap</c> — a JSON object where each key is a base symbol
-///         and the value is an array of correlated symbols,
-///         e.g. <c>{"EURUSD":["GBPUSD","AUDUSD"]}</c>.</item>
-///   <item>For each base symbol, load <see cref="TradeSignal"/> records with
-///         <c>Status = Approved</c> created within the conflict detection window.</item>
-///   <item>For each correlated peer, load its approved signals in the same window.</item>
-///   <item>If the most recent approved base signal and the most recent approved peer signal
-///         have opposing <c>MLPredictedDirection</c> values, fire an alert.</item>
-/// </list>
-///
-/// Configuration keys (read from <see cref="EngineConfig"/>):
-/// <list type="bullet">
-///   <item><c>MLCorrelation:PollIntervalSeconds</c>   — default 300 (5 min)</item>
-///   <item><c>MLCorrelation:WindowMinutes</c>         — conflict window, default 60</item>
-///   <item><c>MLCorrelation:PairMap</c>               — JSON correlation map, default empty</item>
-///   <item><c>MLCorrelation:AlertDestination</c>      — default "ml-ops"</item>
-/// </list>
+/// Detects opposing approved ML signals across configured correlated currency pairs,
+/// raises a durable pair-specific alert, and optionally rejects the not-yet-ordered
+/// approved signals so the order bridge cannot act on contradictory correlated exposure.
 /// </summary>
 public sealed class MLCorrelatedSignalConflictWorker : BackgroundService
 {
-    // ── EngineConfig key constants ─────────────────────────────────────────────
+    internal const string WorkerName = nameof(MLCorrelatedSignalConflictWorker);
 
-    /// <summary>Seconds between conflict detection cycles (default 300 = 5 min).
-    /// Five minutes is short enough to catch intra-session conflicts before both signals
-    /// are executed, but long enough to avoid excessive DB load from frequent signal queries.</summary>
     private const string CK_PollSecs   = "MLCorrelation:PollIntervalSeconds";
-
-    /// <summary>Width (in minutes) of the conflict detection window (default 60 min).
-    /// Only approved signals generated within this window are compared for directional conflict.
-    /// A 60-minute window covers most intra-session signal windows without reaching back so far
-    /// that conflicts from a previous session are incorrectly flagged.</summary>
     private const string CK_Window     = "MLCorrelation:WindowMinutes";
-
-    /// <summary>JSON object defining the correlation map between currency pairs.
-    /// Format: <c>{"EURUSD":["GBPUSD","AUDUSD"],"USDJPY":["USDCHF"]}</c>.
-    /// Each key is a base symbol; the value is an array of correlated peers to check against.
-    /// The map is one-directional — EURUSD checks GBPUSD, but GBPUSD does not automatically
-    /// check EURUSD unless explicitly listed. Configure both directions if bidirectional checking
-    /// is required. An empty map (<c>{}</c>) disables all conflict detection.</summary>
     private const string CK_PairMap    = "MLCorrelation:PairMap";
-
-    /// <summary>Alert destination identifier for conflict alerts (default "ml-ops").</summary>
     private const string CK_AlertDest  = "MLCorrelation:AlertDestination";
+    private const string CK_RejectSignals = "MLCorrelation:RejectConflictingApprovedSignals";
+    private const string DistributedLockKey = "ml:correlated-signal-conflict:cycle";
+    private const string AlertDeduplicationPrefix = "ml-correlated-signal-conflict:";
+    private const string RejectionReason = "Rejected by MLCorrelatedSignalConflictWorker: correlated approved ML signals conflict.";
 
-    private readonly IServiceScopeFactory                          _scopeFactory;
-    private readonly ILogger<MLCorrelatedSignalConflictWorker>     _logger;
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
 
-    /// <summary>
-    /// Initialises the worker with scope factory and logger.
-    /// </summary>
-    /// <param name="scopeFactory">Used to create per-iteration DI scopes for safe scoped service access.</param>
-    /// <param name="logger">Structured logger for correlation conflict detection and alert events.</param>
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<MLCorrelatedSignalConflictWorker> _logger;
+    private readonly MLCorrelatedSignalConflictOptions _options;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
+
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
+
+    internal readonly record struct MLCorrelatedSignalConflictWorkerSettings(
+        TimeSpan InitialDelay,
+        TimeSpan PollInterval,
+        int PollJitterSeconds,
+        int WindowMinutes,
+        string PairMapJson,
+        string AlertDestination,
+        bool RejectConflictingApprovedSignals,
+        int MaxSignalsPerCycle,
+        int LockTimeoutSeconds,
+        int AlertCooldownSeconds);
+
+    internal readonly record struct MLCorrelatedSignalConflictCycleResult(
+        MLCorrelatedSignalConflictWorkerSettings Settings,
+        string? SkippedReason,
+        int ConfiguredPairCount,
+        int CandidateSignalCount,
+        int ConflictsDetected,
+        int AlertsUpserted,
+        int AlertsResolved,
+        int SignalsRejected)
+    {
+        public static MLCorrelatedSignalConflictCycleResult Skipped(
+            MLCorrelatedSignalConflictWorkerSettings settings,
+            string reason)
+            => new(settings, reason, 0, 0, 0, 0, 0, 0);
+    }
+
+    private readonly record struct CorrelatedPair(string LeftSymbol, string RightSymbol)
+    {
+        public string DeduplicationKey => AlertDeduplicationPrefix + LeftSymbol + ":" + RightSymbol;
+    }
+
+    private sealed record SignalSnapshot(
+        long Id,
+        string Symbol,
+        TradeDirection Direction,
+        DateTime GeneratedAt,
+        decimal? MLConfidenceScore,
+        bool HasOrder);
+
+    private sealed record ConflictCandidate(
+        CorrelatedPair Pair,
+        SignalSnapshot LeftSignal,
+        SignalSnapshot RightSignal,
+        IReadOnlyCollection<long> ConflictingSignalIds);
+
     public MLCorrelatedSignalConflictWorker(
-        IServiceScopeFactory                           scopeFactory,
-        ILogger<MLCorrelatedSignalConflictWorker>      logger)
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLCorrelatedSignalConflictWorker> logger,
+        MLCorrelatedSignalConflictOptions? options = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
         _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _logger = logger;
+        _options = options ?? new MLCorrelatedSignalConflictOptions();
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
-    /// <summary>
-    /// Main background loop. Runs indefinitely until the host signals cancellation.
-    /// On each iteration:
-    /// <list type="number">
-    ///   <item>Creates a fresh DI scope to obtain scoped read/write DbContexts.</item>
-    ///   <item>Reads the poll interval from <see cref="EngineConfig"/>.</item>
-    ///   <item>Delegates to <see cref="DetectConflictsAsync"/> to evaluate all configured pair correlations.</item>
-    ///   <item>Sleeps for the configured poll interval (default 5 min) before the next cycle.</item>
-    /// </list>
-    /// The 5-minute default allows conflicts to be detected and alerted before both signals
-    /// advance through the <see cref="SignalOrderBridgeWorker"/> to order placement.
-    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLCorrelatedSignalConflictWorker started.");
+        var initialSettings = BuildSettings(_options);
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Detects opposing approved ML signals across configured correlated pairs.",
+            initialSettings.PollInterval);
 
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            int pollSecs = 300;
-
-            try
-            {
-                // New DI scope per iteration — DbContexts are scoped and must not outlive a single tick.
-                await using var scope   = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx     = readDb.GetDbContext();
-                var wCtx    = writeDb.GetDbContext();
-
-                // Hot-reload: poll interval read from DB each cycle.
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 300, stoppingToken);
-
-                await DetectConflictsAsync(ctx, wCtx, stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "MLCorrelatedSignalConflictWorker loop error");
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
-        }
-
-        _logger.LogInformation("MLCorrelatedSignalConflictWorker stopping.");
-    }
-
-    // ── Detection core ────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Loads the correlation pair map from <see cref="EngineConfig"/> and checks each
-    /// configured base symbol against its correlated peers for directional conflicts.
-    ///
-    /// <b>Batch-load optimisation:</b> Rather than querying signals per symbol, all relevant
-    /// symbols (base + all peers) are collected into a single list and fetched in one DB query.
-    /// The results are then grouped into an in-memory direction map for O(1) peer lookups.
-    ///
-    /// <b>Conflict definition:</b> A conflict exists when the most recent approved ML signal
-    /// for the base symbol has an opposing <c>MLPredictedDirection</c> to the most recent
-    /// approved ML signal for a correlated peer symbol, within the configured time window.
-    /// "Most recent" is determined by <c>GeneratedAt DESC</c>.
-    ///
-    /// <b>Why only approved signals?</b> Pending signals may still be rejected by risk checks;
-    /// comparing them would generate premature conflict alerts. Executed signals are already
-    /// in the market and cannot be recalled, so detecting their conflicts has limited actionable value.
-    /// Approved signals are the most dangerous — they are about to be executed and can still be
-    /// stopped if the conflict is flagged in time.
-    /// </summary>
-    /// <param name="readCtx">Read-only DbContext for signal queries and alert deduplication.</param>
-    /// <param name="writeCtx">Write DbContext for alert creation.</param>
-    /// <param name="ct">Cancellation token from the host.</param>
-    private async Task DetectConflictsAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
-    {
-        int    windowMinutes = await GetConfigAsync<int>   (readCtx, CK_Window,    60,      ct);
-        string pairMapJson   = await GetConfigAsync<string>(readCtx, CK_PairMap,   "{}",    ct);
-        string alertDest     = await GetConfigAsync<string>(readCtx, CK_AlertDest, "ml-ops", ct);
-
-        // Parse the pair correlation map from JSON.
-        // Example: {"EURUSD":["GBPUSD","AUDUSD"],"USDJPY":["USDCHF"]}
-        // PropertyNameCaseInsensitive allows both "EURUSD" and "eurusd" keys to match.
-        Dictionary<string, List<string>> pairMap;
         try
         {
-            pairMap = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, List<string>>>(
-                pairMapJson,
-                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                ?? new();
-        }
-        catch (Exception ex)
-        {
-            // Malformed JSON in EngineConfig — log the error and skip this cycle entirely.
-            _logger.LogWarning(ex, "MLCorrelation: failed to parse PairMap JSON — skipping.");
-            return;
-        }
+            var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName) + initialSettings.InitialDelay;
+            if (initialDelay > TimeSpan.Zero)
+                await Task.Delay(initialDelay, _timeProvider, stoppingToken);
 
-        if (pairMap.Count == 0)
-        {
-            // No pairs configured — correlation detection is disabled. This is normal during
-            // initial deployment before the ops team configures the pair map.
-            _logger.LogDebug("MLCorrelation: PairMap is empty, nothing to check.");
-            return;
-        }
-
-        var cutoff = DateTime.UtcNow.AddMinutes(-windowMinutes);
-
-        // Collect all unique symbols that appear in the pair map (both base keys and peer values).
-        // This allows a single DB query to load all relevant signals instead of one query per symbol.
-        var allSymbols = pairMap.Keys
-            .Concat(pairMap.Values.SelectMany(v => v))
-            .Distinct()
-            .ToList();
-
-        // Batch-load the latest approved ML-predicted signals for all relevant symbols.
-        // Only signals with a non-null MLPredictedDirection are included — signals lacking a
-        // direction prediction cannot participate in directional conflict detection.
-        var latestSignals = await readCtx.Set<TradeSignal>()
-            .Where(ts => allSymbols.Contains(ts.Symbol)            &&
-                         ts.Status == TradeSignalStatus.Approved    &&
-                         ts.GeneratedAt >= cutoff                   &&
-                         ts.MLPredictedDirection.HasValue           &&
-                         !ts.IsDeleted)
-            .AsNoTracking()
-            .Select(ts => new
+            while (!stoppingToken.IsCancellationRequested)
             {
-                ts.Symbol,
-                ts.MLPredictedDirection,
-                ts.GeneratedAt,
-            })
+                var started = Stopwatch.GetTimestamp();
+                var delaySettings = BuildSettings(_options);
+
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                    var result = await RunCycleAsync(stoppingToken);
+                    delaySettings = result.Settings;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.CandidateSignalCount);
+                    _healthMonitor?.RecordCycleSuccess(
+                        WorkerName,
+                        (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _consecutiveFailures = 0;
+                    }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _metrics?.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", WorkerName));
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                await Task.Delay(
+                    CalculateDelay(GetIntervalWithJitter(delaySettings), _consecutiveFailures),
+                    _timeProvider,
+                    stoppingToken);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopping.", WorkerName);
+        }
+    }
+
+    internal async Task<MLCorrelatedSignalConflictCycleResult> RunCycleAsync(CancellationToken ct)
+    {
+        var settings = BuildSettings(_options);
+        var started = Stopwatch.GetTimestamp();
+
+        try
+        {
+            IAsyncDisposable? cycleLock = null;
+            if (_distributedLock is null)
+            {
+                _metrics?.MLCorrelatedSignalConflictLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "unavailable"));
+
+                if (!_missingDistributedLockWarningEmitted)
+                {
+                    _logger.LogWarning(
+                        "{Worker} running without IDistributedLock; duplicate conflict cycles are possible in multi-instance deployments.",
+                        WorkerName);
+                    _missingDistributedLockWarningEmitted = true;
+                }
+            }
+            else
+            {
+                cycleLock = await _distributedLock.TryAcquireAsync(
+                    DistributedLockKey,
+                    TimeSpan.FromSeconds(settings.LockTimeoutSeconds),
+                    ct);
+
+                if (cycleLock is null)
+                {
+                    _metrics?.MLCorrelatedSignalConflictLockAttempts.Add(
+                        1,
+                        new KeyValuePair<string, object?>("outcome", "busy"));
+                    RecordCycleSkipped("lock_busy");
+                    return MLCorrelatedSignalConflictCycleResult.Skipped(settings, "lock_busy");
+                }
+
+                _metrics?.MLCorrelatedSignalConflictLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "acquired"));
+            }
+
+            await using (cycleLock)
+            {
+                await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+                try
+                {
+                    await using var scope = _scopeFactory.CreateAsyncScope();
+                    var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    var writeDb = writeContext.GetDbContext();
+
+                    var runtimeSettings = await LoadRuntimeSettingsAsync(writeDb, settings, ct);
+                    return await DetectConflictsAsync(writeDb, runtimeSettings, ct);
+                }
+                finally
+                {
+                    WorkerBulkhead.MLMonitoring.Release();
+                }
+            }
+        }
+        finally
+        {
+            _metrics?.MLCorrelatedSignalConflictCycleDurationMs.Record(
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        }
+
+        throw new UnreachableException($"{WorkerName} cycle completed without producing a result.");
+    }
+
+    private async Task<MLCorrelatedSignalConflictCycleResult> DetectConflictsAsync(
+        DbContext db,
+        MLCorrelatedSignalConflictWorkerSettings settings,
+        CancellationToken ct)
+    {
+        DateTime nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        IReadOnlyList<CorrelatedPair> pairs;
+        try
+        {
+            pairs = ParsePairs(settings.PairMapJson);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "{Worker}: failed to parse MLCorrelation:PairMap JSON.", WorkerName);
+            RecordCycleSkipped("invalid_pair_map");
+            return MLCorrelatedSignalConflictCycleResult.Skipped(settings, "invalid_pair_map");
+        }
+
+        if (pairs.Count == 0)
+        {
+            int resolved = await ResolveStaleAlertsAsync(db, new HashSet<string>(), nowUtc, ct);
+            await db.SaveChangesAsync(ct);
+            _metrics?.MLCorrelatedSignalConflictAlertsResolved.Add(resolved);
+            RecordCycleSkipped("empty_pair_map");
+            return new MLCorrelatedSignalConflictCycleResult(
+                settings,
+                "empty_pair_map",
+                0,
+                0,
+                0,
+                0,
+                resolved,
+                0);
+        }
+
+        DateTime cutoff = nowUtc.AddMinutes(-settings.WindowMinutes);
+        var configuredSymbols = pairs
+            .SelectMany(pair => new[] { pair.LeftSymbol, pair.RightSymbol })
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var candidateSignals = await db.Set<TradeSignal>()
+            .Where(signal => signal.Status == TradeSignalStatus.Approved
+                             && signal.GeneratedAt >= cutoff
+                             && signal.ExpiresAt > nowUtc
+                             && signal.MLPredictedDirection.HasValue
+                             && !signal.IsDeleted
+                             && configuredSymbols.Contains(signal.Symbol.ToUpper()))
+            .OrderByDescending(signal => signal.GeneratedAt)
+            .ThenByDescending(signal => signal.Id)
+            .Take(settings.MaxSignalsPerCycle)
             .ToListAsync(ct);
 
-        // Build symbol → latest predicted direction map.
-        // For each symbol, take the most recently generated approved signal's direction.
-        // This handles the case where a symbol has multiple approved signals in the window
-        // (e.g. from different strategies) — we compare the freshest prediction only.
-        var directionMap = latestSignals
-            .GroupBy(s => s.Symbol)
-            .ToDictionary(
-                g => g.Key,
-                g => g.OrderByDescending(s => s.GeneratedAt).First().MLPredictedDirection!.Value);
-
-        foreach (var (baseSymbol, peers) in pairMap)
+        if (candidateSignals.Count == 0)
         {
-            ct.ThrowIfCancellationRequested();
+            int resolved = await ResolveStaleAlertsAsync(db, new HashSet<string>(), nowUtc, ct);
+            await db.SaveChangesAsync(ct);
+            _metrics?.MLCorrelatedSignalConflictAlertsResolved.Add(resolved);
+            RecordCycleSkipped("no_candidate_signals");
 
-            // Skip base symbols with no approved signal in the window — no conflict possible.
-            if (!directionMap.TryGetValue(baseSymbol, out var baseDir)) continue;
+            return new MLCorrelatedSignalConflictCycleResult(
+                settings,
+                "no_candidate_signals",
+                pairs.Count,
+                0,
+                0,
+                0,
+                resolved,
+                0);
+        }
 
-            foreach (var peer in peers)
+        var signalsBySymbol = candidateSignals
+            .GroupBy(signal => NormalizeSymbol(signal.Symbol), StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group
+                    .Select(signal => new SignalSnapshot(
+                        signal.Id,
+                        NormalizeSymbol(signal.Symbol),
+                        signal.MLPredictedDirection!.Value,
+                        NormalizeUtc(signal.GeneratedAt),
+                        signal.MLConfidenceScore,
+                        signal.OrderId.HasValue))
+                    .OrderByDescending(signal => signal.GeneratedAt)
+                    .ThenByDescending(signal => signal.Id)
+                    .ToArray(),
+                StringComparer.Ordinal);
+
+        var conflicts = new List<ConflictCandidate>();
+        foreach (var pair in pairs)
+        {
+            if (!signalsBySymbol.TryGetValue(pair.LeftSymbol, out var leftSignals)
+                || !signalsBySymbol.TryGetValue(pair.RightSymbol, out var rightSignals))
             {
-                // Skip peers with no approved signal in the window — no conflict possible.
-                if (!directionMap.TryGetValue(peer, out var peerDir)) continue;
+                continue;
+            }
 
-                // Same direction = correlated pairs agree — no conflict, no alert.
-                // Example: EURUSD Buy + GBPUSD Buy is expected behaviour for USD-selling regimes.
-                if (baseDir == peerDir) continue;
+            var conflictingIds = new HashSet<long>();
+            SignalSnapshot? representativeLeft = null;
+            SignalSnapshot? representativeRight = null;
 
-                // Opposing directions on correlated pairs = conflict.
-                // Example: EURUSD Buy + GBPUSD Sell is contradictory — at least one model
-                // is miscalibrated for the current market regime.
-                _logger.LogWarning(
-                    "MLCorrelation: conflicting signals — {Base} predicts {BaseDir} " +
-                    "but correlated pair {Peer} predicts {PeerDir} within {Window} min window.",
-                    baseSymbol, baseDir, peer, peerDir, windowMinutes);
-
-                // Avoid duplicating an already-active conflict alert for either symbol in the pair.
-                // The check covers both the base and peer symbol to prevent double-alerting when
-                // a symmetric pair map lists both directions (e.g. EURUSD→GBPUSD and GBPUSD→EURUSD).
-                bool alertExists = await readCtx.Set<Alert>()
-                    .AnyAsync(a => (a.Symbol == baseSymbol || a.Symbol == peer) &&
-                                   a.AlertType == AlertType.MLModelDegraded     &&
-                                   a.IsActive  && !a.IsDeleted, ct);
-
-                if (alertExists) continue;
-
-                // Create a conflict alert with full directional context in ConditionJson.
-                // The alert is keyed to the baseSymbol so the AlertWorker can route it correctly.
-                writeCtx.Set<Alert>().Add(new Alert
+            foreach (var left in leftSignals)
+            {
+                foreach (var right in rightSignals)
                 {
-                    AlertType     = AlertType.MLModelDegraded,
-                    Symbol        = baseSymbol,
-                    ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
+                    if (left.Direction == right.Direction)
+                        continue;
+
+                    conflictingIds.Add(left.Id);
+                    conflictingIds.Add(right.Id);
+
+                    if (representativeLeft is null
+                        || representativeRight is null
+                        || IsNewerConflictPair(left, right, representativeLeft, representativeRight))
                     {
-                        reason         = "correlated_signal_conflict",
-                        severity       = "warning",
-                        baseSymbol,
-                        peerSymbol     = peer,
-                        baseDirection  = baseDir.ToString(),
-                        peerDirection  = peerDir.ToString(),
-                        windowMinutes,
-                    }),
-                    IsActive = true,
-                });
+                        representativeLeft = left;
+                        representativeRight = right;
+                    }
+                }
+            }
+
+            if (representativeLeft is not null && representativeRight is not null)
+            {
+                conflicts.Add(new ConflictCandidate(
+                    pair,
+                    representativeLeft,
+                    representativeRight,
+                    conflictingIds.OrderBy(id => id).ToArray()));
             }
         }
 
-        // Single SaveChangesAsync call after processing all pairs — batches all alert inserts
-        // into one DB round trip rather than one per conflict.
-        await writeCtx.SaveChangesAsync(ct);
+        var activeConflictKeys = conflicts
+            .Select(conflict => conflict.Pair.DeduplicationKey)
+            .ToHashSet(StringComparer.Ordinal);
+
+        int alertsResolved = await ResolveStaleAlertsAsync(db, activeConflictKeys, nowUtc, ct);
+        int alertsUpserted = 0;
+        foreach (var conflict in conflicts)
+        {
+            await UpsertAlertAsync(db, conflict, settings, nowUtc, ct);
+            alertsUpserted++;
+        }
+
+        int rejected = settings.RejectConflictingApprovedSignals
+            ? RejectConflictingSignals(candidateSignals, conflicts)
+            : 0;
+
+        await db.SaveChangesAsync(ct);
+
+        _metrics?.MLCorrelatedSignalConflictConflictsDetected.Add(conflicts.Count);
+        _metrics?.MLCorrelatedSignalConflictAlertsUpserted.Add(alertsUpserted);
+        _metrics?.MLCorrelatedSignalConflictAlertsResolved.Add(alertsResolved);
+        _metrics?.MLCorrelatedSignalConflictSignalsRejected.Add(rejected);
+
+        if (conflicts.Count > 0)
+        {
+            _logger.LogWarning(
+                "{Worker}: detected {Count} correlated signal conflict(s), rejected {Rejected} approved signal(s).",
+                WorkerName,
+                conflicts.Count,
+                rejected);
+        }
+
+        return new MLCorrelatedSignalConflictCycleResult(
+            settings,
+            SkippedReason: null,
+            ConfiguredPairCount: pairs.Count,
+            CandidateSignalCount: candidateSignals.Count,
+            ConflictsDetected: conflicts.Count,
+            AlertsUpserted: alertsUpserted,
+            AlertsResolved: alertsResolved,
+            SignalsRejected: rejected);
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
+    private static bool IsNewerConflictPair(
+        SignalSnapshot candidateLeft,
+        SignalSnapshot candidateRight,
+        SignalSnapshot currentLeft,
+        SignalSnapshot currentRight)
+    {
+        var candidateGeneratedAt = candidateLeft.GeneratedAt >= candidateRight.GeneratedAt
+            ? candidateLeft.GeneratedAt
+            : candidateRight.GeneratedAt;
+        var currentGeneratedAt = currentLeft.GeneratedAt >= currentRight.GeneratedAt
+            ? currentLeft.GeneratedAt
+            : currentRight.GeneratedAt;
 
-    /// <summary>
-    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table.
-    /// Returns <paramref name="defaultValue"/> when the key does not exist or the stored
-    /// string cannot be converted to <typeparamref name="T"/>.
-    /// </summary>
-    /// <typeparam name="T">Target type — typically <c>int</c> or <c>string</c>.</typeparam>
-    /// <param name="ctx">Any DbContext with access to the EngineConfig set.</param>
-    /// <param name="key">The EngineConfig key to look up.</param>
-    /// <param name="defaultValue">Fallback returned when the key is absent or unparseable.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>The parsed configuration value, or <paramref name="defaultValue"/>.</returns>
+        if (candidateGeneratedAt != currentGeneratedAt)
+            return candidateGeneratedAt > currentGeneratedAt;
+
+        return Math.Max(candidateLeft.Id, candidateRight.Id) > Math.Max(currentLeft.Id, currentRight.Id);
+    }
+
+    private static int RejectConflictingSignals(
+        IReadOnlyCollection<TradeSignal> candidateSignals,
+        IReadOnlyCollection<ConflictCandidate> conflicts)
+    {
+        if (conflicts.Count == 0)
+            return 0;
+
+        var conflictingIds = conflicts
+            .SelectMany(conflict => conflict.ConflictingSignalIds)
+            .ToHashSet();
+        int rejected = 0;
+
+        foreach (var signal in candidateSignals)
+        {
+            if (!conflictingIds.Contains(signal.Id)
+                || signal.Status != TradeSignalStatus.Approved
+                || signal.OrderId.HasValue)
+            {
+                continue;
+            }
+
+            signal.Status = TradeSignalStatus.Rejected;
+            signal.RejectionReason = RejectionReason;
+            rejected++;
+        }
+
+        return rejected;
+    }
+
+    private static async Task UpsertAlertAsync(
+        DbContext db,
+        ConflictCandidate conflict,
+        MLCorrelatedSignalConflictWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var alerts = await db.Set<Alert>()
+            .IgnoreQueryFilters()
+            .Where(alert => alert.DeduplicationKey == conflict.Pair.DeduplicationKey)
+            .OrderByDescending(alert => alert.Id)
+            .ToListAsync(ct);
+
+        var alert = alerts.FirstOrDefault(candidate => !candidate.IsDeleted);
+        if (alert is null)
+        {
+            alert = new Alert
+            {
+                AlertType = AlertType.MLModelDegraded,
+                DeduplicationKey = conflict.Pair.DeduplicationKey
+            };
+            db.Set<Alert>().Add(alert);
+        }
+
+        alert.AlertType = AlertType.MLModelDegraded;
+        alert.Symbol = conflict.Pair.LeftSymbol;
+        alert.Severity = AlertSeverity.High;
+        alert.CooldownSeconds = settings.AlertCooldownSeconds;
+        alert.ConditionJson = BuildAlertConditionJson(conflict, settings);
+        alert.IsActive = true;
+        alert.AutoResolvedAt = null;
+        alert.IsDeleted = false;
+
+        foreach (var duplicate in alerts.Where(candidate => candidate.Id != alert.Id && !candidate.IsDeleted))
+        {
+            duplicate.IsActive = false;
+            duplicate.AutoResolvedAt ??= nowUtc;
+        }
+    }
+
+    private static async Task<int> ResolveStaleAlertsAsync(
+        DbContext db,
+        IReadOnlySet<string> activeConflictKeys,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var activeAlerts = await db.Set<Alert>()
+            .Where(alert => alert.AlertType == AlertType.MLModelDegraded
+                            && alert.DeduplicationKey != null
+                            && alert.DeduplicationKey.StartsWith(AlertDeduplicationPrefix)
+                            && alert.IsActive)
+            .ToListAsync(ct);
+
+        int resolved = 0;
+        foreach (var alert in activeAlerts)
+        {
+            if (alert.DeduplicationKey is not null && activeConflictKeys.Contains(alert.DeduplicationKey))
+                continue;
+
+            alert.IsActive = false;
+            alert.AutoResolvedAt = nowUtc;
+            resolved++;
+        }
+
+        return resolved;
+    }
+
+    private static IReadOnlyList<CorrelatedPair> ParsePairs(string pairMapJson)
+    {
+        var rawMap = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(
+            string.IsNullOrWhiteSpace(pairMapJson) ? "{}" : pairMapJson,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new();
+
+        var pairsByKey = new Dictionary<string, CorrelatedPair>(StringComparer.Ordinal);
+        foreach (var (baseSymbolRaw, peers) in rawMap)
+        {
+            var baseSymbol = NormalizeSymbol(baseSymbolRaw);
+            if (baseSymbol.Length == 0 || peers is null)
+                continue;
+
+            foreach (var peerRaw in peers)
+            {
+                var peer = NormalizeSymbol(peerRaw);
+                if (peer.Length == 0 || string.Equals(baseSymbol, peer, StringComparison.Ordinal))
+                    continue;
+
+                var ordered = string.CompareOrdinal(baseSymbol, peer) <= 0
+                    ? (Left: baseSymbol, Right: peer)
+                    : (Left: peer, Right: baseSymbol);
+                pairsByKey[ordered.Left + ":" + ordered.Right] = new CorrelatedPair(ordered.Left, ordered.Right);
+            }
+        }
+
+        return pairsByKey.Values
+            .OrderBy(pair => pair.LeftSymbol, StringComparer.Ordinal)
+            .ThenBy(pair => pair.RightSymbol, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static string BuildAlertConditionJson(
+        ConflictCandidate conflict,
+        MLCorrelatedSignalConflictWorkerSettings settings)
+        => JsonSerializer.Serialize(new
+        {
+            reason = "correlated_signal_conflict",
+            severity = "high",
+            destination = settings.AlertDestination,
+            leftSymbol = conflict.Pair.LeftSymbol,
+            rightSymbol = conflict.Pair.RightSymbol,
+            leftSignalId = conflict.LeftSignal.Id,
+            rightSignalId = conflict.RightSignal.Id,
+            leftDirection = conflict.LeftSignal.Direction.ToString(),
+            rightDirection = conflict.RightSignal.Direction.ToString(),
+            leftGeneratedAt = conflict.LeftSignal.GeneratedAt,
+            rightGeneratedAt = conflict.RightSignal.GeneratedAt,
+            leftMlConfidence = conflict.LeftSignal.MLConfidenceScore,
+            rightMlConfidence = conflict.RightSignal.MLConfidenceScore,
+            leftOrderLinked = conflict.LeftSignal.HasOrder,
+            rightOrderLinked = conflict.RightSignal.HasOrder,
+            conflictingSignalCount = conflict.ConflictingSignalIds.Count,
+            conflictingSignalIds = conflict.ConflictingSignalIds.OrderBy(id => id).Take(20),
+            windowMinutes = settings.WindowMinutes,
+            rejectedApprovedSignals = settings.RejectConflictingApprovedSignals
+        });
+
+    private async Task<MLCorrelatedSignalConflictWorkerSettings> LoadRuntimeSettingsAsync(
+        DbContext db,
+        MLCorrelatedSignalConflictWorkerSettings defaults,
+        CancellationToken ct)
+        => defaults with
+        {
+            PollInterval = TimeSpan.FromSeconds(ClampInt(
+                await GetConfigAsync(db, CK_PollSecs, (int)defaults.PollInterval.TotalSeconds, ct),
+                300,
+                30,
+                24 * 60 * 60)),
+            WindowMinutes = ClampInt(
+                await GetConfigAsync(db, CK_Window, defaults.WindowMinutes, ct),
+                defaults.WindowMinutes,
+                1,
+                24 * 60),
+            PairMapJson = await GetConfigAsync(db, CK_PairMap, defaults.PairMapJson, ct),
+            AlertDestination = NormalizeDestination(
+                await GetConfigAsync(db, CK_AlertDest, defaults.AlertDestination, ct)),
+            RejectConflictingApprovedSignals = await GetConfigAsync(
+                db,
+                CK_RejectSignals,
+                defaults.RejectConflictingApprovedSignals,
+                ct)
+        };
+
+    private void RecordCycleSkipped(string reason)
+        => _metrics?.MLCorrelatedSignalConflictCyclesSkipped.Add(
+            1,
+            new KeyValuePair<string, object?>("reason", reason));
+
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+            return baseInterval <= TimeSpan.Zero ? TimeSpan.FromMinutes(5) : baseInterval;
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private static MLCorrelatedSignalConflictWorkerSettings BuildSettings(
+        MLCorrelatedSignalConflictOptions options)
+        => new(
+            InitialDelay: TimeSpan.FromSeconds(ClampInt(options.InitialDelaySeconds, 60, 0, 24 * 60 * 60)),
+            PollInterval: TimeSpan.FromSeconds(ClampInt(options.PollIntervalSeconds, 300, 30, 24 * 60 * 60)),
+            PollJitterSeconds: ClampInt(options.PollJitterSeconds, 30, 0, 24 * 60 * 60),
+            WindowMinutes: ClampInt(options.WindowMinutes, 60, 1, 24 * 60),
+            PairMapJson: string.IsNullOrWhiteSpace(options.PairMapJson) ? "{}" : options.PairMapJson,
+            AlertDestination: NormalizeDestination(options.AlertDestination),
+            RejectConflictingApprovedSignals: options.RejectConflictingApprovedSignals,
+            MaxSignalsPerCycle: ClampInt(options.MaxSignalsPerCycle, 1_000, 1, 10_000),
+            LockTimeoutSeconds: ClampInt(options.LockTimeoutSeconds, 5, 0, 300),
+            AlertCooldownSeconds: ClampInt(options.AlertCooldownSeconds, 1_800, 60, 24 * 60 * 60));
+
+    private static TimeSpan GetIntervalWithJitter(MLCorrelatedSignalConflictWorkerSettings settings)
+        => settings.PollJitterSeconds == 0
+            ? settings.PollInterval
+            : settings.PollInterval + TimeSpan.FromSeconds(Random.Shared.Next(0, settings.PollJitterSeconds + 1));
+
+    private static int ClampInt(int value, int defaultValue, int min, int max)
+        => value < min || value > max ? Math.Clamp(defaultValue, min, max) : value;
+
+    private static string NormalizeSymbol(string? symbol)
+        => string.IsNullOrWhiteSpace(symbol)
+            ? string.Empty
+            : symbol.Trim().ToUpperInvariant();
+
+    private static string NormalizeDestination(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "ml-ops" : value.Trim();
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+        };
+
     private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+        DbContext ctx,
+        string key,
+        T defaultValue,
+        CancellationToken ct)
     {
         var entry = await ctx.Set<EngineConfig>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .FirstOrDefaultAsync(config => config.Key == key && !config.IsDeleted, ct);
 
-        if (entry?.Value is null) return defaultValue;
+        if (entry?.Value is null)
+            return defaultValue;
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        if (typeof(T) == typeof(string))
+            return (T)(object)entry.Value;
+
+        if (typeof(T) == typeof(bool))
+        {
+            if (bool.TryParse(entry.Value, out var boolValue))
+                return (T)(object)boolValue;
+
+            if (entry.Value == "1")
+                return (T)(object)true;
+
+            if (entry.Value == "0")
+                return (T)(object)false;
+        }
+
+        if (typeof(T) == typeof(int)
+            && int.TryParse(entry.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intValue))
+            return (T)(object)intValue;
+
+        return defaultValue;
     }
 }

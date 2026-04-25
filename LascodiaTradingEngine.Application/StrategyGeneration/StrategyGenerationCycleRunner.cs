@@ -451,6 +451,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 RegimeDetectedAtBySymbol = cycleData.RegimeDetectedAtBySymbol,
                 TransitionSymbols = cycleData.TransitionSymbols,
                 LowConfidenceSymbols = cycleData.LowConfidenceSymbols,
+                DataHealthBySymbol = cycleData.DataHealthBySymbol,
                 Haircuts = haircuts,
                 PortfolioEquityCurve = portfolioEquityCurve,
                 SpreadProfileProvider = spreadProfileProvider,
@@ -479,6 +480,28 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                         removedCount,
                         portfolioDrawdown,
                         config.MaxPortfolioDrawdownPct);
+                }
+            }
+
+            if (pendingCandidates.Count > 0)
+            {
+                var (survivors, exposureRemovedCount) = StrategyScreeningEngine.RunPortfolioExposureFilter(
+                    pendingCandidates,
+                    pairDataBySymbol,
+                    activeCountBySymbol,
+                    config.MaxActivePerSymbol,
+                    config.MaxPortfolioSymbolWeightPct,
+                    config.MaxPortfolioCurrencyExposurePct);
+                if (exposureRemovedCount > 0)
+                {
+                    pendingCandidates = survivors;
+                    portfolioFilterRemoved += exposureRemovedCount;
+                    _metrics.StrategyGenPortfolioExposureFiltered.Add(exposureRemovedCount);
+                    _logger.LogInformation(
+                        "StrategyGenerationWorker: portfolio exposure filter removed {Count} (symbol cap={SymbolCap:P0}, currency cap={CurrencyCap:P0})",
+                        exposureRemovedCount,
+                        config.MaxPortfolioSymbolWeightPct,
+                        config.MaxPortfolioCurrencyExposurePct);
                 }
             }
 

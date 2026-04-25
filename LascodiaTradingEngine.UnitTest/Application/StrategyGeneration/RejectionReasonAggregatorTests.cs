@@ -80,6 +80,34 @@ public class RejectionReasonAggregatorTests
     }
 
     [Fact]
+    public async Task LoadAsync_PrefersStructuredFailureStage_WhenReasonIsHumanText()
+    {
+        var (ctx, inner) = NewCtx();
+        var now = DateTime.UtcNow;
+        for (int i = 0; i < 12; i++)
+        {
+            inner.Set<StrategyGenerationFailure>().Add(new StrategyGenerationFailure
+            {
+                Id = i + 1,
+                CandidateId = $"c-{Guid.NewGuid()}",
+                CandidateHash = "h",
+                StrategyType = StrategyType.MACDDivergence,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                FailureStage = ScreeningFailureReason.WalkForward.ToString(),
+                FailureReason = "walk-forward 1/3 windows passed",
+                CreatedAtUtc = now.AddDays(-1),
+            });
+        }
+        inner.SaveChanges();
+
+        var agg = new RejectionReasonAggregator(ctx, NullLogger<RejectionReasonAggregator>.Instance);
+        var result = await agg.LoadAsync(CancellationToken.None);
+
+        Assert.Equal(RejectionClass.Overfit, result[StrategyType.MACDDivergence]);
+    }
+
+    [Fact]
     public async Task MixedDistribution_ClassifiedAsMixed()
     {
         var (ctx, inner) = NewCtx();
