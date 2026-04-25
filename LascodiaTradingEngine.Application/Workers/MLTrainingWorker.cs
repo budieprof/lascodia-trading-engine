@@ -301,6 +301,11 @@ public sealed class MLTrainingWorker : BackgroundService
     /// </summary>
     private const int StarvationDeadlineMinutesDefault = 240;
 
+    private static readonly JsonSerializerOptions HyperparamOverrideJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
     // ── EngineConfig keys ─────────────────────────────────────────────────────
     private const string CK_PollSecs                    = "MLTraining:PollIntervalSeconds";
     private const string CK_K                     = "MLTraining:K";
@@ -704,7 +709,9 @@ public sealed class MLTrainingWorker : BackgroundService
             {
                 try
                 {
-                    var overrides = JsonSerializer.Deserialize<HyperparamOverrides>(run.HyperparamConfigJson);
+                    var overrides = JsonSerializer.Deserialize<HyperparamOverrides>(
+                        run.HyperparamConfigJson,
+                        HyperparamOverrideJsonOptions);
                     if (overrides is not null)
                     {
                         hp = hp with
@@ -715,6 +722,9 @@ public sealed class MLTrainingWorker : BackgroundService
                             TemporalDecayLambda        = overrides.TemporalDecayLambda        ?? hp.TemporalDecayLambda,
                             MaxEpochs                  = overrides.MaxEpochs                  ?? hp.MaxEpochs,
                             EmbargoBarCount            = overrides.EmbargoBarCount            ?? hp.EmbargoBarCount,
+                            NclLambda                  = overrides.NclLambda                  ?? hp.NclLambda,
+                            DiversityLambda            = overrides.DiversityLambda            ?? hp.DiversityLambda,
+                            MaxEnsembleDiversity       = overrides.MaxEnsembleDiversity       ?? hp.MaxEnsembleDiversity,
                             FpCostWeight               = overrides.FpCostWeight               ?? hp.FpCostWeight,
                             UseClassWeights            = overrides.UseClassWeights            ?? hp.UseClassWeights,
                             UseTripleBarrier           = overrides.UseTripleBarrier           ?? hp.UseTripleBarrier,
@@ -3379,7 +3389,9 @@ trainingSamplesBuilt:;
             {
                 try
                 {
-                    var prev = JsonSerializer.Deserialize<HyperparamOverrides>(failedRun.HyperparamConfigJson);
+                    var prev = JsonSerializer.Deserialize<HyperparamOverrides>(
+                        failedRun.HyperparamConfigJson,
+                        HyperparamOverrideJsonOptions);
                     currentGen = prev?.SelfTuningGeneration ?? 0;
                 }
                 catch { /* ignore parse errors */ }
@@ -3512,7 +3524,9 @@ trainingSamplesBuilt:;
 
                     try
                     {
-                        refHp = JsonSerializer.Deserialize<HyperparamOverrides>(matchedRun.HyperparamConfigJson);
+                        refHp = JsonSerializer.Deserialize<HyperparamOverrides>(
+                            matchedRun.HyperparamConfigJson,
+                            HyperparamOverrideJsonOptions);
                         if (refHp is not null)
                         {
                             refModelId = topModel.Id;

@@ -138,6 +138,41 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDeadLetterOptions>>().Value);
 
+        services.RemoveAll<MLDegradationModeOptions>();
+        services.AddSingleton<IValidateOptions<MLDegradationModeOptions>, MLDegradationModeOptionsValidator>();
+        services.AddOptions<MLDegradationModeOptions>()
+            .Bind(configuration.GetSection(nameof(MLDegradationModeOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDegradationModeOptions>>().Value);
+
+        services.RemoveAll<MLDirectionStreakOptions>();
+        services.AddSingleton<IValidateOptions<MLDirectionStreakOptions>, MLDirectionStreakOptionsValidator>();
+        services.AddOptions<MLDirectionStreakOptions>()
+            .Bind(configuration.GetSection(nameof(MLDirectionStreakOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDirectionStreakOptions>>().Value);
+
+        services.RemoveAll<MLDriftAgreementOptions>();
+        services.AddSingleton<IValidateOptions<MLDriftAgreementOptions>, MLDriftAgreementOptionsValidator>();
+        services.AddOptions<MLDriftAgreementOptions>()
+            .Bind(configuration.GetSection(nameof(MLDriftAgreementOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDriftAgreementOptions>>().Value);
+
+        services.RemoveAll<MLDriftMonitorOptions>();
+        services.AddSingleton<IValidateOptions<MLDriftMonitorOptions>, MLDriftMonitorOptionsValidator>();
+        services.AddOptions<MLDriftMonitorOptions>()
+            .Bind(configuration.GetSection(nameof(MLDriftMonitorOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDriftMonitorOptions>>().Value);
+
+        services.RemoveAll<MLEnsembleDiversityRecoveryOptions>();
+        services.AddSingleton<IValidateOptions<MLEnsembleDiversityRecoveryOptions>, MLEnsembleDiversityRecoveryOptionsValidator>();
+        services.AddOptions<MLEnsembleDiversityRecoveryOptions>()
+            .Bind(configuration.GetSection(nameof(MLEnsembleDiversityRecoveryOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLEnsembleDiversityRecoveryOptions>>().Value);
+
         services.RemoveAll<MLErgodicityOptions>();
         services.AddSingleton<IValidateOptions<MLErgodicityOptions>, MLErgodicityOptionsValidator>();
         services.AddOptions<MLErgodicityOptions>()

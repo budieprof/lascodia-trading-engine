@@ -735,6 +735,198 @@ public class MLConformalBreakerWorkerTest
         Assert.NotNull(alert.AutoResolvedAt);
     }
 
+    [Fact]
+    public async Task RunAsync_AlertBackpressure_HaltsTripDispatchesPastBudget()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var modelA = CreateModel(1, "EURUSD", isSuppressed: false);
+        var modelB = CreateModel(2, "GBPUSD", isSuppressed: false);
+        var modelC = CreateModel(3, "USDJPY", isSuppressed: false);
+        db.Set<MLModel>().AddRange(modelA, modelB, modelC);
+        AddCalibration(db, modelA, now);
+        AddCalibration(db, modelB, now);
+        AddCalibration(db, modelC, now);
+        // All three are uncovered → all three should trip absent backpressure.
+        AddPredictionLogs(db, modelA, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        AddPredictionLogs(db, modelB, now.AddHours(-2), covered: false, startTradeSignalId: 100);
+        AddPredictionLogs(db, modelC, now.AddHours(-2), covered: false, startTradeSignalId: 200);
+        await db.SaveChangesAsync();
+
+        var dispatcher = new CapturingAlertDispatcher();
+        var options = CreateBreakerOptions();
+        options.MaxAlertsPerCycle = 1;
+
+        var worker = CreateWorker(db, options, alertDispatcher: dispatcher);
+        await worker.RunAsync(CancellationToken.None);
+
+        // All three break, but only one alert is dispatched.
+        var trippedBreakers = await db.Set<MLConformalBreakerLog>().Where(b => b.IsActive).ToListAsync();
+        Assert.Equal(3, trippedBreakers.Count);
+        Assert.Single(dispatcher.Dispatched);
+    }
+
+    [Fact]
+    public async Task RunAsync_FairRotation_PrefersLeastRecentlyEvaluatedModelsWhenOverCap()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var staleModel = CreateModel(1, "EURUSD", isSuppressed: false);
+        var freshModel = CreateModel(2, "GBPUSD", isSuppressed: false);
+        db.Set<MLModel>().AddRange(staleModel, freshModel);
+        AddCalibration(db, staleModel, now);
+        AddCalibration(db, freshModel, now);
+        AddPredictionLogs(db, staleModel, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        AddPredictionLogs(db, freshModel, now.AddHours(-2), covered: false, startTradeSignalId: 100);
+
+        // freshModel was just evaluated; staleModel hasn't been evaluated. With cap=1,
+        // staleModel should be picked first. Pre-seed only freshModel's cursor.
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformal:Model:2:LastEvaluatedAt",
+            Value = now.AddHours(-1).ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            DataType = ConfigDataType.String,
+            IsHotReloadable = false,
+            LastUpdatedAt = now,
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.MaxCycleModels = 1;
+        options.ModelBatchSize = 1;
+
+        var worker = CreateWorker(db, options);
+        await worker.RunAsync(CancellationToken.None);
+
+        var trippedBreakers = await db.Set<MLConformalBreakerLog>().Where(b => b.IsActive).ToListAsync();
+        var tripped = Assert.Single(trippedBreakers);
+        Assert.Equal(staleModel.Id, tripped.MLModelId);
+    }
+
+    [Fact]
+    public async Task RunAsync_PerModelCursors_ArePersistedForEvaluatedModels()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        var lastEvaluatedConfig = await db.Set<EngineConfig>()
+            .SingleOrDefaultAsync(c => c.Key == "MLConformal:Model:1:LastEvaluatedAt");
+        Assert.NotNull(lastEvaluatedConfig);
+
+        var tripStreakConfig = await db.Set<EngineConfig>()
+            .SingleOrDefaultAsync(c => c.Key == "MLConformal:Model:1:TripStreak");
+        Assert.NotNull(tripStreakConfig);
+        Assert.Equal("1", tripStreakConfig!.Value);
+    }
+
+    [Fact]
+    public async Task RunAsync_ChronicTripEscalation_FiresAlertOnceWhenStreakReachesThreshold()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: true);
+        var existingBreaker = CreateBreaker(model.Id, id: 50, suspendedAt: now.AddHours(-2), resumeAt: now.AddHours(8));
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalBreakerLog>().Add(existingBreaker);
+        AddCalibration(db, model, now);
+        // Logs after the suspension started → the active breaker should be refreshed (still bad).
+        AddPredictionLogs(db, model, existingBreaker.SuspendedAt.AddMinutes(1), covered: false, startTradeSignalId: 1);
+
+        // Pre-seed streak=3 (one short of the default ChronicTripThreshold=4).
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformal:Model:1:TripStreak",
+            Value = "3",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = false,
+            LastUpdatedAt = now,
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var dispatcher = new CapturingAlertDispatcher();
+        var worker = CreateWorker(db, CreateBreakerOptions(), alertDispatcher: dispatcher);
+        await worker.RunAsync(CancellationToken.None);
+
+        // Streak crossed threshold → chronic alert fired.
+        var chronicAlert = await db.Set<Alert>()
+            .SingleOrDefaultAsync(a => a.DeduplicationKey == "ml-conformal-chronic-trip:1");
+        Assert.NotNull(chronicAlert);
+        Assert.True(chronicAlert!.IsActive);
+        Assert.Equal(AlertType.MLModelDegraded, chronicAlert.AlertType);
+
+        // Dispatcher saw the chronic message.
+        Assert.Contains(
+            dispatcher.Dispatched,
+            d => d.Alert.DeduplicationKey == "ml-conformal-chronic-trip:1");
+
+        // Streak is now 4.
+        var streakConfig = await db.Set<EngineConfig>()
+            .SingleAsync(c => c.Key == "MLConformal:Model:1:TripStreak");
+        Assert.Equal("4", streakConfig.Value);
+    }
+
+    [Fact]
+    public async Task RunAsync_ChronicTripEscalation_AutoResolvesOnRecovery()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: true);
+        var existingBreaker = CreateBreaker(model.Id, id: 60, suspendedAt: now.AddHours(-2), resumeAt: now.AddHours(8));
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalBreakerLog>().Add(existingBreaker);
+        AddCalibration(db, model, now);
+        // Logs after the suspension that show recovery → covered.
+        AddPredictionLogs(db, model, existingBreaker.SuspendedAt.AddMinutes(1), covered: true, startTradeSignalId: 1);
+
+        // Pre-seed an active chronic alert + streak.
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformal:Model:1:TripStreak",
+            Value = "5",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = false,
+            LastUpdatedAt = now,
+            IsDeleted = false
+        });
+        db.Set<Alert>().Add(new Alert
+        {
+            Id = 9090,
+            AlertType = AlertType.MLModelDegraded,
+            DeduplicationKey = "ml-conformal-chronic-trip:1",
+            Symbol = "EURUSD",
+            Severity = AlertSeverity.High,
+            CooldownSeconds = 3600,
+            ConditionJson = "{}",
+            IsActive = true,
+            LastTriggeredAt = now.AddHours(-1),
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        var chronicAlert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == "ml-conformal-chronic-trip:1");
+        Assert.False(chronicAlert.IsActive);
+        Assert.NotNull(chronicAlert.AutoResolvedAt);
+
+        // Streak reset.
+        var streakConfig = await db.Set<EngineConfig>()
+            .SingleAsync(c => c.Key == "MLConformal:Model:1:TripStreak");
+        Assert.Equal("0", streakConfig.Value);
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()

@@ -52,6 +52,8 @@ public class HyperparamOverrides
     public double? TemporalDecayLambda { get; set; }
     public int?    MaxEpochs           { get; set; }
     public int?    EmbargoBarCount     { get; set; }
+    public double? DiversityLambda     { get; set; }
+    public double? MaxEnsembleDiversity { get; set; }
     public Guid?   SearchBatchId       { get; set; }
     public int?    CandidateIndex      { get; set; }
     public int?    TotalCandidates     { get; set; }
@@ -380,7 +382,7 @@ public class HyperparamOverrides
     public int SsaWindowLength { get; set; } = 10;           // #298 SSA embedding window L
     public double FtrlAlpha { get; set; } = 0.1;             // #299 FTRL learning rate
     public double FtrlBeta { get; set; } = 1.0;              // #299 FTRL smoothing parameter
-    public double NclLambda { get; set; } = 0.3;             // #300 NCL correlation penalty weight
+    public double? NclLambda { get; set; }                   // #300 NCL correlation penalty weight
     public double MwuEpsilon { get; set; } = 0.1;            // #301 MWU learning rate for multiplicative update
     public int TransferEntropyLag { get; set; } = 1;         // #302 TE conditioning lag
     public int CcmLibrarySizeMax { get; set; } = 200;        // #303 CCM max library size
@@ -3131,6 +3133,15 @@ public class ModelSnapshot
     /// Used by <c>MLTrainingWorker</c> as a promotion quality gate.
     /// </summary>
     public double Ece { get; set; }
+
+    /// <summary>
+    /// Per-market-regime training-time ECE measured during model training. Keys are regime
+    /// names (e.g. "Trending", "Ranging", "Volatile"); values are the held-out ECE measured
+    /// on the regime-conditioned subset. Empty = training pipeline did not compute per-regime
+    /// baselines, in which case <see cref="MLCalibrationMonitorWorker"/> falls back to the
+    /// global <see cref="Ece"/> for each regime's baseline-signal evaluation.
+    /// </summary>
+    public Dictionary<string, double> RegimeEce { get; set; } = [];
 
     // ── Reliability diagram bins (set post-Platt calibration) ────────���───────
 

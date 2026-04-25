@@ -87,6 +87,7 @@ public static class WorkerGroupFilter
         typeof(MLCovariateShiftWorker),
         typeof(MLCusumDriftWorker),
         typeof(MLDataQualityWorker),
+        typeof(MLDegradationModeWorker),
         typeof(MLDirectionStreakWorker),
         typeof(MLDriftMonitorWorker),
         typeof(MLEnsembleDiversityRecoveryWorker),

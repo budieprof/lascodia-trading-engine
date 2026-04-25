@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -55,11 +56,13 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const string CK_FleetDegradationRatio = "MLCalibration:FleetDegradationRatio";
     private const string CK_PerRegimeMinSamples = "MLCalibration:PerRegimeMinSamples";
     private const string CK_PerRegimeMaxSnapshots = "MLCalibration:PerRegimeMaxSnapshots";
-    private const string CK_WriteLegacyAlias = "MLCalibration:WriteLegacyAlias";
+    private const string CK_BootstrapCacheStaleHours = "MLCalibration:BootstrapCacheStaleHours";
+    private const string CK_RetrainOnBaselineCritical = "MLCalibration:RetrainOnBaselineCritical";
     private const string CK_TimeDecayHalfLifeDays = "MLCalibration:TimeDecayHalfLifeDays";
     private const string CK_MinSamplesForTimeDecay = "MLCalibration:MinSamplesForTimeDecay";
     private const string CK_TrendSmoothingWindow = "MLCalibration:TrendSmoothingWindow";
     private const string CK_StaleSkipAlertThreshold = "MLCalibration:StaleSkipAlertThreshold";
+    private const string CK_MaxDegreeOfParallelism = "MLCalibration:MaxDegreeOfParallelism";
     private const string StaleAlertDeduplicationPrefix = "ml-calibration-monitor-stale:";
 
     private const int DefaultPollSeconds = 60 * 60;
@@ -135,10 +138,11 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const int MinMinSamplesForTimeDecay = 0;
     private const int MaxMinSamplesForTimeDecay = 5_000;
 
-    // Smoothing window: 1 = single-cycle delta (current behavior), 3 = average over last 3
-    // cycles. Higher values dampen transient single-cycle noise at the cost of slower
-    // response to a real shift.
-    private const int DefaultTrendSmoothingWindow = 1;
+    // Smoothing window: 3 = average over last 3 cycles' ECE before computing trend delta.
+    // Default raised from 1 because single-cycle deltas are objectively noisy on small
+    // resolved-log windows; the median-of-3 absorbs transient one-cycle spikes without
+    // meaningfully delaying detection of a real shift.
+    private const int DefaultTrendSmoothingWindow = 3;
     private const int MinTrendSmoothingWindow = 1;
     private const int MaxTrendSmoothingWindow = 30;
 
@@ -147,6 +151,21 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const int DefaultStaleSkipAlertThreshold = 5;
     private const int MinStaleSkipAlertThreshold = 1;
     private const int MaxStaleSkipAlertThreshold = 1000;
+
+    // Bootstrap is cached per-model with this staleness window. Calibration drifts on the
+    // scale of days, not hours; recomputing the stderr every cycle wastes CPU. The cached
+    // value lives in EngineConfig and is invalidated when the cache age exceeds the bound.
+    private const int DefaultBootstrapCacheStaleHours = 24;
+    private const int MinBootstrapCacheStaleHours = 0;
+    private const int MaxBootstrapCacheStaleHours = 24 * 30;
+
+    // Bounded in-process concurrency for per-model evaluation. Default 1 preserves
+    // historical strictly-sequential semantics; bumping this fans out to N concurrent
+    // (model, lock-acquire, query, audit-flush) chains, each in its own DI scope. The
+    // cycle-level distributed lock and bulkhead semaphore still gate the whole cycle.
+    private const int DefaultMaxDegreeOfParallelism = 1;
+    private const int MinMaxDegreeOfParallelism = 1;
+    private const int MaxMaxDegreeOfParallelism = 16;
 
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
@@ -167,7 +186,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         string Symbol,
         Timeframe Timeframe,
         LearnerArchitecture LearnerArchitecture,
-        byte[]? ModelBytes);
+        byte[]? ModelBytes,
+        uint RowVersion);
 
     private readonly record struct CalibrationSample(
         double Confidence,
@@ -397,7 +417,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
                 try
                 {
-                    return await RunCycleCoreAsync(serviceProvider, writeContext, db, settings, ct);
+                    return await RunCycleCoreAsync(db, settings, ct);
                 }
                 finally
                 {
@@ -409,7 +429,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
         try
         {
-            return await RunCycleCoreAsync(serviceProvider, writeContext, db, settings, ct);
+            return await RunCycleCoreAsync(db, settings, ct);
         }
         finally
         {
@@ -432,8 +452,6 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     }
 
     private async Task<MLCalibrationMonitorCycleResult> RunCycleCoreAsync(
-        IServiceProvider serviceProvider,
-        IWriteApplicationDbContext writeContext,
         DbContext db,
         MLCalibrationMonitorWorkerSettings settings,
         CancellationToken ct)
@@ -450,7 +468,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 model.Symbol,
                 model.Timeframe,
                 model.LearnerArchitecture,
-                model.ModelBytes))
+                model.ModelBytes,
+                model.RowVersion))
             .ToListAsync(ct);
 
         if (models.Count == 0)
@@ -466,75 +485,86 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         var modelIds = models.Select(model => model.Id).ToList();
         var lastNewestOutcome = await LoadLastNewestOutcomeMapAsync(db, modelIds, ct);
 
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        int parallelism = Math.Clamp(settings.MaxDegreeOfParallelism, 1, MaxMaxDegreeOfParallelism);
+
+        // Per-model evaluation runs under bounded parallelism. Each iteration owns its
+        // DI scope (and therefore its own DbContext), so EF state never crosses the
+        // boundary. Outcome aggregation happens after the loop from a thread-safe bag;
+        // counters that need to fire mid-iteration use Interlocked.
+        var outcomes = new ConcurrentBag<ModelEvaluationOutcome>();
+        int failedModels = 0;
+
+        await Parallel.ForEachAsync(
+            models,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = parallelism,
+                CancellationToken = ct,
+            },
+            async (model, modelCt) =>
+            {
+                lastNewestOutcome.TryGetValue(model.Id, out var lastSeen);
+
+                await using var modelScope = _scopeFactory.CreateAsyncScope();
+                var modelWriteCtx = modelScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                var modelDb = modelWriteCtx.GetDbContext();
+
+                try
+                {
+                    var outcome = await EvaluateModelWithLockAsync(
+                        modelScope.ServiceProvider,
+                        modelWriteCtx,
+                        modelDb,
+                        model,
+                        settings,
+                        lastSeen,
+                        nowUtc,
+                        modelCt);
+
+                    outcomes.Add(outcome);
+
+                    if (!outcome.Evaluated)
+                    {
+                        _metrics?.MLCalibrationMonitorModelsSkipped.Add(
+                            1,
+                            new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
+                            new KeyValuePair<string, object?>("symbol", model.Symbol),
+                            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.Increment(ref failedModels);
+                    _metrics?.WorkerErrors.Add(
+                        1,
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("reason", "ml_calibration_monitor_model"));
+                    _logger.LogWarning(
+                        ex,
+                        "{Worker}: failed to evaluate calibration for model {ModelId} ({Symbol}/{Timeframe}).",
+                        WorkerName,
+                        model.Id,
+                        model.Symbol,
+                        model.Timeframe);
+                }
+            }).ConfigureAwait(false);
+
         int evaluatedModels = 0;
         int warningModels = 0;
         int criticalModels = 0;
         int retrainingQueued = 0;
         int dispatchedAlerts = 0;
         int resolvedAlerts = 0;
-        int failedModels = 0;
-
-        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
-
-        foreach (var model in models)
+        foreach (var outcome in outcomes)
         {
-            ct.ThrowIfCancellationRequested();
-
-            try
-            {
-                lastNewestOutcome.TryGetValue(model.Id, out var lastSeen);
-                var outcome = await EvaluateModelWithLockAsync(
-                    serviceProvider,
-                    writeContext,
-                    db,
-                    model,
-                    settings,
-                    lastSeen,
-                    nowUtc,
-                    ct);
-
-                if (!outcome.Evaluated)
-                {
-                    _metrics?.MLCalibrationMonitorModelsSkipped.Add(
-                        1,
-                        new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
-                        new KeyValuePair<string, object?>("symbol", model.Symbol),
-                        new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
-                    continue;
-                }
-
-                evaluatedModels++;
-                if (outcome.AlertState == MLCalibrationMonitorAlertState.Warning)
-                    warningModels++;
-                else if (outcome.AlertState == MLCalibrationMonitorAlertState.Critical)
-                    criticalModels++;
-
-                if (outcome.RetrainingQueued)
-                    retrainingQueued++;
-                if (outcome.AlertDispatched)
-                    dispatchedAlerts++;
-                if (outcome.AlertResolved)
-                    resolvedAlerts++;
-            }
-            catch (Exception ex)
-            {
-                failedModels++;
-                _metrics?.WorkerErrors.Add(
-                    1,
-                    new KeyValuePair<string, object?>("worker", WorkerName),
-                    new KeyValuePair<string, object?>("reason", "ml_calibration_monitor_model"));
-                _logger.LogWarning(
-                    ex,
-                    "{Worker}: failed to evaluate calibration for model {ModelId} ({Symbol}/{Timeframe}).",
-                    WorkerName,
-                    model.Id,
-                    model.Symbol,
-                    model.Timeframe);
-            }
-            finally
-            {
-                db.ChangeTracker.Clear();
-            }
+            if (!outcome.Evaluated) continue;
+            evaluatedModels++;
+            if (outcome.AlertState == MLCalibrationMonitorAlertState.Warning) warningModels++;
+            else if (outcome.AlertState == MLCalibrationMonitorAlertState.Critical) criticalModels++;
+            if (outcome.RetrainingQueued) retrainingQueued++;
+            if (outcome.AlertDispatched) dispatchedAlerts++;
+            if (outcome.AlertResolved) resolvedAlerts++;
         }
 
         bool fleetAlertDispatched = false;
@@ -629,8 +659,42 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     {
         // Audit rows accumulate locally and flush in a dedicated DI scope at the end. Keeps
         // audit IO from implicitly committing pending changes on the snapshot scope and gives
-        // operators a durable trail regardless of failure mode.
-        var pendingAudits = new List<MLCalibrationLog>(4);
+        // operators a durable trail regardless of failure mode. Capacity sized for the global
+        // row plus one per matched regime (MarketRegime has fewer than 16 members today).
+        var pendingAudits = new List<MLCalibrationLog>(16);
+        // Bootstrap-cache writes accumulate across the global + per-regime evaluation paths
+        // and flush in a single batched upsert at the end of the cycle. With N matched
+        // regimes and a full cache miss this collapses (1 + N) round-trips into 1.
+        var pendingCacheSpecs = new List<EngineConfigUpsertSpec>(8);
+
+        // Resolve every per-context override in a single round-trip and clone the settings
+        // record with the effective values. The resolver walks the four wildcard tiers
+        // (Symbol+TF → Symbol-only → TF-only → fleet-wide) per knob in memory, so a single
+        // `*:H1:MaxEce` row tightens the ceiling on every H1 model without per-symbol rows.
+        var overrides = await LoadAllPerContextOverridesAsync(db, model.Symbol, model.Timeframe, ct);
+        settings = settings with
+        {
+            MaxEce = ResolveOverride(overrides, model.Symbol, model.Timeframe, "MaxEce",
+                TryParseFiniteDouble,
+                v => v >= MinMaxEce && v <= MaxMaxEce,
+                settings.MaxEce),
+            DegradationDelta = ResolveOverride(overrides, model.Symbol, model.Timeframe, "DegradationDelta",
+                TryParseFiniteDouble,
+                v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
+                settings.DegradationDelta),
+            RegressionGuardK = ResolveOverride(overrides, model.Symbol, model.Timeframe, "RegressionGuardK",
+                TryParseFiniteDouble,
+                v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
+                settings.RegressionGuardK),
+            BootstrapCacheStaleHours = ResolveOverride(overrides, model.Symbol, model.Timeframe, "BootstrapCacheStaleHours",
+                TryParseStrictInt,
+                v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
+                settings.BootstrapCacheStaleHours),
+            RetrainOnBaselineCritical = ResolveOverride(overrides, model.Symbol, model.Timeframe, "RetrainOnBaselineCritical",
+                TryParseBoolish,
+                _ => true,
+                settings.RetrainOnBaselineCritical),
+        };
 
         try
         {
@@ -687,9 +751,29 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             if (lastSeenOutcomeAt.HasValue && newestOutcomeAt <= lastSeenOutcomeAt.Value)
                 return ModelEvaluationOutcome.Skipped("no_new_outcomes");
 
+            double? cachedStderr = await LoadFreshBootstrapStderrAsync(
+                db, model.Id, regime: null, model.RowVersion, nowUtc,
+                settings.BootstrapCacheStaleHours, ct);
+            bool globalBootstrapCacheHit = cachedStderr.HasValue;
+            _metrics?.MLCalibrationMonitorBootstrapCacheLookups.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", globalBootstrapCacheHit ? "hit" : "miss"),
+                new KeyValuePair<string, object?>("scope", "global"),
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+
             var summary = ComputeCalibrationSummary(
                 samples, settings.BootstrapResamples, nowUtc,
-                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay);
+                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay,
+                cachedStderr, model.Id);
+            // When we recomputed the stderr (cache was missing or stale), append the cache
+            // refresh specs to the pending batch — they flush together with the summary keys.
+            if (!globalBootstrapCacheHit && summary.EceStderr > 0)
+            {
+                AppendBootstrapCacheSpecs(
+                    pendingCacheSpecs, model.Id, regime: null,
+                    summary.EceStderr, model.RowVersion, nowUtc);
+            }
             // Smoothed previous-ECE: average over the last N global audit rows for this model.
             // With TrendSmoothingWindow = 1 (default) this collapses to single-cycle behavior;
             // higher values dampen transient one-cycle spikes that auto-resolve next cycle.
@@ -747,13 +831,30 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                     new KeyValuePair<string, object?>("source", "baseline"));
             }
 
-            await PersistSummaryAsync(db, model, settings, summary, signals, nowUtc, ct);
+            await PersistSummaryAsync(db, model, summary, signals, nowUtc, pendingCacheSpecs, ct);
 
             bool retrainingQueued = false;
             bool alertDispatched = false;
             bool alertResolved = false;
 
-            if (alertState == MLCalibrationMonitorAlertState.Critical)
+            // Critical state can be reached via three different signals; only two of them
+            // suggest retraining will help by default.
+            //
+            // - Threshold critical: model is way off the absolute ECE ceiling → retrain
+            // - Trend critical: model is rapidly decalibrating from its own recent past → retrain
+            // - Baseline critical (only): live ECE has always been worse than training-time ECE.
+            //   Retraining on the same data window is usually unhelpful — the gap is typically
+            //   distributional, not noise — so by default we alert but suppress the retrain.
+            //   Operators who believe their training-time baseline is stale (e.g. labels were
+            //   later corrected) can flip RetrainOnBaselineCritical = true (globally or per
+            //   Symbol/Timeframe via the MLCalibration:Override:{Symbol}:{Timeframe}: pattern).
+            bool retrainEligible =
+                (signals.ThresholdExceeded && summary.CurrentEce > settings.MaxEce * SevereThresholdMultiplier) ||
+                (signals.TrendExceeded && signals.TrendDelta > settings.DegradationDelta * SevereThresholdMultiplier) ||
+                (settings.RetrainOnBaselineCritical && signals.BaselineExceeded
+                    && signals.BaselineDelta > settings.DegradationDelta * SevereThresholdMultiplier);
+
+            if (alertState == MLCalibrationMonitorAlertState.Critical && retrainEligible)
             {
                 retrainingQueued = await QueueRetrainingIfNeededAsync(
                     db, model, settings, summary, signals, nowUtc, ct);
@@ -818,13 +919,13 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 signals: signals,
                 alertState: alertState,
                 newestOutcomeAt: newestOutcomeAt,
-                diagnostics: BuildDiagnosticsWithBins(summary, signals, settings),
+                diagnostics: BuildDiagnosticsWithBins(summary, signals, settings, globalBootstrapCacheHit),
                 evaluatedAt: nowUtc);
 
             // Per-regime breakdown: pool samples by the active regime at PredictedAt and
             // measure ECE per regime. Each regime gets its own audit row so dashboards can
             // see whether miscalibration is regime-localised.
-            await EvaluatePerRegimeAsync(db, model, samples, settings, nowUtc, pendingAudits, ct);
+            await EvaluatePerRegimeAsync(db, model, samples, settings, nowUtc, pendingAudits, pendingCacheSpecs, ct);
 
             _logger.LogDebug(
                 "{Worker}: model {ModelId} ({Symbol}/{Timeframe}) ece={Ece:F6}±{Stderr:F6}, accuracy={Accuracy:P1}, meanConfidence={MeanConfidence:F4}, previous={PreviousEce}, baseline={BaselineEce}, trendDelta={TrendDelta:F6}, baselineDelta={BaselineDelta:F6}, samples={Samples}, state={State}.",
@@ -865,6 +966,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         MLCalibrationMonitorWorkerSettings settings,
         DateTime nowUtc,
         List<MLCalibrationLog> pendingAudits,
+        List<EngineConfigUpsertSpec> pendingCacheSpecs,
         CancellationToken ct)
     {
         if (samples.Count == 0) return;
@@ -893,9 +995,30 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         {
             if (regimeSamples.Count < settings.PerRegimeMinSamples) continue;
 
+            // Per-regime stderr is cached under its own scope key so each regime amortises
+            // bootstrap CPU separately. RowVersion check ensures a model swap invalidates
+            // every regime's cache simultaneously. Per-context override applies the same
+            // staleness window resolution as the global path.
+            double? regimeCachedStderr = await LoadFreshBootstrapStderrAsync(
+                db, model.Id, regime, model.RowVersion, nowUtc, settings.BootstrapCacheStaleHours, ct);
+            bool regimeBootstrapCacheHit = regimeCachedStderr.HasValue;
+            _metrics?.MLCalibrationMonitorBootstrapCacheLookups.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", regimeBootstrapCacheHit ? "hit" : "miss"),
+                new KeyValuePair<string, object?>("scope", "regime"),
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+
             var regimeSummary = ComputeCalibrationSummary(
                 regimeSamples, settings.BootstrapResamples, nowUtc,
-                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay);
+                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay,
+                regimeCachedStderr, model.Id);
+            if (!regimeBootstrapCacheHit && regimeSummary.EceStderr > 0)
+            {
+                AppendBootstrapCacheSpecs(
+                    pendingCacheSpecs, model.Id, regime,
+                    regimeSummary.EceStderr, model.RowVersion, nowUtc);
+            }
             // Per-regime trend signal reads the prior per-regime ECE from the audit log so
             // regime drift is detected even when the global trend is flat. Returns null on
             // first cycle for a given regime, in which case the trend signal stays inert.
@@ -905,7 +1028,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 regimeSummary.CurrentEce,
                 regimeSummary.EceStderr,
                 previousEce: regimePreviousEce,
-                baselineEce: TryResolveBaselineEce(model.ModelBytes),
+                baselineEce: TryResolveBaselineEce(model.ModelBytes, regime),
                 settings.MaxEce,
                 settings.DegradationDelta,
                 settings.RegressionGuardK);
@@ -929,7 +1052,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 signals: regimeSignals,
                 alertState: regimeState,
                 newestOutcomeAt: regimeSummary.NewestOutcomeAt,
-                diagnostics: BuildDiagnosticsWithBins(regimeSummary, regimeSignals, settings),
+                diagnostics: BuildDiagnosticsWithBins(regimeSummary, regimeSignals, settings, regimeBootstrapCacheHit),
                 evaluatedAt: nowUtc);
         }
     }
@@ -1006,7 +1129,9 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         int bootstrapResamples,
         DateTime nowUtc,
         double timeDecayHalfLifeDays,
-        int minSamplesForTimeDecay)
+        int minSamplesForTimeDecay,
+        double? cachedStderr,
+        long modelId)
     {
         // Time decay is auto-disabled below MinSamplesForTimeDecay so the tilt cannot
         // dominate floating-point noise on small samples.
@@ -1060,7 +1185,12 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             binMeanConfidence[i] = binConfidenceSum[i] / binCounts[i];
         }
 
-        double eceStderr = ComputeBootstrapEceStderr(samples, bootstrapResamples, nowUtc, effectiveHalfLife);
+        // Bootstrap caching: calibration drifts on the scale of days, not hours; recomputing
+        // the stderr every cycle wastes CPU. The caller supplies the cached value when fresh
+        // (within BootstrapCacheStaleHours); we recompute only when the cache is stale or
+        // missing.
+        double eceStderr = cachedStderr
+            ?? ComputeBootstrapEceStderr(samples, bootstrapResamples, nowUtc, effectiveHalfLife, modelId);
 
         return new CalibrationSummary(
             ResolvedCount: samples.Count,
@@ -1101,16 +1231,28 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         IReadOnlyList<CalibrationSample> samples,
         int resamples,
         DateTime nowUtc,
-        double effectiveHalfLifeDays)
+        double effectiveHalfLifeDays,
+        long modelId)
     {
         if (resamples <= 0 || samples.Count < 2) return 0.0;
 
-        // Deterministic seed: derived from sample count + first/last outcome timestamps so
-        // identical inputs yield identical stderr across runs.
-        long seed = samples.Count;
-        if (samples.Count > 0) seed ^= samples[0].OutcomeAt.Ticks;
-        if (samples.Count > 1) seed ^= samples[^1].OutcomeAt.Ticks;
-        var rng = new Random(unchecked((int)seed));
+        // Deterministic, fixed-mix seed: FNV-1a 64 over (modelId, count, firstTick, lastTick)
+        // folded to int. Identical inputs reproduce the same stderr across runs and replicas.
+        // We avoid HashCode.Combine here because that uses a process-randomized seed, which
+        // would make two replicas of the same model disagree on a cold-cache stderr.
+        // Including modelId in the mix prevents collisions between two models that happen to
+        // share sample-boundary timestamps.
+        long seed;
+        unchecked
+        {
+            seed = 1469598103934665603L; // FNV-1a 64-bit offset basis
+            const long fnvPrime = 1099511628211L;
+            seed = (seed ^ modelId) * fnvPrime;
+            seed = (seed ^ samples.Count) * fnvPrime;
+            seed = (seed ^ samples[0].OutcomeAt.Ticks) * fnvPrime;
+            seed = (seed ^ samples[^1].OutcomeAt.Ticks) * fnvPrime;
+        }
+        var rng = new Random(unchecked((int)(seed ^ (seed >> 32))));
 
         var binCounts = new double[NumBins];
         var binCorrect = new double[NumBins];
@@ -1185,43 +1327,35 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             trendStderrPasses);
     }
 
-    private async Task PersistSummaryAsync(
+    /// <summary>
+    /// Persists the four current-state keys this worker writes to <c>EngineConfig</c>.
+    /// </summary>
+    /// <remarks>
+    /// Writes only the four current-state hot-reload keys
+    /// (<c>:CurrentEce</c>, <c>:EceStderr</c>, <c>:CalibrationDegrading</c>, <c>:LastEvaluatedAt</c>)
+    /// plus internal bootstrap-cache scaffolding. Time-series data lives in
+    /// <c>MLCalibrationLog</c>. For the deleted-key migration mapping, see
+    /// <c>docs/migrations/2026-04-mlcalibrationmonitor-engineconfig-cleanup.md</c>.
+    /// </remarks>
+    private static async Task PersistSummaryAsync(
         DbContext db,
         ActiveModelCandidate model,
-        MLCalibrationMonitorWorkerSettings settings,
         CalibrationSummary summary,
         CalibrationSignals signals,
         DateTime nowUtc,
+        List<EngineConfigUpsertSpec> pendingCacheSpecs,
         CancellationToken ct)
     {
         string modelPrefix = $"MLCalibration:Model:{model.Id}";
 
-        var specs = new List<EngineConfigUpsertSpec>(12)
+        // Combine the four hot-reload summary keys with any bootstrap-cache refresh specs
+        // accumulated during this cycle (global + per-regime). Single round-trip per model.
+        var specs = new List<EngineConfigUpsertSpec>(4 + pendingCacheSpecs.Count)
         {
             new($"{modelPrefix}:CurrentEce",
                 summary.CurrentEce.ToString("F6", CultureInfo.InvariantCulture),
                 ConfigDataType.Decimal,
                 "Current live Expected Calibration Error for this ML model.",
-                false),
-            new($"{modelPrefix}:ResolvedCount",
-                summary.ResolvedCount.ToString(CultureInfo.InvariantCulture),
-                ConfigDataType.Int,
-                "Resolved prediction count contributing to the latest ML calibration measurement.",
-                false),
-            new($"{modelPrefix}:Accuracy",
-                summary.Accuracy.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Observed correctness rate across the latest resolved predictions used by MLCalibrationMonitorWorker.",
-                false),
-            new($"{modelPrefix}:MeanConfidence",
-                summary.MeanConfidence.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Mean predicted-class confidence across the latest resolved predictions used by MLCalibrationMonitorWorker.",
-                false),
-            new($"{modelPrefix}:TrendDelta",
-                signals.TrendDelta.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Current minus previous live ECE delta for this ML model.",
                 false),
             new($"{modelPrefix}:CalibrationDegrading",
                 (signals.ThresholdExceeded || signals.TrendExceeded || signals.BaselineExceeded).ToString(),
@@ -1239,44 +1373,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 "Bootstrap-derived ECE stderr used to gate the trend signal.",
                 false),
         };
-
-        if (signals.PreviousEce.HasValue)
-        {
-            specs.Add(new($"{modelPrefix}:PreviousEce",
-                signals.PreviousEce.Value.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Previous live Expected Calibration Error measurement for this ML model.",
-                false));
-        }
-
-        if (signals.BaselineEce.HasValue)
-        {
-            specs.Add(new($"{modelPrefix}:BaselineEce",
-                signals.BaselineEce.Value.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Training-time baseline ECE loaded from the persisted model snapshot.",
-                false));
-            specs.Add(new($"{modelPrefix}:BaselineDelta",
-                signals.BaselineDelta.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Current live ECE minus training-time snapshot ECE for this ML model.",
-                false));
-        }
-
-        if (settings.WriteLegacyAlias)
-        {
-            string legacyPrefix = $"MLCalibration:{model.Symbol}:{model.Timeframe}";
-            specs.Add(new($"{legacyPrefix}:CurrentEce",
-                summary.CurrentEce.ToString("F6", CultureInfo.InvariantCulture),
-                ConfigDataType.Decimal,
-                "Legacy alias for the active model's current live ECE in this symbol/timeframe context.",
-                false));
-            specs.Add(new($"{legacyPrefix}:ModelId",
-                model.Id.ToString(CultureInfo.InvariantCulture),
-                ConfigDataType.Int,
-                "ML model id currently backing the legacy MLCalibration symbol/timeframe aliases.",
-                false));
-        }
+        specs.AddRange(pendingCacheSpecs);
 
         await EngineConfigUpsert.BatchUpsertAsync(db, specs, ct);
     }
@@ -1721,9 +1818,10 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             CK_MinTimeBetweenRetrainsHours, CK_TrainingDataWindowDays,
             CK_ModelLockTimeoutSeconds, CK_RegressionGuardK, CK_BootstrapResamples,
             CK_FleetDegradationRatio, CK_PerRegimeMinSamples, CK_PerRegimeMaxSnapshots,
-            CK_WriteLegacyAlias,
             CK_TimeDecayHalfLifeDays, CK_MinSamplesForTimeDecay,
             CK_TrendSmoothingWindow, CK_StaleSkipAlertThreshold,
+            CK_BootstrapCacheStaleHours, CK_RetrainOnBaselineCritical,
+            CK_MaxDegreeOfParallelism,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -1771,7 +1869,6 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 DefaultPerRegimeMinSamples, MinPerRegimeMinSamples, MaxPerRegimeMinSamples),
             PerRegimeMaxSnapshots: ClampInt(GetInt(values, CK_PerRegimeMaxSnapshots, DefaultPerRegimeMaxSnapshots),
                 DefaultPerRegimeMaxSnapshots, MinPerRegimeMaxSnapshots, MaxPerRegimeMaxSnapshots),
-            WriteLegacyAlias: GetBool(values, CK_WriteLegacyAlias, true),
             TimeDecayHalfLifeDays: ClampDoubleAllowingZero(GetDouble(values, CK_TimeDecayHalfLifeDays, DefaultTimeDecayHalfLifeDays),
                 DefaultTimeDecayHalfLifeDays, MinTimeDecayHalfLifeDays, MaxTimeDecayHalfLifeDays),
             MinSamplesForTimeDecay: ClampIntAllowingZero(GetInt(values, CK_MinSamplesForTimeDecay, DefaultMinSamplesForTimeDecay),
@@ -1779,7 +1876,16 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             TrendSmoothingWindow: ClampInt(GetInt(values, CK_TrendSmoothingWindow, DefaultTrendSmoothingWindow),
                 DefaultTrendSmoothingWindow, MinTrendSmoothingWindow, MaxTrendSmoothingWindow),
             StaleSkipAlertThreshold: ClampInt(GetInt(values, CK_StaleSkipAlertThreshold, DefaultStaleSkipAlertThreshold),
-                DefaultStaleSkipAlertThreshold, MinStaleSkipAlertThreshold, MaxStaleSkipAlertThreshold));
+                DefaultStaleSkipAlertThreshold, MinStaleSkipAlertThreshold, MaxStaleSkipAlertThreshold),
+            BootstrapCacheStaleHours: ClampInt(GetInt(values, CK_BootstrapCacheStaleHours, DefaultBootstrapCacheStaleHours),
+                DefaultBootstrapCacheStaleHours, MinBootstrapCacheStaleHours, MaxBootstrapCacheStaleHours),
+            // Default off — baseline-only Critical alerts but does not retrain. Operators
+            // who believe their training-time baseline is stale (or want all-Critical-retrains
+            // for safety) can flip this to true.
+            RetrainOnBaselineCritical: GetBool(values, CK_RetrainOnBaselineCritical, false),
+            MaxDegreeOfParallelism: ClampInt(
+                GetInt(values, CK_MaxDegreeOfParallelism, DefaultMaxDegreeOfParallelism),
+                DefaultMaxDegreeOfParallelism, MinMaxDegreeOfParallelism, MaxMaxDegreeOfParallelism));
     }
 
     private static MLCalibrationMonitorAlertState ResolveAlertState(
@@ -1822,7 +1928,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         || log.CalibratedProbability.HasValue
         || log.RawProbability.HasValue;
 
-    private static double? TryResolveBaselineEce(byte[]? modelBytes)
+    private static double? TryResolveBaselineEce(byte[]? modelBytes, MarketRegimeEnum? regime = null)
     {
         if (modelBytes is not { Length: > 0 })
             return null;
@@ -1830,7 +1936,19 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         try
         {
             var snapshot = JsonSerializer.Deserialize<ModelSnapshot>(modelBytes);
-            if (snapshot is null || !double.IsFinite(snapshot.Ece) || snapshot.Ece < 0.0)
+            if (snapshot is null) return null;
+
+            // Per-regime baseline takes precedence when training populated it; otherwise the
+            // global ECE is the honest fallback. Operators see the same baseline for the
+            // global row and any regimes the training pipeline didn't measure.
+            if (regime is not null && snapshot.RegimeEce is { Count: > 0 } regimeMap &&
+                regimeMap.TryGetValue(regime.Value.ToString(), out double regimeEce) &&
+                double.IsFinite(regimeEce) && regimeEce >= 0.0)
+            {
+                return regimeEce;
+            }
+
+            if (!double.IsFinite(snapshot.Ece) || snapshot.Ece < 0.0)
                 return null;
 
             return snapshot.Ece;
@@ -1873,6 +1991,249 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     /// that scope), so the caller can fall back to the legacy EngineConfig scalar or treat
     /// the trend signal as inert.
     /// </summary>
+    /// <summary>
+    /// Returns the cached bootstrap stderr for this (model, regime) scope when both the
+    /// wall-clock staleness window AND the model's <c>RowVersion</c> match. Returns
+    /// <c>null</c> on any mismatch (cache missing, time-stale, or model bytes replaced via
+    /// retrain promotion) so the caller recomputes. Per-regime cache lives under
+    /// <c>:Regime:{name}:</c> keys keyed identically to the global path.
+    /// </summary>
+    private static async Task<double?> LoadFreshBootstrapStderrAsync(
+        DbContext db,
+        long modelId,
+        MarketRegimeEnum? regime,
+        uint currentRowVersion,
+        DateTime nowUtc,
+        int staleHours,
+        CancellationToken ct)
+    {
+        if (staleHours <= 0) return null;
+
+        // Use the integer enum value, not the string name — renaming a regime enum member
+        // (e.g. Trending → TrendingUp) keeps the underlying integer stable so cached entries
+        // survive the rename. Stable across enum reordering only if the int values are
+        // explicit; the codebase's MarketRegime is explicitly numbered for this reason.
+        string scope = regime is null
+            ? $"MLCalibration:Model:{modelId}"
+            : $"MLCalibration:Model:{modelId}:Regime:{(int)regime.Value}";
+
+        string stderrKey = $"{scope}:EceStderr";
+        string computedAtKey = $"{scope}:EceStderrComputedAt";
+        string rowVersionKey = $"{scope}:EceStderrModelRowVersion";
+
+        var rows = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(c => c.Key == stderrKey || c.Key == computedAtKey || c.Key == rowVersionKey)
+            .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
+
+        // RowVersion check: invalidate cache when model bytes change (champion swap, retrain
+        // promotion). A wall-clock-fresh cache from a stale snapshot is worse than no cache.
+        if (!rows.TryGetValue(rowVersionKey, out var rvRaw) ||
+            !uint.TryParse(rvRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var cachedRowVersion) ||
+            cachedRowVersion != currentRowVersion)
+        {
+            return null;
+        }
+
+        // RoundtripKind on its own is sufficient for ISO-8601 "O" format strings written by
+        // PersistBootstrapCacheAsync; combining with AssumeUniversal throws ArgumentException.
+        if (!rows.TryGetValue(computedAtKey, out var atRaw) ||
+            !DateTime.TryParse(atRaw, CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind, out var computedAt))
+        {
+            return null;
+        }
+
+        if ((nowUtc - computedAt.ToUniversalTime()).TotalHours > staleHours)
+            return null;
+
+        if (!rows.TryGetValue(stderrKey, out var stderrRaw) ||
+            !double.TryParse(stderrRaw, NumberStyles.Float | NumberStyles.AllowThousands,
+                CultureInfo.InvariantCulture, out var stderr) ||
+            !double.IsFinite(stderr) || stderr < 0)
+        {
+            return null;
+        }
+
+        return stderr;
+    }
+
+    /// <summary>
+    /// Appends bootstrap-cache specs (stderr, computed-at, RowVersion fingerprint) to the
+    /// caller-supplied accumulator. Caller flushes the full set in one batched upsert at the
+    /// end of the cycle, so a model with N matched regimes produces a single round-trip
+    /// instead of (1 + N) per-scope round-trips.
+    /// </summary>
+    private static void AppendBootstrapCacheSpecs(
+        List<EngineConfigUpsertSpec> pending,
+        long modelId,
+        MarketRegimeEnum? regime,
+        double stderr,
+        uint rowVersion,
+        DateTime nowUtc)
+    {
+        // Use the integer enum value, not the string name — renaming a regime enum member
+        // (e.g. Trending → TrendingUp) keeps the underlying integer stable so cached entries
+        // survive the rename. Stable across enum reordering only if the int values are
+        // explicit; the codebase's MarketRegime is explicitly numbered for this reason.
+        string scope = regime is null
+            ? $"MLCalibration:Model:{modelId}"
+            : $"MLCalibration:Model:{modelId}:Regime:{(int)regime.Value}";
+
+        pending.Add(new($"{scope}:EceStderr",
+            stderr.ToString("F6", CultureInfo.InvariantCulture),
+            ConfigDataType.Decimal,
+            "Bootstrap-derived ECE stderr cached for the trend-signal stderr gate.",
+            false));
+        pending.Add(new($"{scope}:EceStderrComputedAt",
+            nowUtc.ToString("O", CultureInfo.InvariantCulture),
+            ConfigDataType.String,
+            "UTC timestamp when the bootstrap-derived ECE stderr was last recomputed.",
+            false));
+        pending.Add(new($"{scope}:EceStderrModelRowVersion",
+            rowVersion.ToString(CultureInfo.InvariantCulture),
+            ConfigDataType.Int,
+            "MLModel.RowVersion at the time the cached stderr was computed; mismatches invalidate the cache.",
+            false));
+    }
+
+    /// <summary>
+    /// Loads every per-context override row that could apply to <paramref name="symbol"/>/
+    /// <paramref name="timeframe"/> in a single round-trip: the four wildcard tiers
+    /// (<c>{symbol}:{tf}</c>, <c>{symbol}:*</c>, <c>*:{tf}</c>, <c>*:*</c>) are all OR'd into
+    /// one prefix scan. Caller resolves precedence in memory via
+    /// <see cref="ResolveOverride{T}"/>, so all five override knobs share the one query.
+    /// </summary>
+    private static async Task<IReadOnlyDictionary<string, string>> LoadAllPerContextOverridesAsync(
+        DbContext db, string symbol, Timeframe timeframe, CancellationToken ct)
+    {
+        string tfStr = timeframe.ToString();
+        string p1 = $"MLCalibration:Override:{symbol}:{tfStr}:";
+        string p2 = $"MLCalibration:Override:{symbol}:*:";
+        string p3 = $"MLCalibration:Override:*:{tfStr}:";
+        string p4 = "MLCalibration:Override:*:*:";
+
+        return await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(c => c.Key.StartsWith(p1)
+                     || c.Key.StartsWith(p2)
+                     || c.Key.StartsWith(p3)
+                     || c.Key.StartsWith(p4))
+            .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
+    }
+
+    /// <summary>
+    /// Walks the override-precedence chain (most-specific → least-specific) for a single
+    /// setting and returns the first row that parses cleanly and clears <paramref name="validate"/>.
+    /// Order: <c>{Symbol}:{TF}</c> → <c>{Symbol}:*</c> → <c>*:{TF}</c> → <c>*:*</c> →
+    /// <paramref name="globalDefault"/>. Parsing or validation failures fall through to the
+    /// next tier, not silent acceptance of bad data.
+    /// </summary>
+    private static T ResolveOverride<T>(
+        IReadOnlyDictionary<string, string> overrides,
+        string symbol,
+        Timeframe timeframe,
+        string settingName,
+        Func<string, (bool ok, T value)> tryParse,
+        Func<T, bool> validate,
+        T globalDefault)
+    {
+        string tfStr = timeframe.ToString();
+        string[] keys =
+        [
+            $"MLCalibration:Override:{symbol}:{tfStr}:{settingName}",
+            $"MLCalibration:Override:{symbol}:*:{settingName}",
+            $"MLCalibration:Override:*:{tfStr}:{settingName}",
+            $"MLCalibration:Override:*:*:{settingName}",
+        ];
+        foreach (var key in keys)
+        {
+            if (!overrides.TryGetValue(key, out var raw) || raw is null) continue;
+            var (ok, value) = tryParse(raw);
+            if (ok && validate(value)) return value;
+        }
+        return globalDefault;
+    }
+
+    // Shared parsers for the override resolvers — strict (no decimal-to-int truncation),
+    // invariant culture, finite-double-only.
+    private static (bool ok, int value) TryParseStrictInt(string raw)
+        => int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v)
+            ? (true, v) : (false, 0);
+
+    private static (bool ok, double value) TryParseFiniteDouble(string raw)
+        => double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands,
+                CultureInfo.InvariantCulture, out var v) && double.IsFinite(v)
+            ? (true, v) : (false, 0d);
+
+    private static (bool ok, bool value) TryParseBoolish(string raw)
+    {
+        if (bool.TryParse(raw, out var b)) return (true, b);
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+            return (true, i != 0);
+        return (false, false);
+    }
+
+    /// <summary>Resolves the effective <c>BootstrapCacheStaleHours</c> for a (Symbol, Timeframe) pair.</summary>
+    internal static async Task<int> ResolveBootstrapCacheStaleHoursAsync(
+        DbContext db, string symbol, Timeframe timeframe, int globalDefault, CancellationToken ct)
+    {
+        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
+        return ResolveOverride(
+            overrides, symbol, timeframe, "BootstrapCacheStaleHours",
+            TryParseStrictInt,
+            v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
+            globalDefault);
+    }
+
+    /// <summary>Resolves the effective <c>RetrainOnBaselineCritical</c> for a (Symbol, Timeframe) pair.</summary>
+    internal static async Task<bool> ResolveRetrainOnBaselineCriticalAsync(
+        DbContext db, string symbol, Timeframe timeframe, bool globalDefault, CancellationToken ct)
+    {
+        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
+        return ResolveOverride(
+            overrides, symbol, timeframe, "RetrainOnBaselineCritical",
+            TryParseBoolish,
+            _ => true,
+            globalDefault);
+    }
+
+    /// <summary>Resolves the effective <c>MaxEce</c> ceiling for a (Symbol, Timeframe) pair.</summary>
+    internal static async Task<double> ResolveMaxEceAsync(
+        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct)
+    {
+        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
+        return ResolveOverride(
+            overrides, symbol, timeframe, "MaxEce",
+            TryParseFiniteDouble,
+            v => v >= MinMaxEce && v <= MaxMaxEce,
+            globalDefault);
+    }
+
+    /// <summary>Resolves the effective <c>DegradationDelta</c> for a (Symbol, Timeframe) pair.</summary>
+    internal static async Task<double> ResolveDegradationDeltaAsync(
+        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct)
+    {
+        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
+        return ResolveOverride(
+            overrides, symbol, timeframe, "DegradationDelta",
+            TryParseFiniteDouble,
+            v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
+            globalDefault);
+    }
+
+    /// <summary>Resolves the effective <c>RegressionGuardK</c> for a (Symbol, Timeframe) pair.</summary>
+    internal static async Task<double> ResolveRegressionGuardKAsync(
+        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct)
+    {
+        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
+        return ResolveOverride(
+            overrides, symbol, timeframe, "RegressionGuardK",
+            TryParseFiniteDouble,
+            v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
+            globalDefault);
+    }
+
     private static async Task<double?> LoadSmoothedPreviousEceAsync(
         DbContext db,
         long modelId,
@@ -1900,7 +2261,9 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             .ToListAsync(ct);
 
         if (rows.Count == 0) return null;
-        return rows.Average();
+        double sum = 0.0;
+        foreach (var v in rows) sum += v;
+        return sum / rows.Count;
     }
 
     private static void EnqueueAudit(
@@ -1980,7 +2343,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private static string BuildDiagnosticsWithBins(
         CalibrationSummary summary,
         CalibrationSignals signals,
-        MLCalibrationMonitorWorkerSettings settings)
+        MLCalibrationMonitorWorkerSettings settings,
+        bool bootstrapCacheHit)
     {
         var bins = new List<object>(NumBins);
         for (int i = 0; i < NumBins; i++)
@@ -2007,6 +2371,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             thresholdExceeded = signals.ThresholdExceeded,
             trendExceeded = signals.TrendExceeded,
             baselineExceeded = signals.BaselineExceeded,
+            bootstrapCacheHit,
             bins,
         });
     }
@@ -2125,11 +2490,13 @@ internal sealed record MLCalibrationMonitorWorkerSettings(
     double FleetDegradationRatio,
     int PerRegimeMinSamples,
     int PerRegimeMaxSnapshots,
-    bool WriteLegacyAlias,
     double TimeDecayHalfLifeDays,
     int MinSamplesForTimeDecay,
     int TrendSmoothingWindow,
-    int StaleSkipAlertThreshold);
+    int StaleSkipAlertThreshold,
+    int BootstrapCacheStaleHours,
+    bool RetrainOnBaselineCritical,
+    int MaxDegreeOfParallelism);
 
 internal sealed record MLCalibrationMonitorCycleResult(
     MLCalibrationMonitorWorkerSettings Settings,

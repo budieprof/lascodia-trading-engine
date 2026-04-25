@@ -8,8 +8,10 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Drift;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
@@ -55,6 +57,9 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     private const string CK_LockTimeoutSecs     = "MLDrift:LockTimeoutSeconds";
     private const string CK_DbCommandTimeoutSecs = "MLDrift:DbCommandTimeoutSeconds";
     private const string CK_MinTimeBetweenRetrainsHours = "MLDrift:MinTimeBetweenRetrainsHours";
+    private const string CK_AlertCooldownSecs = "MLDrift:AlertCooldownSeconds";
+    private const string CK_AlertDestination = "MLDrift:AlertDestination";
+    private const string CK_FlagTtlHours = "MLDrift:FlagTtlHours";
 
     // Per-pair override key prefix:
     //   MLDrift:Override:{Symbol}:{Timeframe}:AccuracyThreshold
@@ -127,8 +132,19 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     private const int MinMinTimeBetweenRetrainsHours = 0;
     private const int MaxMinTimeBetweenRetrainsHours = 24 * 30;
 
+    private const int DefaultAlertCooldownSeconds = AlertCooldownDefaults.Default_MLDrift;
+    private const int MinAlertCooldownSeconds = 0;
+    private const int MaxAlertCooldownSeconds = 30 * 24 * 60 * 60;
+
+    private const int DefaultFlagTtlHours = 24;
+    private const int MinFlagTtlHours = 1;
+    private const int MaxFlagTtlHours = 24 * 30;
+
     internal const string WorkerName = nameof(MLDriftMonitorWorker);
     private const string DistributedLockKey = "workers:ml-drift-monitor:cycle";
+    private const string DriftDetectorType = "DriftMonitor";
+    private const string DriftAlertPrefix = "drift-monitor:";
+    private const int AlertConditionMaxLength = 2_500;
 
     /// <summary>Outer-loop wake cadence — drives sub-cycle hot-reload of config.</summary>
     private static readonly TimeSpan WakeInterval = TimeSpan.FromSeconds(60);
@@ -137,6 +153,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLDriftMonitorWorker> _logger;
+    private readonly MLDriftMonitorOptions _options;
     private readonly IDistributedLock? _distributedLock;
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly TradingMetrics? _metrics;
@@ -163,7 +180,10 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         int MaxModelsPerCycle,
         int LockTimeoutSeconds,
         int DbCommandTimeoutSeconds,
-        int MinTimeBetweenRetrainsHours);
+        int MinTimeBetweenRetrainsHours,
+        int AlertCooldownSeconds,
+        string AlertDestination,
+        int DriftFlagTtlHours);
 
     internal readonly record struct DriftMonitorCycleResult(
         TimeSpan PollInterval,
@@ -206,6 +226,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     public MLDriftMonitorWorker(
         IServiceScopeFactory scopeFactory,
         ILogger<MLDriftMonitorWorker> logger,
+        MLDriftMonitorOptions? options = null,
         IDistributedLock? distributedLock = null,
         IWorkerHealthMonitor? healthMonitor = null,
         TradingMetrics? metrics = null,
@@ -214,6 +235,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
+        _options = options ?? new MLDriftMonitorOptions();
         _distributedLock = distributedLock;
         _healthMonitor = healthMonitor;
         _metrics = metrics;
@@ -366,7 +388,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
         // Load + clamp settings once per cycle. Operators changing config see effects on the
         // next cycle (sub-cycle hot-reload is handled by the outer loop in ExecuteAsync).
-        var settings = await LoadSettingsAsync(ctx, ct);
+        var settings = await LoadSettingsAsync(ctx, _options, ct);
         ApplyCommandTimeout(ctx, settings.DbCommandTimeoutSeconds);
         ApplyCommandTimeout(writeCtx, settings.DbCommandTimeoutSeconds);
 
@@ -404,7 +426,15 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
         await using (cycleLock)
         {
-            return await RunCycleCoreAsync(ctx, writeCtx, settings, ct);
+            await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+            try
+            {
+                return await RunCycleCoreAsync(ctx, writeCtx, settings, ct);
+            }
+            finally
+            {
+                WorkerBulkhead.MLMonitoring.Release();
+            }
         }
     }
 
@@ -424,12 +454,28 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         // here — the tenure-challenge and model-expiry checks must run for every active model
         // regardless of whether it has fresh prediction data. The drift check applies its own
         // MinPredictions guard inline.
-        var activeModels = await ctx.Set<MLModel>()
+        var activeModelQuery = ctx.Set<MLModel>()
             .AsNoTracking()
-            .Where(m => m.IsActive && !m.IsDeleted)
+            .Where(m =>
+                m.IsActive &&
+                !m.IsDeleted &&
+                (m.Status == MLModelStatus.Active || m.IsFallbackChampion));
+
+        var activeModels = await activeModelQuery
             .OrderBy(m => m.Id)
             .Take(settings.MaxModelsPerCycle)
             .ToListAsync(ct);
+
+        var skippedByLimit = activeModels.Count == settings.MaxModelsPerCycle
+            ? Math.Max(0, await activeModelQuery.CountAsync(ct) - activeModels.Count)
+            : 0;
+
+        if (skippedByLimit > 0)
+        {
+            _metrics?.MLDriftMonitorModelsSkipped.Add(
+                skippedByLimit,
+                new KeyValuePair<string, object?>("reason", "max_models_per_cycle"));
+        }
 
         // Batched pre-fetch of prediction logs for ALL active models in two round-trips
         // (resolved + all-including-unresolved) instead of two queries per model. Eliminates
@@ -448,7 +494,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         {
             ct.ThrowIfCancellationRequested();
 
-            overrides.TryGetValue((model.Symbol, model.Timeframe), out var perPair);
+            overrides.TryGetValue((NormalizeSymbol(model.Symbol), model.Timeframe), out var perPair);
             resolvedLogsByModel.TryGetValue(model.Id, out var resolvedLogs);
             allLogsByModel.TryGetValue(model.Id, out var allLogs);
 
@@ -500,6 +546,12 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                 _logger.LogDebug(expiryEx, "Model expiry check failed for model {Id} — non-critical", model.Id);
             }
         }
+
+        await ResolveStaleDriftAlertsAsync(
+            writeCtx,
+            activeModels.Select(model => (NormalizeSymbol(model.Symbol), model.Timeframe)).ToHashSet(),
+            skippedByLimit == 0,
+            ct);
 
         return new DriftMonitorCycleResult(
             PollInterval: settings.PollInterval,
@@ -692,14 +744,19 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         // ── Persisted consecutive failure counter ────────────────────────────
         // Stored in EngineConfig so it survives worker restarts. Key pattern:
         //   MLDrift:{Symbol}:{Timeframe}:ConsecutiveFailures
-        var failKey = $"MLDrift:{model.Symbol}:{model.Timeframe}:ConsecutiveFailures";
+        var normalizedSymbol = NormalizeSymbol(model.Symbol);
+        var failKey = $"MLDrift:{normalizedSymbol}:{model.Timeframe}:ConsecutiveFailures";
 
         if (!anyDrift)
         {
             // Model is healthy — reset persisted consecutive failure counter
             await ResetPersistedFailureCountAsync(writeCtx, failKey, ct);
+            await ExpireDriftFlagAsync(writeCtx, model, ct);
+            await ResolveDriftAlertsForPairAsync(writeCtx, model.Symbol, model.Timeframe, ct);
             return false;
         }
+
+        await SetOrRefreshDriftFlagAsync(writeCtx, model, settings, ct);
 
         // ── Consecutive window tracking ─────────────────────────────────────
         int failCount = await GetConfigAsync<int>(readCtx, failKey, 0, ct);
@@ -720,6 +777,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             _logger.LogInformation(
                 "Model {Id} ({Symbol}/{Tf}): drift detected [{Reason}] — window {N}/{Required} before retrain",
                 model.Id, model.Symbol, model.Timeframe, driftReason, failCount, requiredConsecutiveFailures);
+            await writeCtx.SaveChangesAsync(ct);
             return false;
         }
 
@@ -738,6 +796,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             _logger.LogDebug(
                 "Model {Id} ({Symbol}/{Tf}): drift detected [{Reason}] but retraining already queued",
                 model.Id, model.Symbol, model.Timeframe, driftReason);
+            await writeCtx.SaveChangesAsync(ct);
             return false;
         }
 
@@ -765,6 +824,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                 _logger.LogDebug(
                     "Model {Id} ({Symbol}/{Tf}): drift detected but inside retrain cooldown ({Hours}h)",
                     model.Id, model.Symbol, model.Timeframe, settings.MinTimeBetweenRetrainsHours);
+                await writeCtx.SaveChangesAsync(ct);
                 return false;
             }
         }
@@ -781,6 +841,7 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             _logger.LogWarning(
                 "Model {Id} ({Symbol}/{Tf}): drift detected [{Reason}] but queue depth {Depth} >= max {Max} — skipping",
                 model.Id, model.Symbol, model.Timeframe, driftReason, currentQueueDepth, settings.MaxQueueDepth);
+            await writeCtx.SaveChangesAsync(ct);
             return false;
         }
 
@@ -858,8 +919,13 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         // Set an EngineConfig flag so MLSignalSuppressionWorker can prioritize
         // this symbol/timeframe on its next iteration instead of waiting for
         // the full poll cycle (reduces propagation delay from minutes to seconds).
-        var urgentKey = $"MLDrift:UrgentSymbol:{model.Symbol}:{model.Timeframe}";
-        await UpsertConfigAsync(writeCtx, urgentKey, now.ToString("O", CultureInfo.InvariantCulture), ct);
+        var urgentKey = $"MLDrift:UrgentSymbol:{normalizedSymbol}:{model.Timeframe}";
+        await UpsertConfigAsync(
+            writeCtx,
+            urgentKey,
+            now.ToString("O", CultureInfo.InvariantCulture),
+            ct,
+            ConfigDataType.String);
 
         _metrics?.MLDriftMonitorDriftsDetected.Add(
             1,
@@ -867,60 +933,131 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
             new KeyValuePair<string, object?>("learner_architecture", model.LearnerArchitecture.ToString()),
             new KeyValuePair<string, object?>("trigger", driftTrigger));
+        _metrics?.MLDriftMonitorRetrainingQueued.Add(
+            1,
+            new KeyValuePair<string, object?>("symbol", model.Symbol),
+            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+            new KeyValuePair<string, object?>("trigger", driftTrigger));
 
         _logger.LogWarning(
             "Drift detected for model {Id} ({Symbol}/{Tf}): [{Reason}] (trigger={Trigger}) over {N} predictions. " +
             "Queued retraining run {RunId}. Set urgent flag for suppression worker.",
             model.Id, model.Symbol, model.Timeframe, driftReason, driftTrigger, logs.Count, run.Id);
 
-        await DispatchDriftAlertAsync(model, driftTrigger, driftReason, accuracy, logs.Count, retrainQueued: true, ct);
+        await DispatchDriftAlertAsync(
+            writeCtx,
+            model,
+            driftTrigger,
+            driftReason,
+            accuracy,
+            logs.Count,
+            settings,
+            retrainQueued: true,
+            ct);
 
         return true;
     }
 
 
     private async Task DispatchDriftAlertAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
         MLModel model,
         string driftTrigger,
         string driftReason,
         double accuracy,
         int observationCount,
+        DriftMonitorWorkerSettings settings,
         bool retrainQueued,
         CancellationToken ct)
     {
-        if (_alertDispatcher is null) return;
+        var dedupKey = BuildDriftAlertDedupKey(model.Symbol, model.Timeframe, driftTrigger);
 
         try
         {
-            await using var scope = _scopeFactory.CreateAsyncScope();
-            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
-            int cooldownSec = await AlertCooldownDefaults.GetCooldownAsync(
-                writeCtx, AlertCooldownDefaults.CK_MLDrift, AlertCooldownDefaults.Default_MLDrift, ct);
-
             string conditionJson = JsonSerializer.Serialize(new
             {
-                DetectorType = "DriftMonitor",
-                ModelId = model.Id,
-                Symbol = model.Symbol,
-                Timeframe = model.Timeframe.ToString(),
-                DriftTrigger = driftTrigger,
-                DriftReason = driftReason,
-                Accuracy = accuracy,
-                ObservationCount = observationCount,
-                RetrainingQueued = retrainQueued,
-                DetectedAt = _timeProvider.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+                detectorType = DriftDetectorType,
+                destination = settings.AlertDestination,
+                modelId = model.Id,
+                symbol = model.Symbol,
+                timeframe = model.Timeframe.ToString(),
+                driftTrigger,
+                driftReason,
+                accuracy,
+                observationCount,
+                retrainingQueued = retrainQueued,
+                detectedAt = _timeProvider.GetUtcNow().UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
             });
 
-            var alert = new Alert
+            if (conditionJson.Length > AlertConditionMaxLength)
+                conditionJson = conditionJson[..AlertConditionMaxLength];
+
+            var alerts = await writeCtx.Set<Alert>()
+                .IgnoreQueryFilters()
+                .Where(alert =>
+                    !alert.IsDeleted &&
+                    alert.AlertType == AlertType.MLModelDegraded &&
+                    alert.DeduplicationKey == dedupKey)
+                .OrderByDescending(alert => alert.IsActive)
+                .ThenByDescending(alert => alert.LastTriggeredAt ?? DateTime.MinValue)
+                .ThenByDescending(alert => alert.Id)
+                .ToListAsync(ct);
+
+            var alert = alerts.FirstOrDefault();
+            var wasActive = alert is { IsActive: true, AutoResolvedAt: null };
+            var lastTriggeredAt = alert?.LastTriggeredAt;
+
+            if (alert is null)
             {
-                AlertType = AlertType.MLModelDegraded,
-                Severity = AlertSeverity.Medium,
-                Symbol = model.Symbol,
-                DeduplicationKey = $"drift-monitor:{model.Symbol}:{model.Timeframe}:{driftTrigger}",
-                CooldownSeconds = cooldownSec,
-                ConditionJson = conditionJson,
-                IsActive = true,
-            };
+                alert = new Alert
+                {
+                    AlertType = AlertType.MLModelDegraded,
+                    Symbol = model.Symbol,
+                    DeduplicationKey = dedupKey,
+                };
+                writeCtx.Set<Alert>().Add(alert);
+            }
+
+            foreach (var duplicate in alerts.Skip(1))
+            {
+                duplicate.IsActive = false;
+                duplicate.AutoResolvedAt ??= _timeProvider.GetUtcNow().UtcDateTime;
+            }
+
+            alert.AlertType = AlertType.MLModelDegraded;
+            alert.Severity = driftTrigger == "MultiSignal" ? AlertSeverity.High : AlertSeverity.Medium;
+            alert.Symbol = model.Symbol;
+            alert.DeduplicationKey = dedupKey;
+            alert.CooldownSeconds = settings.AlertCooldownSeconds;
+            alert.ConditionJson = conditionJson;
+            alert.IsActive = true;
+            alert.AutoResolvedAt = null;
+
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            var cooldownElapsed = lastTriggeredAt is null ||
+                                  settings.AlertCooldownSeconds <= 0 ||
+                                  nowUtc - lastTriggeredAt.Value >= TimeSpan.FromSeconds(settings.AlertCooldownSeconds);
+            var shouldDispatch = !wasActive || cooldownElapsed;
+
+            await writeCtx.SaveChangesAsync(ct);
+
+            if (!shouldDispatch)
+            {
+                _metrics?.MLDriftMonitorAlertsSuppressed.Add(
+                    1,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                    new KeyValuePair<string, object?>("trigger", driftTrigger),
+                    new KeyValuePair<string, object?>("reason", "cooldown"));
+                return;
+            }
+
+            if (_alertDispatcher is null)
+            {
+                alert.LastTriggeredAt = nowUtc;
+                await writeCtx.SaveChangesAsync(ct);
+                return;
+            }
 
             string message = string.Format(
                 CultureInfo.InvariantCulture,
@@ -928,11 +1065,18 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                 model.Symbol, model.Timeframe, driftTrigger, driftReason, accuracy, observationCount, retrainQueued);
 
             await _alertDispatcher.DispatchAsync(alert, message, ct);
+            alert.LastTriggeredAt = nowUtc;
+            await writeCtx.SaveChangesAsync(ct);
+
             _metrics?.MLDriftMonitorAlertsDispatched.Add(
                 1,
                 new KeyValuePair<string, object?>("symbol", model.Symbol),
                 new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
                 new KeyValuePair<string, object?>("trigger", driftTrigger));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -941,6 +1085,231 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                 WorkerName, model.Id, model.Symbol, model.Timeframe);
         }
     }
+
+    private async Task SetOrRefreshDriftFlagAsync(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        MLModel model,
+        DriftMonitorWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var symbol = NormalizeSymbol(model.Symbol);
+        var flag = await db.Set<MLDriftFlag>()
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(existing =>
+                existing.Symbol == symbol &&
+                existing.Timeframe == model.Timeframe &&
+                existing.DetectorType == DriftDetectorType,
+                ct);
+
+        if (flag is null)
+        {
+            db.Set<MLDriftFlag>().Add(new MLDriftFlag
+            {
+                Symbol = symbol,
+                Timeframe = model.Timeframe,
+                DetectorType = DriftDetectorType,
+                FirstDetectedAtUtc = nowUtc,
+                LastRefreshedAtUtc = nowUtc,
+                ExpiresAtUtc = nowUtc.AddHours(settings.DriftFlagTtlHours),
+                ConsecutiveDetections = 1,
+                IsDeleted = false,
+            });
+        }
+        else
+        {
+            var wasActive = !flag.IsDeleted && flag.ExpiresAtUtc > nowUtc;
+            flag.IsDeleted = false;
+            flag.LastRefreshedAtUtc = nowUtc;
+            flag.ExpiresAtUtc = nowUtc.AddHours(settings.DriftFlagTtlHours);
+            flag.ConsecutiveDetections = wasActive ? flag.ConsecutiveDetections + 1 : 1;
+
+            if (!wasActive)
+                flag.FirstDetectedAtUtc = nowUtc;
+        }
+
+        try
+        {
+            await db.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (DbExceptions.IsUniqueViolation(ex))
+        {
+            db.ChangeTracker.Clear();
+            flag = await db.Set<MLDriftFlag>()
+                .IgnoreQueryFilters()
+                .FirstOrDefaultAsync(existing =>
+                    existing.Symbol == symbol &&
+                    existing.Timeframe == model.Timeframe &&
+                    existing.DetectorType == DriftDetectorType,
+                    ct);
+
+            if (flag is null)
+                throw;
+
+            var wasActive = !flag.IsDeleted && flag.ExpiresAtUtc > nowUtc;
+            flag.IsDeleted = false;
+            flag.LastRefreshedAtUtc = nowUtc;
+            flag.ExpiresAtUtc = nowUtc.AddHours(settings.DriftFlagTtlHours);
+            flag.ConsecutiveDetections = wasActive ? flag.ConsecutiveDetections + 1 : 1;
+
+            if (!wasActive)
+                flag.FirstDetectedAtUtc = nowUtc;
+
+            await db.SaveChangesAsync(ct);
+        }
+
+        _metrics?.MLDriftMonitorFlagsSet.Add(
+            1,
+            new KeyValuePair<string, object?>("symbol", symbol),
+            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+    }
+
+    private async Task ExpireDriftFlagAsync(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        MLModel model,
+        CancellationToken ct)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var symbol = NormalizeSymbol(model.Symbol);
+        var flag = await db.Set<MLDriftFlag>()
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(existing =>
+                existing.Symbol == symbol &&
+                existing.Timeframe == model.Timeframe &&
+                existing.DetectorType == DriftDetectorType,
+                ct);
+
+        if (flag is null || flag.ExpiresAtUtc <= nowUtc)
+            return;
+
+        flag.ExpiresAtUtc = nowUtc.AddMinutes(-1);
+        flag.LastRefreshedAtUtc = nowUtc;
+        flag.ConsecutiveDetections = 0;
+
+        _metrics?.MLDriftMonitorFlagsCleared.Add(
+            1,
+            new KeyValuePair<string, object?>("symbol", symbol),
+            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+
+        await db.SaveChangesAsync(ct);
+    }
+
+    private async Task<int> ResolveDriftAlertsForPairAsync(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        string symbol,
+        Timeframe timeframe,
+        CancellationToken ct)
+    {
+        var prefix = BuildDriftAlertPrefix(symbol, timeframe);
+        var alerts = await db.Set<Alert>()
+            .IgnoreQueryFilters()
+            .Where(alert =>
+                !alert.IsDeleted &&
+                alert.AlertType == AlertType.MLModelDegraded &&
+                alert.IsActive &&
+                alert.DeduplicationKey != null &&
+                alert.DeduplicationKey.StartsWith(prefix))
+            .ToListAsync(ct);
+
+        var resolved = 0;
+        foreach (var alert in alerts)
+            resolved += await ResolveLoadedAlertAsync(db, alert, ct);
+
+        return resolved;
+    }
+
+    private async Task<int> ResolveStaleDriftAlertsAsync(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        HashSet<(string Symbol, Timeframe Timeframe)> activePairs,
+        bool allowFullStaleResolution,
+        CancellationToken ct)
+    {
+        if (!allowFullStaleResolution)
+            return 0;
+
+        var alerts = await db.Set<Alert>()
+            .IgnoreQueryFilters()
+            .Where(alert =>
+                !alert.IsDeleted &&
+                alert.AlertType == AlertType.MLModelDegraded &&
+                alert.IsActive &&
+                alert.DeduplicationKey != null &&
+                alert.DeduplicationKey.StartsWith(DriftAlertPrefix))
+            .ToListAsync(ct);
+
+        var resolved = 0;
+        foreach (var alert in alerts)
+        {
+            var pair = TryParseDriftAlertPair(alert.DeduplicationKey);
+            if (pair is not null && activePairs.Contains(pair.Value))
+                continue;
+
+            resolved += await ResolveLoadedAlertAsync(db, alert, ct);
+        }
+
+        return resolved;
+    }
+
+    private async Task<int> ResolveLoadedAlertAsync(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        Alert alert,
+        CancellationToken ct)
+    {
+        if (!alert.IsActive && alert.AutoResolvedAt.HasValue)
+            return 0;
+
+        try
+        {
+            if (_alertDispatcher is not null)
+                await _alertDispatcher.TryAutoResolveAsync(alert, conditionStillActive: false, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "{Worker}: failed to dispatch resolved notification for alert {AlertId}.", WorkerName, alert.Id);
+        }
+
+        alert.IsActive = false;
+        alert.AutoResolvedAt ??= _timeProvider.GetUtcNow().UtcDateTime;
+        await db.SaveChangesAsync(ct);
+
+        _metrics?.MLDriftMonitorAlertsResolved.Add(
+            1,
+            new KeyValuePair<string, object?>("symbol", alert.Symbol ?? "unknown"));
+
+        return 1;
+    }
+
+    private static string BuildDriftAlertDedupKey(string symbol, Timeframe timeframe, string driftTrigger)
+        => $"{BuildDriftAlertPrefix(symbol, timeframe)}{driftTrigger}";
+
+    private static string BuildDriftAlertPrefix(string symbol, Timeframe timeframe)
+        => $"{DriftAlertPrefix}{NormalizeSymbol(symbol)}:{timeframe}:";
+
+    private static (string Symbol, Timeframe Timeframe)? TryParseDriftAlertPair(string? deduplicationKey)
+    {
+        if (string.IsNullOrWhiteSpace(deduplicationKey) ||
+            !deduplicationKey.StartsWith(DriftAlertPrefix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var parts = deduplicationKey[DriftAlertPrefix.Length..].Split(':');
+        if (parts.Length < 3 ||
+            string.IsNullOrWhiteSpace(parts[0]) ||
+            !Enum.TryParse<Timeframe>(parts[1], out var timeframe))
+        {
+            return null;
+        }
+
+        return (NormalizeSymbol(parts[0]), timeframe);
+    }
+
+    private static string NormalizeSymbol(string symbol)
+        => string.IsNullOrWhiteSpace(symbol) ? string.Empty : symbol.Trim().ToUpperInvariant();
 
     // ── Improvement #10: Champion tenure tracking ──────────────────────────
 
@@ -1027,6 +1396,11 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             "Tenure challenge: model {Id} ({Symbol}/{Tf}) active for {Days:F0} days " +
             "(max tenure={MaxDays}). Queued proactive retraining run {RunId}.",
             model.Id, model.Symbol, model.Timeframe, tenureDays, maxTenureDays, run.Id);
+        _metrics?.MLDriftMonitorRetrainingQueued.Add(
+            1,
+            new KeyValuePair<string, object?>("symbol", model.Symbol),
+            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+            new KeyValuePair<string, object?>("trigger", "TenureChallenge"));
         return true;
     }
 
@@ -1096,6 +1470,11 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             "Model expiry: model {Id} ({Symbol}/{Tf}) active for {Age:F0} days (max={Max}). " +
             "Queued emergency retraining run {RunId} (Priority=0).",
             model.Id, model.Symbol, model.Timeframe, ageDays, maxAgeDays, run.Id);
+        _metrics?.MLDriftMonitorRetrainingQueued.Add(
+            1,
+            new KeyValuePair<string, object?>("symbol", model.Symbol),
+            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+            new KeyValuePair<string, object?>("trigger", "ModelExpiry"));
         return true;
     }
 
@@ -1207,14 +1586,22 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     internal static async Task<DriftMonitorWorkerSettings> LoadSettingsAsync(
         Microsoft.EntityFrameworkCore.DbContext db,
         CancellationToken ct)
+        => await LoadSettingsAsync(db, new MLDriftMonitorOptions(), ct);
+
+    private static async Task<DriftMonitorWorkerSettings> LoadSettingsAsync(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        MLDriftMonitorOptions options,
+        CancellationToken ct)
     {
+        var defaults = BuildSettings(options);
         string[] keys =
         [
             CK_Enabled, CK_PollSecs, CK_WindowDays, CK_MinPredictions, CK_AccThreshold,
             CK_TrainingDays, CK_MaxBrierDrift, CK_MaxDisagreement, CK_RelativeDegradation,
             CK_ConsecutiveFailures, CK_SharpeDegradation, CK_MinClosedTrades, CK_MaxQueueDepth,
             CK_MaxModelsPerCycle, CK_LockTimeoutSecs, CK_DbCommandTimeoutSecs,
-            CK_MinTimeBetweenRetrainsHours,
+            CK_MinTimeBetweenRetrainsHours, CK_AlertCooldownSecs, CK_AlertDestination,
+            CK_FlagTtlHours, AlertCooldownDefaults.CK_MLDrift,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -1223,27 +1610,60 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
 
         return new DriftMonitorWorkerSettings(
-            Enabled: GetBool(values, CK_Enabled, true),
+            Enabled: GetBool(values, CK_Enabled, defaults.Enabled),
             PollInterval: TimeSpan.FromSeconds(
-                ClampInt(GetInt(values, CK_PollSecs, DefaultPollSeconds), DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
-            WindowDays: ClampInt(GetInt(values, CK_WindowDays, DefaultWindowDays), DefaultWindowDays, MinWindowDays, MaxWindowDays),
-            MinPredictions: ClampInt(GetInt(values, CK_MinPredictions, DefaultMinPredictions), DefaultMinPredictions, MinMinPredictions, MaxMinPredictions),
-            AccuracyThreshold: ClampDoubleRange(GetDouble(values, CK_AccThreshold, DefaultAccuracyThreshold), DefaultAccuracyThreshold, MinAccuracyThreshold, MaxAccuracyThreshold),
-            TrainingDataWindowDays: ClampInt(GetInt(values, CK_TrainingDays, DefaultTrainingDataWindowDays), DefaultTrainingDataWindowDays, MinTrainingDataWindowDays, MaxTrainingDataWindowDays),
-            MaxBrierScore: ClampDoubleRange(GetDouble(values, CK_MaxBrierDrift, DefaultMaxBrierDrift), DefaultMaxBrierDrift, MinMaxBrierDrift, MaxMaxBrierDrift),
-            MaxEnsembleDisagreement: ClampDoubleRange(GetDouble(values, CK_MaxDisagreement, DefaultMaxDisagreement), DefaultMaxDisagreement, MinMaxDisagreement, MaxMaxDisagreement),
-            RelativeDegradationRatio: ClampDoubleRange(GetDouble(values, CK_RelativeDegradation, DefaultRelativeDegradation), DefaultRelativeDegradation, MinRelativeDegradation, MaxRelativeDegradation),
-            RequiredConsecutiveFailures: ClampInt(GetInt(values, CK_ConsecutiveFailures, DefaultConsecutiveFailures), DefaultConsecutiveFailures, MinConsecutiveFailures, MaxConsecutiveFailures),
-            SharpeDegradationRatio: ClampDoubleRange(GetDouble(values, CK_SharpeDegradation, DefaultSharpeDegradation), DefaultSharpeDegradation, MinSharpeDegradation, MaxSharpeDegradation),
-            MinClosedTradesForSharpe: ClampInt(GetInt(values, CK_MinClosedTrades, DefaultMinClosedTrades), DefaultMinClosedTrades, MinMinClosedTrades, MaxMinClosedTrades),
-            MaxQueueDepth: ClampIntAllowMax(GetInt(values, CK_MaxQueueDepth, DefaultMaxQueueDepth), DefaultMaxQueueDepth, MinMaxQueueDepth, MaxMaxQueueDepth),
-            MaxModelsPerCycle: ClampInt(GetInt(values, CK_MaxModelsPerCycle, DefaultMaxModelsPerCycle), DefaultMaxModelsPerCycle, MinMaxModelsPerCycle, MaxMaxModelsPerCycle),
-            LockTimeoutSeconds: ClampInt(GetInt(values, CK_LockTimeoutSecs, DefaultLockTimeoutSeconds), DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
-            DbCommandTimeoutSeconds: ClampInt(GetInt(values, CK_DbCommandTimeoutSecs, DefaultDbCommandTimeoutSeconds), DefaultDbCommandTimeoutSeconds, MinDbCommandTimeoutSeconds, MaxDbCommandTimeoutSeconds),
+                ClampInt(GetInt(values, CK_PollSecs, (int)defaults.PollInterval.TotalSeconds), DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
+            WindowDays: ClampInt(GetInt(values, CK_WindowDays, defaults.WindowDays), DefaultWindowDays, MinWindowDays, MaxWindowDays),
+            MinPredictions: ClampInt(GetInt(values, CK_MinPredictions, defaults.MinPredictions), DefaultMinPredictions, MinMinPredictions, MaxMinPredictions),
+            AccuracyThreshold: ClampDoubleRange(GetDouble(values, CK_AccThreshold, defaults.AccuracyThreshold), DefaultAccuracyThreshold, MinAccuracyThreshold, MaxAccuracyThreshold),
+            TrainingDataWindowDays: ClampInt(GetInt(values, CK_TrainingDays, defaults.TrainingDataWindowDays), DefaultTrainingDataWindowDays, MinTrainingDataWindowDays, MaxTrainingDataWindowDays),
+            MaxBrierScore: ClampDoubleRange(GetDouble(values, CK_MaxBrierDrift, defaults.MaxBrierScore), DefaultMaxBrierDrift, MinMaxBrierDrift, MaxMaxBrierDrift),
+            MaxEnsembleDisagreement: ClampDoubleRange(GetDouble(values, CK_MaxDisagreement, defaults.MaxEnsembleDisagreement), DefaultMaxDisagreement, MinMaxDisagreement, MaxMaxDisagreement),
+            RelativeDegradationRatio: ClampDoubleRange(GetDouble(values, CK_RelativeDegradation, defaults.RelativeDegradationRatio), DefaultRelativeDegradation, MinRelativeDegradation, MaxRelativeDegradation),
+            RequiredConsecutiveFailures: ClampInt(GetInt(values, CK_ConsecutiveFailures, defaults.RequiredConsecutiveFailures), DefaultConsecutiveFailures, MinConsecutiveFailures, MaxConsecutiveFailures),
+            SharpeDegradationRatio: ClampDoubleRange(GetDouble(values, CK_SharpeDegradation, defaults.SharpeDegradationRatio), DefaultSharpeDegradation, MinSharpeDegradation, MaxSharpeDegradation),
+            MinClosedTradesForSharpe: ClampInt(GetInt(values, CK_MinClosedTrades, defaults.MinClosedTradesForSharpe), DefaultMinClosedTrades, MinMinClosedTrades, MaxMinClosedTrades),
+            MaxQueueDepth: ClampIntAllowMax(GetInt(values, CK_MaxQueueDepth, defaults.MaxQueueDepth), DefaultMaxQueueDepth, MinMaxQueueDepth, MaxMaxQueueDepth),
+            MaxModelsPerCycle: ClampInt(GetInt(values, CK_MaxModelsPerCycle, defaults.MaxModelsPerCycle), DefaultMaxModelsPerCycle, MinMaxModelsPerCycle, MaxMaxModelsPerCycle),
+            LockTimeoutSeconds: ClampNonNegativeInt(GetInt(values, CK_LockTimeoutSecs, defaults.LockTimeoutSeconds), DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
+            DbCommandTimeoutSeconds: ClampInt(GetInt(values, CK_DbCommandTimeoutSecs, defaults.DbCommandTimeoutSeconds), DefaultDbCommandTimeoutSeconds, MinDbCommandTimeoutSeconds, MaxDbCommandTimeoutSeconds),
             MinTimeBetweenRetrainsHours: ClampNonNegativeInt(
-                GetInt(values, CK_MinTimeBetweenRetrainsHours, DefaultMinTimeBetweenRetrainsHours),
-                DefaultMinTimeBetweenRetrainsHours, MinMinTimeBetweenRetrainsHours, MaxMinTimeBetweenRetrainsHours));
+                GetInt(values, CK_MinTimeBetweenRetrainsHours, defaults.MinTimeBetweenRetrainsHours),
+                DefaultMinTimeBetweenRetrainsHours, MinMinTimeBetweenRetrainsHours, MaxMinTimeBetweenRetrainsHours),
+            AlertCooldownSeconds: ClampNonNegativeInt(
+                GetInt(values, CK_AlertCooldownSecs,
+                    GetInt(values, AlertCooldownDefaults.CK_MLDrift, defaults.AlertCooldownSeconds)),
+                DefaultAlertCooldownSeconds, MinAlertCooldownSeconds, MaxAlertCooldownSeconds),
+            AlertDestination: GetString(values, CK_AlertDestination, defaults.AlertDestination, maxLength: 100),
+            DriftFlagTtlHours: ClampInt(GetInt(values, CK_FlagTtlHours, defaults.DriftFlagTtlHours), DefaultFlagTtlHours, MinFlagTtlHours, MaxFlagTtlHours));
     }
+
+    private static DriftMonitorWorkerSettings BuildSettings(MLDriftMonitorOptions options)
+        => new(
+            Enabled: options.Enabled,
+            PollInterval: TimeSpan.FromSeconds(ClampInt(options.PollIntervalSeconds, DefaultPollSeconds, MinPollSeconds, MaxPollSeconds)),
+            WindowDays: ClampInt(options.DriftWindowDays, DefaultWindowDays, MinWindowDays, MaxWindowDays),
+            MinPredictions: ClampInt(options.DriftMinPredictions, DefaultMinPredictions, MinMinPredictions, MaxMinPredictions),
+            AccuracyThreshold: ClampDoubleRange(options.DriftAccuracyThreshold, DefaultAccuracyThreshold, MinAccuracyThreshold, MaxAccuracyThreshold),
+            TrainingDataWindowDays: ClampInt(options.TrainingDataWindowDays, DefaultTrainingDataWindowDays, MinTrainingDataWindowDays, MaxTrainingDataWindowDays),
+            MaxBrierScore: ClampDoubleRange(options.MaxBrierScore, DefaultMaxBrierDrift, MinMaxBrierDrift, MaxMaxBrierDrift),
+            MaxEnsembleDisagreement: ClampDoubleRange(options.MaxEnsembleDisagreement, DefaultMaxDisagreement, MinMaxDisagreement, MaxMaxDisagreement),
+            RelativeDegradationRatio: ClampDoubleRange(options.RelativeDegradationRatio, DefaultRelativeDegradation, MinRelativeDegradation, MaxRelativeDegradation),
+            RequiredConsecutiveFailures: ClampInt(options.ConsecutiveFailuresBeforeRetrain, DefaultConsecutiveFailures, MinConsecutiveFailures, MaxConsecutiveFailures),
+            SharpeDegradationRatio: ClampDoubleRange(options.SharpeDegradationRatio, DefaultSharpeDegradation, MinSharpeDegradation, MaxSharpeDegradation),
+            MinClosedTradesForSharpe: ClampInt(options.MinClosedTradesForSharpe, DefaultMinClosedTrades, MinMinClosedTrades, MaxMinClosedTrades),
+            MaxQueueDepth: ClampIntAllowMax(options.MaxQueueDepth, DefaultMaxQueueDepth, MinMaxQueueDepth, MaxMaxQueueDepth),
+            MaxModelsPerCycle: ClampInt(options.MaxModelsPerCycle, DefaultMaxModelsPerCycle, MinMaxModelsPerCycle, MaxMaxModelsPerCycle),
+            LockTimeoutSeconds: ClampNonNegativeInt(options.LockTimeoutSeconds, DefaultLockTimeoutSeconds, MinLockTimeoutSeconds, MaxLockTimeoutSeconds),
+            DbCommandTimeoutSeconds: ClampInt(options.DbCommandTimeoutSeconds, DefaultDbCommandTimeoutSeconds, MinDbCommandTimeoutSeconds, MaxDbCommandTimeoutSeconds),
+            MinTimeBetweenRetrainsHours: ClampNonNegativeInt(options.MinTimeBetweenRetrainsHours, DefaultMinTimeBetweenRetrainsHours, MinMinTimeBetweenRetrainsHours, MaxMinTimeBetweenRetrainsHours),
+            AlertCooldownSeconds: ClampNonNegativeInt(options.AlertCooldownSeconds, DefaultAlertCooldownSeconds, MinAlertCooldownSeconds, MaxAlertCooldownSeconds),
+            AlertDestination: string.IsNullOrWhiteSpace(options.AlertDestination)
+                ? "ml-ops"
+                : options.AlertDestination.Trim().Length > 100
+                    ? options.AlertDestination.Trim()[..100]
+                    : options.AlertDestination.Trim(),
+            DriftFlagTtlHours: ClampInt(options.DriftFlagTtlHours, DefaultFlagTtlHours, MinFlagTtlHours, MaxFlagTtlHours));
 
     /// <summary>
     /// Single-query fetch of all per-pair overrides keyed under <c>MLDrift:Override:</c>.
@@ -1268,7 +1688,8 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             var parts = rest.Split(':');
             if (parts.Length != 3) continue;
 
-            string symbol = parts[0];
+            string symbol = NormalizeSymbol(parts[0]);
+            if (symbol.Length == 0) continue;
             if (!Enum.TryParse<Timeframe>(parts[1], ignoreCase: false, out var timeframe)) continue;
 
             string field = parts[2];
@@ -1319,6 +1740,19 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                System.Globalization.CultureInfo.InvariantCulture, out var parsed)
             ? parsed : defaultValue;
 
+    private static string GetString(
+        IReadOnlyDictionary<string, string> values,
+        string key,
+        string defaultValue,
+        int maxLength)
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+
+        var trimmed = raw.Trim();
+        return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength];
+    }
+
     private static int ClampInt(int value, int fallback, int min, int max)
         => value <= 0 ? fallback : Math.Min(Math.Max(value, min), max);
 
@@ -1348,8 +1782,23 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
         if (entry?.Value is null) return defaultValue;
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        try
+        {
+            if (typeof(T) == typeof(bool))
+            {
+                if (bool.TryParse(entry.Value, out var parsedBool))
+                    return (T)(object)parsedBool;
+                if (int.TryParse(entry.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedInt))
+                    return (T)(object)(parsedInt != 0);
+                return defaultValue;
+            }
+
+            return (T)Convert.ChangeType(entry.Value, typeof(T), CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return defaultValue;
+        }
     }
 
     /// <summary>
@@ -1361,8 +1810,9 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,
         string                                  value,
-        CancellationToken                       ct)
-        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(ctx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Int, ct: ct);
+        CancellationToken                       ct,
+        LascodiaTradingEngine.Domain.Enums.ConfigDataType dataType = LascodiaTradingEngine.Domain.Enums.ConfigDataType.Int)
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(ctx, key, value, dataType: dataType, ct: ct);
 
     /// <summary>
     /// Resets (or removes) the persisted consecutive failure counter for a model that is healthy.
@@ -1378,22 +1828,3 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, "0"), ct);
     }
 }
-
-internal sealed record DriftMonitorWorkerSettings(
-    bool Enabled,
-    TimeSpan PollInterval,
-    int WindowDays,
-    int MinPredictions,
-    double AccuracyThreshold,
-    int TrainingDataWindowDays,
-    double MaxBrierScore,
-    double MaxEnsembleDisagreement,
-    double RelativeDegradationRatio,
-    int RequiredConsecutiveFailures,
-    double SharpeDegradationRatio,
-    int MinClosedTradesForSharpe,
-    int MaxQueueDepth,
-    int MaxModelsPerCycle,
-    int LockTimeoutSeconds,
-    int DbCommandTimeoutSeconds,
-    int MinTimeBetweenRetrainsHours);

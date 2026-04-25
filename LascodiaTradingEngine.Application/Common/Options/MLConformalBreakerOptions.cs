@@ -68,4 +68,21 @@ public class MLConformalBreakerOptions : ConfigurationOption<MLConformalBreakerO
 
     /// <summary>Polling interval for conformal coverage backfill.</summary>
     public int BackfillPollIntervalMinutes { get; set; } = 60;
+
+    /// <summary>
+    /// Hard cap on the number of trip alerts dispatched in a single cycle. Resolves are not
+    /// counted (operators always want to know about resolved suspensions). Defaults high
+    /// enough not to interfere with normal-volume trips; set lower to throttle a
+    /// thundering-herd regime shift.
+    /// </summary>
+    public int MaxAlertsPerCycle { get; set; } = 50;
+
+    /// <summary>
+    /// Number of consecutive trip cycles per <c>(model, symbol, timeframe)</c> before the
+    /// worker raises a chronic-tripper escalation alert. The standard trip alarm fires every
+    /// time the breaker opens; the chronic alarm fires once when the streak crosses the
+    /// threshold and auto-resolves on the first recovery cycle. Use this signal to drive a
+    /// model-retirement workflow rather than letting the breaker re-trip indefinitely.
+    /// </summary>
+    public int ChronicTripThreshold { get; set; } = 4;
 }

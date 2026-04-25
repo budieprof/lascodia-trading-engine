@@ -1,398 +1,1206 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
-using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Detects models that are stuck predicting the same direction for an extended period,
-/// which is a signal that the model has degenerated into a directional bias rather than
-/// responding dynamically to market conditions.
-///
-/// <para>
-/// <b>Problem:</b> A model can achieve nominal accuracy by always predicting Buy in a
-/// sustained uptrend. When the trend reverses the model continues to predict Buy, causing
-/// systematic losses. Simple rolling accuracy metrics won't catch this early because
-/// accuracy only degrades gradually after the trend turns.
-/// </para>
-///
-/// <para>
-/// <b>Distinction from MLPredictionSkewWorker:</b>
-/// <see cref="MLPredictionSkewWorker"/> evaluates the BUY/SELL ratio over a calendar
-/// window (e.g. 14 days), catching slow-onset skew caused by class-imbalanced training
-/// data. This worker evaluates the <em>most recent N predictions</em> regardless of
-/// when they occurred, catching <em>sudden onset</em> directional lock — e.g., a model
-/// that was balanced yesterday but has issued only Buy signals for the last 30 bars.
-/// </para>
-///
-/// <para>
-/// <b>Streak detection algorithm:</b>
-/// <list type="number">
-///   <item>For each active model, load the last <c>WindowSize</c> prediction log records
-///         ordered by <c>PredictedAt</c> descending (both resolved and unresolved).</item>
-///   <item>Count Buy vs Sell in that window; identify the dominant direction.</item>
-///   <item>Compute dominantFraction = dominantCount / windowSize.</item>
-///   <item>If dominantFraction &gt; <c>MaxSameDirectionFraction</c>, the model is
-///         considered "stuck" and an alert is fired.</item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Polling interval:</b> 3600 seconds (1 hour) by default, configurable via
-/// <c>MLStreak:PollIntervalSeconds</c>. The hourly cadence is appropriate for detecting
-/// streaks that develop over hours-to-days.
-/// </para>
-///
-/// <para>
-/// <b>ML lifecycle contribution:</b> Acts as an early-warning system for directional
-/// lock that precedes full model collapse. Unlike the skew worker, it does not
-/// automatically queue a retrain — the operator alert is considered sufficient since
-/// the streak may reflect genuine trending market conditions rather than model failure.
-/// </para>
-///
-/// Configuration keys (read from <see cref="EngineConfig"/>):
-/// <list type="bullet">
-///   <item><c>MLStreak:PollIntervalSeconds</c>        — default 3600 (1 h)</item>
-///   <item><c>MLStreak:WindowSize</c>                 — number of recent predictions, default 30</item>
-///   <item><c>MLStreak:MaxSameDirectionFraction</c>   — max tolerated fraction, default 0.85</item>
-///   <item><c>MLStreak:AlertDestination</c>           — default "ml-ops"</item>
-/// </list>
+/// Detects active ML models whose most recent predictions have collapsed into a
+/// one-sided direction streak.
 /// </summary>
 public sealed class MLDirectionStreakWorker : BackgroundService
 {
-    private const string CK_PollSecs   = "MLStreak:PollIntervalSeconds";
-    private const string CK_Window     = "MLStreak:WindowSize";
-    private const string CK_MaxFrac    = "MLStreak:MaxSameDirectionFraction";
-    private const string CK_AlertDest  = "MLStreak:AlertDestination";
+    internal const string WorkerName = nameof(MLDirectionStreakWorker);
 
-    private readonly IServiceScopeFactory              _scopeFactory;
-    private readonly ILogger<MLDirectionStreakWorker>  _logger;
+    private const string DistributedLockKey = "ml:direction-streak:cycle";
+    private const string AlertDeduplicationPrefix = "ml-direction-streak:";
+    private const int AlertConditionMaxLength = 1_500;
 
-    /// <summary>
-    /// Initializes the worker.
-    /// </summary>
-    /// <param name="scopeFactory">Per-iteration DI scope factory for EF DbContexts.</param>
-    /// <param name="logger">Structured logger.</param>
+    private const string CK_Enabled = "MLStreak:Enabled";
+    private const string CK_PollSecs = "MLStreak:PollIntervalSeconds";
+    private const string CK_PollJitterSecs = "MLStreak:PollJitterSeconds";
+    private const string CK_Window = "MLStreak:WindowSize";
+    private const string CK_MaxFrac = "MLStreak:MaxSameDirectionFraction";
+    private const string CK_EntropyThreshold = "MLStreak:EntropyThreshold";
+    private const string CK_RunsZThreshold = "MLStreak:RunsZScoreThreshold";
+    private const string CK_LongestRunFraction = "MLStreak:LongestRunFraction";
+    private const string CK_MinFailedTestsToAlert = "MLStreak:MinFailedTestsToAlert";
+    private const string CK_MinFailedTestsToRetrain = "MLStreak:MinFailedTestsToRetrain";
+    private const string CK_AutoQueueRetrain = "MLStreak:AutoQueueRetrain";
+    private const string CK_RetrainLookbackDays = "MLStreak:RetrainLookbackDays";
+    private const string CK_MaxModelsPerCycle = "MLStreak:MaxModelsPerCycle";
+    private const string CK_MaxRetrainsPerCycle = "MLStreak:MaxRetrainsPerCycle";
+    private const string CK_AlertCooldown = "MLStreak:AlertCooldownSeconds";
+    private const string CK_LockTimeout = "MLStreak:LockTimeoutSeconds";
+    private const string CK_AlertDest = "MLStreak:AlertDestination";
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<MLDirectionStreakWorker> _logger;
+    private readonly MLDirectionStreakOptions _options;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
+
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
+    private bool _missingAlertDispatcherWarningEmitted;
+
     public MLDirectionStreakWorker(
-        IServiceScopeFactory               scopeFactory,
-        ILogger<MLDirectionStreakWorker>   logger)
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLDirectionStreakWorker> logger,
+        MLDirectionStreakOptions? options = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
         _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _logger = logger;
+        _options = options ?? new MLDirectionStreakOptions();
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
-    /// <summary>
-    /// Background service main loop. Each iteration creates a fresh DI scope,
-    /// reads the hot-reloadable poll interval, and invokes
-    /// <see cref="CheckStreaksAsync"/> to evaluate all active models.
-    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLDirectionStreakWorker started.");
+        var initialSettings = BuildSettings(_options);
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Detects active ML models whose recent predictions have collapsed into a one-sided direction streak.",
+            initialSettings.PollInterval);
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            int pollSecs = 3600;
+            var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName) + initialSettings.InitialDelay;
+            if (initialDelay > TimeSpan.Zero)
+                await Task.Delay(initialDelay, _timeProvider, stoppingToken);
 
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                await using var scope   = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx     = readDb.GetDbContext();
-                var wCtx    = writeDb.GetDbContext();
+                var started = Stopwatch.GetTimestamp();
+                var delaySettings = BuildSettings(_options);
 
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 3600, stoppingToken);
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                    var result = await RunCycleAsync(stoppingToken);
+                    delaySettings = result.Settings;
 
-                await CheckStreaksAsync(ctx, wCtx, stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "MLDirectionStreakWorker loop error");
-            }
+                    var durationMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.ModelsEvaluated);
+                    _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                    _metrics?.WorkerCycleDurationMs.Record(durationMs, Tag("worker", WorkerName));
 
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
+                    if (result.SkippedReason is { Length: > 0 })
+                    {
+                        _logger.LogDebug("{Worker}: cycle skipped ({Reason}).", WorkerName, result.SkippedReason);
+                    }
+                    else if (result.StreaksDetected > 0 || result.AlertsResolved > 0 || result.RetrainsQueued > 0)
+                    {
+                        _logger.LogInformation(
+                            "{Worker}: evaluated={Evaluated}, skipped={Skipped}, detected={Detected}, severe={Severe}, alertsDispatched={AlertsDispatched}, alertsResolved={AlertsResolved}, retrainsQueued={RetrainsQueued}.",
+                            WorkerName,
+                            result.ModelsEvaluated,
+                            result.ModelsSkipped,
+                            result.StreaksDetected,
+                            result.SevereStreaks,
+                            result.AlertsDispatched,
+                            result.AlertsResolved,
+                            result.RetrainsQueued);
+                    }
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _consecutiveFailures = 0;
+                    }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _metrics?.WorkerErrors.Add(1, Tag("worker", WorkerName));
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                await Task.Delay(
+                    CalculateDelay(GetIntervalWithJitter(delaySettings), _consecutiveFailures),
+                    _timeProvider,
+                    stoppingToken);
+            }
         }
-
-        _logger.LogInformation("MLDirectionStreakWorker stopping.");
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopping.", WorkerName);
+        }
     }
 
-    // ── Streak detection core ─────────────────────────────────────────────────
-
-    /// <summary>
-    /// Reads configuration and iterates all active models, running streak detection
-    /// for each. Only the minimal projection (Id, Symbol, Timeframe) is fetched
-    /// to keep the query payload small. Per-model errors are isolated.
-    /// </summary>
-    private async Task CheckStreaksAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
+    internal async Task<MLDirectionStreakCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        int    windowSize   = await GetConfigAsync<int>   (readCtx, CK_Window,    30,      ct);
-        double maxFraction  = await GetConfigAsync<double>(readCtx, CK_MaxFrac,   0.85,    ct);
-        string alertDest    = await GetConfigAsync<string>(readCtx, CK_AlertDest, "ml-ops", ct);
-        int    alertCooldown = await GetConfigAsync<int>  (readCtx, AlertCooldownDefaults.CK_MLMonitoring, AlertCooldownDefaults.Default_MLMonitoring, ct);
+        var started = Stopwatch.GetTimestamp();
+        var settings = BuildSettings(_options);
 
-        // Only select the columns needed for streak analysis — no need to load the
-        // full model entity graph.
-        var activeModels = await readCtx.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted)
-            .AsNoTracking()
-            .Select(m => new { m.Id, m.Symbol, m.Timeframe })
-            .ToListAsync(ct);
+        try
+        {
+            if (!settings.Enabled)
+            {
+                RecordCycleSkipped("disabled");
+                return MLDirectionStreakCycleResult.Skipped(settings, "disabled");
+            }
 
-        if (activeModels.Count == 0) return;
+            IAsyncDisposable? cycleLock = null;
+            if (_distributedLock is null)
+            {
+                _metrics?.MLDirectionStreakLockAttempts.Add(1, Tag("outcome", "unavailable"));
+                if (!_missingDistributedLockWarningEmitted)
+                {
+                    _logger.LogWarning(
+                        "{Worker} running without IDistributedLock; duplicate direction-streak alerting/retraining is possible in multi-instance deployments.",
+                        WorkerName);
+                    _missingDistributedLockWarningEmitted = true;
+                }
+            }
+            else
+            {
+                cycleLock = await _distributedLock.TryAcquireAsync(
+                    DistributedLockKey,
+                    settings.LockTimeout,
+                    ct);
 
-        foreach (var model in activeModels)
+                if (cycleLock is null)
+                {
+                    _metrics?.MLDirectionStreakLockAttempts.Add(1, Tag("outcome", "busy"));
+                    RecordCycleSkipped("lock_busy");
+                    return MLDirectionStreakCycleResult.Skipped(settings, "lock_busy");
+                }
+
+                _metrics?.MLDirectionStreakLockAttempts.Add(1, Tag("outcome", "acquired"));
+            }
+
+            await using (cycleLock)
+            {
+                await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+                try
+                {
+                    await using var scope = _scopeFactory.CreateAsyncScope();
+                    var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    var db = writeContext.GetDbContext();
+                    var dispatcher = scope.ServiceProvider.GetService<IAlertDispatcher>();
+
+                    if (dispatcher is null && !_missingAlertDispatcherWarningEmitted)
+                    {
+                        _logger.LogWarning(
+                            "{Worker} could not resolve IAlertDispatcher; direction-streak alerts will be persisted but not notified.",
+                            WorkerName);
+                        _missingAlertDispatcherWarningEmitted = true;
+                    }
+
+                    var runtimeSettings = await LoadRuntimeSettingsAsync(db, settings, ct);
+                    if (!runtimeSettings.Enabled)
+                    {
+                        RecordCycleSkipped("disabled");
+                        return MLDirectionStreakCycleResult.Skipped(runtimeSettings, "disabled");
+                    }
+
+                    return await CheckStreaksAsync(writeContext, db, dispatcher, runtimeSettings, ct);
+                }
+                finally
+                {
+                    WorkerBulkhead.MLMonitoring.Release();
+                }
+            }
+        }
+        finally
+        {
+            _metrics?.MLDirectionStreakCycleDurationMs.Record(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        }
+    }
+
+    private async Task<MLDirectionStreakCycleResult> CheckStreaksAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        MLDirectionStreakWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var modelLoad = await LoadActiveModelsAsync(db, settings, ct);
+
+        var modelsEvaluated = 0;
+        var modelsSkipped = modelLoad.ModelsSkipped;
+        var streaksDetected = 0;
+        var severeStreaks = 0;
+        var alertsDispatched = 0;
+        var alertsSuppressedByCooldown = 0;
+        var retrainsQueued = 0;
+        var alertsResolved = 0;
+
+        for (var i = 0; i < modelLoad.ModelsSkipped; i++)
+            RecordModelSkipped("model_not_eligible");
+        if (modelLoad.Truncated)
+            RecordModelSkipped("max_models_truncated");
+
+        foreach (var model in modelLoad.ModelsToEvaluate)
         {
             ct.ThrowIfCancellationRequested();
 
             try
             {
-                await CheckModelStreakAsync(
-                    model.Id, model.Symbol, model.Timeframe,
-                    windowSize, maxFraction, alertDest, alertCooldown,
-                    readCtx, writeCtx, ct);
+                var canQueueRetrain = retrainsQueued < settings.MaxRetrainsPerCycle;
+                var result = await CheckModelStreakAsync(
+                    writeContext,
+                    db,
+                    dispatcher,
+                    settings,
+                    model,
+                    canQueueRetrain,
+                    nowUtc,
+                    ct);
+
+                modelsEvaluated++;
+                _metrics?.MLDirectionStreakModelsEvaluated.Add(
+                    1,
+                    Tag("symbol", model.Symbol),
+                    Tag("timeframe", model.Timeframe));
+
+                if (result.SkippedReason is { Length: > 0 })
+                {
+                    modelsSkipped++;
+                    RecordModelSkipped(result.SkippedReason);
+                }
+
+                if (result.StreakDetected)
+                {
+                    streaksDetected++;
+                    _metrics?.MLDirectionStreakDetections.Add(
+                        1,
+                        Tag("symbol", model.Symbol),
+                        Tag("timeframe", model.Timeframe));
+                }
+
+                if (result.SevereStreak)
+                {
+                    severeStreaks++;
+                    _metrics?.MLDirectionStreakSevereDetections.Add(
+                        1,
+                        Tag("symbol", model.Symbol),
+                        Tag("timeframe", model.Timeframe));
+                }
+
+                if (result.AlertDispatched)
+                    alertsDispatched++;
+                if (result.AlertSuppressedByCooldown)
+                    alertsSuppressedByCooldown++;
+                if (result.RetrainQueued)
+                    retrainsQueued++;
+                if (result.AlertResolved)
+                    alertsResolved++;
+
+                if (result.Diagnostics is not null)
+                {
+                    _metrics?.MLDirectionStreakDominantFraction.Record(
+                        result.Diagnostics.DominantFraction,
+                        Tag("symbol", model.Symbol),
+                        Tag("timeframe", model.Timeframe));
+                    _metrics?.MLDirectionStreakEntropy.Record(
+                        result.Diagnostics.Entropy,
+                        Tag("symbol", model.Symbol),
+                        Tag("timeframe", model.Timeframe));
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex,
-                    "DirectionStreak: check failed for model {Id} ({Symbol}/{Tf}) — skipping.",
-                    model.Id, model.Symbol, model.Timeframe);
+                modelsSkipped++;
+                RecordModelSkipped("model_error");
+                _logger.LogWarning(
+                    ex,
+                    "{Worker}: failed to process model {ModelId} ({Symbol}/{Timeframe}); skipping.",
+                    WorkerName,
+                    model.Id,
+                    model.Symbol,
+                    model.Timeframe);
             }
         }
+
+        var staleResolved = await ResolveStaleAlertsAsync(
+            writeContext,
+            db,
+            dispatcher,
+            modelLoad.ActiveAlertKeys,
+            nowUtc,
+            ct);
+        alertsResolved += staleResolved;
+
+        if (modelsEvaluated == 0 && modelLoad.ActiveAlertKeys.Count == 0)
+        {
+            RecordCycleSkipped("no_active_models");
+            return new MLDirectionStreakCycleResult(
+                settings,
+                "no_active_models",
+                0,
+                modelsSkipped,
+                0,
+                0,
+                0,
+                0,
+                0,
+                alertsResolved,
+                modelLoad.Truncated);
+        }
+
+        return new MLDirectionStreakCycleResult(
+            settings,
+            null,
+            modelsEvaluated,
+            modelsSkipped,
+            streaksDetected,
+            severeStreaks,
+            alertsDispatched,
+            alertsSuppressedByCooldown,
+            retrainsQueued,
+            alertsResolved,
+            modelLoad.Truncated);
     }
 
-    /// <summary>
-    /// Evaluates the direction streak for a single ML model over the most recent
-    /// <paramref name="windowSize"/> prediction log records. Applies three complementary
-    /// tests: (1) dominant-fraction threshold, (2) Wald-Wolfowitz runs test for randomness,
-    /// (3) Shannon entropy threshold. Severe streaks queue automatic retraining with
-    /// class-rebalancing metadata.
-    /// </summary>
-    private async Task CheckModelStreakAsync(
-        long                                    modelId,
-        string                                  symbol,
-        Timeframe                               timeframe,
-        int                                     windowSize,
-        double                                  maxFraction,
-        string                                  alertDest,
-        int                                     alertCooldown,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
+    private async Task<ModelStreakProcessResult> CheckModelStreakAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        MLDirectionStreakWorkerSettings settings,
+        ModelSnapshot model,
+        bool canQueueRetrain,
+        DateTime nowUtc,
+        CancellationToken ct)
     {
-        var recent = await readCtx.Set<MLModelPredictionLog>()
-            .Where(l => l.MLModelId == modelId && !l.IsDeleted)
-            .OrderByDescending(l => l.PredictedAt)
-            .Take(windowSize)
+        var recentDirections = await db.Set<MLModelPredictionLog>()
+            .Where(log => log.MLModelId == model.Id && !log.IsDeleted)
+            .OrderByDescending(log => log.PredictedAt)
+            .ThenByDescending(log => log.Id)
+            .Take(settings.WindowSize)
             .AsNoTracking()
-            .Select(l => l.PredictedDirection)
+            .Select(log => log.PredictedDirection)
             .ToListAsync(ct);
 
-        if (recent.Count < windowSize)
+        if (recentDirections.Count < settings.WindowSize)
         {
-            _logger.LogDebug(
-                "DirectionStreak: model {Id} ({Symbol}/{Tf}) — only {N}/{Window} predictions available, skipping.",
-                modelId, symbol, timeframe, recent.Count, windowSize);
-            return;
+            var resolved = await ResolveModelAlertAsync(
+                writeContext,
+                db,
+                dispatcher,
+                model,
+                nowUtc,
+                ct);
+
+            return new ModelStreakProcessResult(
+                SkippedReason: "insufficient_predictions",
+                StreakDetected: false,
+                SevereStreak: false,
+                AlertDispatched: false,
+                AlertSuppressedByCooldown: false,
+                AlertResolved: resolved,
+                RetrainQueued: false,
+                Diagnostics: null);
         }
 
-        // ── Basic direction counts ───────────────────────────────────────────
-        int    n             = recent.Count;
-        int    buyCount      = recent.Count(d => d == TradeDirection.Buy);
-        int    sellCount     = n - buyCount;
-        int    dominantCount = Math.Max(buyCount, sellCount);
-        double dominantFrac  = (double)dominantCount / n;
-        var    dominantDir   = buyCount >= sellCount ? TradeDirection.Buy : TradeDirection.Sell;
+        var diagnostics = CalculateDiagnostics(recentDirections, settings);
+        var failCount = diagnostics.FailedTestCount(settings);
+        if (failCount < settings.MinFailedTestsToAlert)
+        {
+            var resolved = await ResolveModelAlertAsync(
+                writeContext,
+                db,
+                dispatcher,
+                model,
+                nowUtc,
+                ct);
 
-        // ── Shannon entropy ──────────────────────────────────────────────────
-        // Binary entropy: H = -p*log2(p) - (1-p)*log2(1-p). Max = 1.0 (balanced),
-        // Min = 0.0 (all same direction). Low entropy indicates directional lock.
-        double pBuy    = (double)buyCount / n;
-        double entropy = 0.0;
-        if (pBuy > 0 && pBuy < 1)
+            return new ModelStreakProcessResult(
+                SkippedReason: null,
+                StreakDetected: false,
+                SevereStreak: false,
+                AlertDispatched: false,
+                AlertSuppressedByCooldown: false,
+                AlertResolved: resolved,
+                RetrainQueued: false,
+                diagnostics);
+        }
+
+        var severe = failCount >= settings.MinFailedTestsToRetrain;
+        var alertResult = await UpsertAndDispatchAlertAsync(
+            writeContext,
+            db,
+            dispatcher,
+            model,
+            diagnostics,
+            severe,
+            settings,
+            nowUtc,
+            ct);
+
+        var retrainQueued = false;
+        if (severe && settings.AutoQueueRetrain)
+        {
+            if (canQueueRetrain)
+            {
+                retrainQueued = await QueueRetrainIfNeededAsync(
+                    db,
+                    model,
+                    diagnostics,
+                    failCount,
+                    settings,
+                    nowUtc,
+                    ct);
+            }
+            else
+            {
+                RecordModelSkipped("retrain_budget_exhausted");
+            }
+        }
+
+        await writeContext.SaveChangesAsync(ct);
+
+        _logger.LogWarning(
+            "{Worker}: model {ModelId} ({Symbol}/{Timeframe}) direction streak detected. failedTests={FailedTests}, severe={Severe}, dominant={DominantDirection} {DominantFraction:P1}, entropy={Entropy:F3}, runsZ={RunsZ:F2}, longestRun={LongestRun}.",
+            WorkerName,
+            model.Id,
+            model.Symbol,
+            model.Timeframe,
+            failCount,
+            severe,
+            diagnostics.DominantDirection,
+            diagnostics.DominantFraction,
+            diagnostics.Entropy,
+            diagnostics.RunsZScore,
+            diagnostics.LongestRun);
+
+        return new ModelStreakProcessResult(
+            SkippedReason: null,
+            StreakDetected: true,
+            SevereStreak: severe,
+            AlertDispatched: alertResult.Dispatched,
+            AlertSuppressedByCooldown: alertResult.SuppressedByCooldown,
+            AlertResolved: false,
+            RetrainQueued: retrainQueued,
+            diagnostics);
+    }
+
+    private async Task<AlertDispatchResult> UpsertAndDispatchAlertAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        ModelSnapshot model,
+        DirectionStreakDiagnostics diagnostics,
+        bool severe,
+        MLDirectionStreakWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var deduplicationKey = BuildAlertKey(model);
+        var alerts = await db.Set<Alert>()
+            .IgnoreQueryFilters()
+            .Where(alert => alert.DeduplicationKey == deduplicationKey)
+            .OrderByDescending(alert => alert.Id)
+            .ToListAsync(ct);
+
+        var alert = alerts.FirstOrDefault(candidate => !candidate.IsDeleted);
+        var previousTriggeredAt = alert?.LastTriggeredAt;
+        if (alert is null)
+        {
+            alert = new Alert
+            {
+                AlertType = AlertType.MLModelDegraded,
+                DeduplicationKey = deduplicationKey
+            };
+            db.Set<Alert>().Add(alert);
+        }
+
+        alert.AlertType = AlertType.MLModelDegraded;
+        alert.Symbol = model.Symbol;
+        alert.Severity = severe ? AlertSeverity.High : AlertSeverity.Medium;
+        alert.CooldownSeconds = (int)settings.AlertCooldown.TotalSeconds;
+        alert.ConditionJson = BuildAlertConditionJson(model, diagnostics, severe, settings, nowUtc);
+        alert.IsActive = true;
+        alert.AutoResolvedAt = null;
+        alert.IsDeleted = false;
+
+        foreach (var duplicate in alerts.Where(candidate => candidate.Id != alert.Id && !candidate.IsDeleted))
+        {
+            duplicate.IsActive = false;
+            duplicate.AutoResolvedAt ??= nowUtc;
+        }
+
+        await writeContext.SaveChangesAsync(ct);
+
+        if (IsWithinCooldown(previousTriggeredAt, nowUtc, settings.AlertCooldown))
+            return new AlertDispatchResult(false, true);
+
+        if (dispatcher is null)
+            return new AlertDispatchResult(false, false);
+
+        var lastTriggeredBeforeDispatch = alert.LastTriggeredAt;
+        try
+        {
+            await dispatcher.DispatchAsync(alert, BuildAlertMessage(model, diagnostics, severe, settings), ct);
+            await writeContext.SaveChangesAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to dispatch direction-streak alert for model {ModelId} ({Symbol}/{Timeframe}).",
+                WorkerName,
+                model.Id,
+                model.Symbol,
+                model.Timeframe);
+            return new AlertDispatchResult(false, false);
+        }
+
+        var dispatched = alert.LastTriggeredAt.HasValue
+                         && alert.LastTriggeredAt != lastTriggeredBeforeDispatch;
+        if (dispatched)
+        {
+            _metrics?.MLDirectionStreakAlertsDispatched.Add(
+                1,
+                Tag("symbol", model.Symbol),
+                Tag("timeframe", model.Timeframe),
+                Tag("severity", alert.Severity.ToString()));
+        }
+
+        return new AlertDispatchResult(dispatched, false);
+    }
+
+    private async Task<bool> QueueRetrainIfNeededAsync(
+        DbContext db,
+        ModelSnapshot model,
+        DirectionStreakDiagnostics diagnostics,
+        int failCount,
+        MLDirectionStreakWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var retrainExists = await db.Set<MLTrainingRun>()
+            .AnyAsync(run => run.Symbol == model.Symbol
+                          && run.Timeframe == model.Timeframe
+                          && (run.Status == RunStatus.Queued || run.Status == RunStatus.Running)
+                          && !run.IsDeleted,
+                ct);
+
+        if (retrainExists)
+            return false;
+
+        db.Set<MLTrainingRun>().Add(new MLTrainingRun
+        {
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            Status = RunStatus.Queued,
+            TriggerType = TriggerType.AutoDegrading,
+            FromDate = nowUtc.AddDays(-settings.RetrainLookbackDays),
+            ToDate = nowUtc,
+            StartedAt = nowUtc,
+            ErrorMessage = $"[DirectionStreak] Auto-retrain: {failCount}/4 tests failed " +
+                           $"(dominant={diagnostics.DominantDirection} {diagnostics.DominantFraction:P0}, " +
+                           $"entropy={diagnostics.Entropy:F3}, runsZ={diagnostics.RunsZScore:F2}, " +
+                           $"longestRun={diagnostics.LongestRun}). Recommend class rebalancing and regularisation.",
+            HyperparamConfigJson = JsonSerializer.Serialize(new
+            {
+                triggeredBy = WorkerName,
+                reason = "direction_streak",
+                classRebalance = true,
+                sourceModelId = model.Id,
+                model.Symbol,
+                timeframe = model.Timeframe.ToString(),
+                dominantDirection = diagnostics.DominantDirection.ToString(),
+                diagnostics.DominantFraction,
+                diagnostics.Entropy,
+                diagnostics.RunsZScore,
+                diagnostics.LongestRun,
+                failCount,
+                settings.WindowSize
+            }, JsonOptions)
+        });
+
+        _metrics?.MLDirectionStreakRetrainsQueued.Add(
+            1,
+            Tag("symbol", model.Symbol),
+            Tag("timeframe", model.Timeframe));
+
+        return true;
+    }
+
+    private async Task<bool> ResolveModelAlertAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        ModelSnapshot model,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(candidate => candidate.AlertType == AlertType.MLModelDegraded
+                                           && candidate.DeduplicationKey == BuildAlertKey(model)
+                                           && candidate.IsActive
+                                           && !candidate.IsDeleted,
+                ct);
+
+        if (alert is null)
+            return false;
+
+        await ResolveAlertAsync(writeContext, dispatcher, alert, nowUtc, ct);
+        _metrics?.MLDirectionStreakAlertsResolved.Add(1, Tag("symbol", model.Symbol), Tag("timeframe", model.Timeframe));
+        return true;
+    }
+
+    private async Task<int> ResolveStaleAlertsAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        IReadOnlySet<string> activeAlertKeys,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var alerts = await db.Set<Alert>()
+            .Where(alert => alert.AlertType == AlertType.MLModelDegraded
+                         && alert.DeduplicationKey != null
+                         && alert.DeduplicationKey.StartsWith(AlertDeduplicationPrefix)
+                         && alert.IsActive
+                         && !alert.IsDeleted)
+            .ToListAsync(ct);
+
+        var resolved = 0;
+        foreach (var alert in alerts)
+        {
+            if (alert.DeduplicationKey is not null && activeAlertKeys.Contains(alert.DeduplicationKey))
+                continue;
+
+            await ResolveAlertAsync(writeContext, dispatcher, alert, nowUtc, ct);
+            resolved++;
+        }
+
+        if (resolved > 0)
+            _metrics?.MLDirectionStreakAlertsResolved.Add(resolved, Tag("scope", "stale"));
+
+        return resolved;
+    }
+
+    private async Task ResolveAlertAsync(
+        IWriteApplicationDbContext writeContext,
+        IAlertDispatcher? dispatcher,
+        Alert alert,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        if (dispatcher is not null)
+        {
+            try
+            {
+                await dispatcher.TryAutoResolveAsync(alert, conditionStillActive: false, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "{Worker}: failed to dispatch direction-streak recovery for {DeduplicationKey}.",
+                    WorkerName,
+                    alert.DeduplicationKey);
+            }
+        }
+
+        alert.IsActive = false;
+        alert.AutoResolvedAt ??= nowUtc;
+        await writeContext.SaveChangesAsync(ct);
+    }
+
+    private async Task<LoadModelsResult> LoadActiveModelsAsync(
+        DbContext db,
+        MLDirectionStreakWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var rows = await db.Set<MLModel>()
+            .Where(model => model.IsActive
+                         && !model.IsSuppressed
+                         && !model.IsDeleted
+                         && model.Status == MLModelStatus.Active
+                         && model.ModelBytes != null)
+            .AsNoTracking()
+            .Select(model => new ModelSnapshot(
+                model.Id,
+                model.Symbol,
+                model.Timeframe,
+                model.ModelBytes != null && model.ModelBytes.Length > 0))
+            .ToListAsync(ct);
+
+        var skipped = 0;
+        var eligible = rows
+            .Select(row => row with { Symbol = NormalizeSymbol(row.Symbol) })
+            .Where(row =>
+            {
+                var valid = IsValidSymbol(row.Symbol) && row.HasModelBytes;
+                if (!valid)
+                    skipped++;
+                return valid;
+            })
+            .OrderBy(row => row.Symbol, StringComparer.Ordinal)
+            .ThenBy(row => row.Timeframe)
+            .ThenBy(row => row.Id)
+            .ToList();
+
+        var activeAlertKeys = eligible
+            .Select(BuildAlertKey)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var truncated = eligible.Count > settings.MaxModelsPerCycle;
+        if (truncated)
+            eligible = eligible.Take(settings.MaxModelsPerCycle).ToList();
+
+        return new LoadModelsResult(eligible, activeAlertKeys, skipped, truncated);
+    }
+
+    private async Task<MLDirectionStreakWorkerSettings> LoadRuntimeSettingsAsync(
+        DbContext db,
+        MLDirectionStreakWorkerSettings defaults,
+        CancellationToken ct)
+    {
+        var keys = new[]
+        {
+            CK_Enabled,
+            CK_PollSecs,
+            CK_PollJitterSecs,
+            CK_Window,
+            CK_MaxFrac,
+            CK_EntropyThreshold,
+            CK_RunsZThreshold,
+            CK_LongestRunFraction,
+            CK_MinFailedTestsToAlert,
+            CK_MinFailedTestsToRetrain,
+            CK_AutoQueueRetrain,
+            CK_RetrainLookbackDays,
+            CK_MaxModelsPerCycle,
+            CK_MaxRetrainsPerCycle,
+            CK_AlertCooldown,
+            CK_LockTimeout,
+            CK_AlertDest
+        };
+
+        var config = await db.Set<EngineConfig>()
+            .Where(entry => keys.Contains(entry.Key) && !entry.IsDeleted)
+            .AsNoTracking()
+            .ToDictionaryAsync(entry => entry.Key, entry => entry.Value, ct);
+
+        var minFailedToAlert = GetInt(config, CK_MinFailedTestsToAlert, defaults.MinFailedTestsToAlert, 1, 4);
+        var minFailedToRetrain = GetInt(config, CK_MinFailedTestsToRetrain, defaults.MinFailedTestsToRetrain, minFailedToAlert, 4);
+
+        return defaults with
+        {
+            Enabled = GetBool(config, CK_Enabled, defaults.Enabled),
+            PollInterval = TimeSpan.FromSeconds(GetInt(config, CK_PollSecs, (int)defaults.PollInterval.TotalSeconds, 30, 86_400)),
+            PollJitter = TimeSpan.FromSeconds(GetInt(config, CK_PollJitterSecs, (int)defaults.PollJitter.TotalSeconds, 0, 86_400)),
+            WindowSize = GetInt(config, CK_Window, defaults.WindowSize, 10, 500),
+            MaxSameDirectionFraction = GetDouble(config, CK_MaxFrac, defaults.MaxSameDirectionFraction, 0.55, 0.99),
+            EntropyThreshold = GetDouble(config, CK_EntropyThreshold, defaults.EntropyThreshold, 0.0, 1.0),
+            RunsZScoreThreshold = GetDouble(config, CK_RunsZThreshold, defaults.RunsZScoreThreshold, -10.0, 0.0),
+            LongestRunFraction = GetDouble(config, CK_LongestRunFraction, defaults.LongestRunFraction, 0.10, 1.0),
+            MinFailedTestsToAlert = minFailedToAlert,
+            MinFailedTestsToRetrain = minFailedToRetrain,
+            AutoQueueRetrain = GetBool(config, CK_AutoQueueRetrain, defaults.AutoQueueRetrain),
+            RetrainLookbackDays = GetInt(config, CK_RetrainLookbackDays, defaults.RetrainLookbackDays, 30, 3_650),
+            MaxModelsPerCycle = GetInt(config, CK_MaxModelsPerCycle, defaults.MaxModelsPerCycle, 1, 100_000),
+            MaxRetrainsPerCycle = GetInt(config, CK_MaxRetrainsPerCycle, defaults.MaxRetrainsPerCycle, 0, 1_000),
+            AlertCooldown = TimeSpan.FromSeconds(GetInt(config, CK_AlertCooldown, (int)defaults.AlertCooldown.TotalSeconds, 0, 2_592_000)),
+            LockTimeout = TimeSpan.FromSeconds(GetInt(config, CK_LockTimeout, (int)defaults.LockTimeout.TotalSeconds, 0, 300)),
+            AlertDestination = GetString(config, CK_AlertDest, defaults.AlertDestination, 100)
+        };
+    }
+
+    private static MLDirectionStreakWorkerSettings BuildSettings(MLDirectionStreakOptions options)
+    {
+        var minFailedToAlert = Clamp(options.MinFailedTestsToAlert, 1, 4);
+        var minFailedToRetrain = Clamp(options.MinFailedTestsToRetrain, minFailedToAlert, 4);
+
+        return new MLDirectionStreakWorkerSettings
+        {
+            Enabled = options.Enabled,
+            InitialDelay = TimeSpan.FromSeconds(Clamp(options.InitialDelaySeconds, 0, 86_400)),
+            PollInterval = TimeSpan.FromSeconds(Clamp(options.PollIntervalSeconds, 30, 86_400)),
+            PollJitter = TimeSpan.FromSeconds(Clamp(options.PollJitterSeconds, 0, 86_400)),
+            WindowSize = Clamp(options.WindowSize, 10, 500),
+            MaxSameDirectionFraction = Clamp(options.MaxSameDirectionFraction, 0.55, 0.99),
+            EntropyThreshold = Clamp(options.EntropyThreshold, 0.0, 1.0),
+            RunsZScoreThreshold = Clamp(options.RunsZScoreThreshold, -10.0, 0.0),
+            LongestRunFraction = Clamp(options.LongestRunFraction, 0.10, 1.0),
+            MinFailedTestsToAlert = minFailedToAlert,
+            MinFailedTestsToRetrain = minFailedToRetrain,
+            AutoQueueRetrain = options.AutoQueueRetrain,
+            RetrainLookbackDays = Clamp(options.RetrainLookbackDays, 30, 3_650),
+            MaxModelsPerCycle = Clamp(options.MaxModelsPerCycle, 1, 100_000),
+            MaxRetrainsPerCycle = Clamp(options.MaxRetrainsPerCycle, 0, 1_000),
+            AlertCooldown = TimeSpan.FromSeconds(Clamp(options.AlertCooldownSeconds, 0, 2_592_000)),
+            LockTimeout = TimeSpan.FromSeconds(Clamp(options.LockTimeoutSeconds, 0, 300)),
+            AlertDestination = NormalizeDestination(options.AlertDestination, "ml-ops")
+        };
+    }
+
+    internal static DirectionStreakDiagnostics CalculateDiagnostics(
+        IReadOnlyList<TradeDirection> recentDirections,
+        MLDirectionStreakWorkerSettings settings)
+    {
+        var n = recentDirections.Count;
+        var buyCount = recentDirections.Count(direction => direction == TradeDirection.Buy);
+        var sellCount = n - buyCount;
+        var dominantCount = Math.Max(buyCount, sellCount);
+        var dominantFraction = n > 0 ? (double)dominantCount / n : 0.0;
+        var dominantDirection = buyCount >= sellCount ? TradeDirection.Buy : TradeDirection.Sell;
+
+        var pBuy = n > 0 ? (double)buyCount / n : 0.0;
+        var entropy = 0.0;
+        if (pBuy > 0.0 && pBuy < 1.0)
             entropy = -(pBuy * Math.Log2(pBuy) + (1.0 - pBuy) * Math.Log2(1.0 - pBuy));
 
-        // ── Wald-Wolfowitz runs test for randomness ──────────────────────────
-        // A "run" is a maximal consecutive sequence of the same direction.
-        // Too few runs indicates directional lock; too many indicates alternating bias.
-        int runs = 1;
-        for (int i = 1; i < n; i++)
+        var runs = n > 0 ? 1 : 0;
+        var longestRun = n > 0 ? 1 : 0;
+        var currentRun = n > 0 ? 1 : 0;
+        for (var i = 1; i < n; i++)
         {
-            if (recent[i] != recent[i - 1])
+            if (recentDirections[i] == recentDirections[i - 1])
+            {
+                currentRun++;
+            }
+            else
+            {
                 runs++;
-        }
+                currentRun = 1;
+            }
 
-        // Expected runs and variance under the null hypothesis of random order:
-        // E(R) = 1 + 2*n1*n2/(n1+n2)
-        // Var(R) = 2*n1*n2*(2*n1*n2 - n1 - n2) / ((n1+n2)^2 * (n1+n2-1))
-        double n1 = buyCount;
-        double n2 = sellCount;
-        double expectedRuns = 1.0 + (2.0 * n1 * n2) / (n1 + n2);
-        double varRuns = (n1 + n2) > 1
-            ? (2.0 * n1 * n2 * (2.0 * n1 * n2 - n1 - n2)) / ((n1 + n2) * (n1 + n2) * ((n1 + n2) - 1.0))
-            : 0;
-        double runsZScore = varRuns > 0 ? (runs - expectedRuns) / Math.Sqrt(varRuns) : 0;
-
-        // ── Longest consecutive run ──────────────────────────────────────────
-        int longestRun = 1, currentRun = 1;
-        for (int i = 1; i < n; i++)
-        {
-            if (recent[i] == recent[i - 1]) currentRun++;
-            else                             currentRun = 1;
             longestRun = Math.Max(longestRun, currentRun);
         }
 
-        _logger.LogDebug(
-            "DirectionStreak: model {Id} ({Symbol}/{Tf}) — Buy={B} Sell={S} dominant={Dir} ({Frac:P1}) " +
-            "entropy={H:F3} runs={R} runsZ={Z:F2} longestRun={LR}",
-            modelId, symbol, timeframe, buyCount, sellCount, dominantDir, dominantFrac,
-            entropy, runs, runsZScore, longestRun);
+        var n1 = (double)buyCount;
+        var n2 = (double)sellCount;
+        var expectedRuns = n > 0 ? 1.0 + (2.0 * n1 * n2) / (n1 + n2) : 0.0;
+        var varRuns = (n1 + n2) > 1.0
+            ? (2.0 * n1 * n2 * (2.0 * n1 * n2 - n1 - n2)) /
+              ((n1 + n2) * (n1 + n2) * ((n1 + n2) - 1.0))
+            : 0.0;
+        var runsZScore = varRuns > 0.0 ? (runs - expectedRuns) / Math.Sqrt(varRuns) : 0.0;
 
-        // ── Determine if any test indicates directional lock ─────────────────
-        // 1. Dominant fraction exceeds threshold (original check)
-        bool fracFailed   = dominantFrac > maxFraction;
-        // 2. Entropy below 0.5 indicates severe imbalance (50% of max possible)
-        bool entropyFailed = entropy < 0.5;
-        // 3. Runs Z-score < -2.0 indicates significantly fewer runs than expected (p < 0.05)
-        bool runsFailed    = runsZScore < -2.0;
-        // 4. Longest consecutive run exceeds 60% of window (e.g., 18/30 same direction in a row)
-        bool longestRunFailed = longestRun > (int)(windowSize * 0.6);
-
-        // Require at least 2 of 4 tests to fail to avoid false positives from any single test
-        int failCount = (fracFailed ? 1 : 0) + (entropyFailed ? 1 : 0)
-                      + (runsFailed ? 1 : 0) + (longestRunFailed ? 1 : 0);
-
-        if (failCount < 2) return;
-
-        // ── Determine severity: 3+ tests = severe (retrain), 2 = warning (alert only) ──
-        bool isSevere = failCount >= 3;
-
-        _logger.LogWarning(
-            "DirectionStreak: model {Id} ({Symbol}/{Tf}) — {FailCount}/4 tests failed. " +
-            "fracFailed={FF} entropyFailed={EF} runsFailed={RF} longestRunFailed={LRF}. Severity={Sev}",
-            modelId, symbol, timeframe, failCount, fracFailed, entropyFailed, runsFailed, longestRunFailed,
-            isSevere ? "SEVERE" : "WARNING");
-
-        // ── Deduplicated alert ───────────────────────────────────────────────
-        string dedupKey = $"direction-streak:{symbol}:{timeframe}:{modelId}";
-        bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.DeduplicationKey == dedupKey
-                        && a.IsActive && !a.IsDeleted, ct);
-
-        if (!alertExists)
-        {
-            writeCtx.Set<Alert>().Add(new Alert
-            {
-                AlertType        = AlertType.MLModelDegraded,
-                Symbol           = symbol,
-                Severity         = isSevere ? AlertSeverity.High : AlertSeverity.Medium,
-                DeduplicationKey = dedupKey,
-                CooldownSeconds  = alertCooldown,
-                ConditionJson    = System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    reason            = "direction_streak",
-                    severity          = isSevere ? "severe" : "warning",
-                    symbol,
-                    timeframe         = timeframe.ToString(),
-                    modelId,
-                    dominantDirection = dominantDir.ToString(),
-                    dominantFraction  = Math.Round(dominantFrac, 4),
-                    entropy           = Math.Round(entropy, 4),
-                    runsZScore        = Math.Round(runsZScore, 4),
-                    runs,
-                    expectedRuns      = Math.Round(expectedRuns, 2),
-                    longestConsecutiveRun = longestRun,
-                    windowSize,
-                    testsFailedCount  = failCount,
-                    detectedAt        = DateTime.UtcNow.ToString("O")
-                }),
-                IsActive = true,
-            });
-        }
-
-        // ── Auto-queue retrain for severe streaks ────────────────────────────
-        if (isSevere)
-        {
-            bool retrainExists = await readCtx.Set<MLTrainingRun>()
-                .AnyAsync(r => r.Symbol == symbol
-                            && r.Timeframe == timeframe
-                            && r.Status == RunStatus.Queued
-                            && !r.IsDeleted, ct);
-
-            if (!retrainExists)
-            {
-                // Full 365-day window ending now. Previously this block omitted
-                // FromDate/ToDate, which caused them to default to DateTime.MinValue
-                // (persisted as PostgreSQL -infinity) and made MLTrainingWorker's
-                // candle query return zero rows, failing every run with
-                // "Insufficient candles: 0 (need 530)" after 3 retries. Matches the
-                // window used by MLPredictionPnlWorker, MLStructuralBreakWorker, and
-                // MLFeaturePsiWorker so all detection-triggered retrains train on
-                // the same amount of data.
-                var retrainNow      = DateTime.UtcNow;
-                var retrainFromDate = retrainNow.AddDays(-365);
-
-                writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
-                {
-                    Symbol               = symbol,
-                    Timeframe            = timeframe,
-                    Status               = RunStatus.Queued,
-                    TriggerType          = TriggerType.AutoDegrading,
-                    FromDate             = retrainFromDate,
-                    ToDate                = retrainNow,
-                    ErrorMessage         = $"[DirectionStreak] Auto-retrain: {failCount}/4 tests failed " +
-                                           $"(dominant={dominantDir} {dominantFrac:P0}, entropy={entropy:F3}, " +
-                                           $"runsZ={runsZScore:F2}, longestRun={longestRun}). " +
-                                           "Recommend class-rebalancing and dropout regularisation.",
-                    HyperparamConfigJson = System.Text.Json.JsonSerializer.Serialize(new
-                    {
-                        triggeredBy           = "MLDirectionStreakWorker",
-                        classRebalance        = true,
-                        dominantDirection     = dominantDir.ToString(),
-                        dominantFraction      = dominantFrac,
-                    }),
-                });
-
-                _logger.LogWarning(
-                    "DirectionStreak: queued retrain for {Symbol}/{Tf} model {Id} due to severe directional lock",
-                    symbol, timeframe, modelId);
-            }
-        }
-
-        await writeCtx.SaveChangesAsync(ct);
+        var longestRunFraction = n > 0 ? (double)longestRun / n : 0.0;
+        return new DirectionStreakDiagnostics(
+            BuyCount: buyCount,
+            SellCount: sellCount,
+            DominantDirection: dominantDirection,
+            DominantFraction: dominantFraction,
+            Entropy: entropy,
+            Runs: runs,
+            ExpectedRuns: expectedRuns,
+            RunsZScore: runsZScore,
+            LongestRun: longestRun,
+            LongestRunFraction: longestRunFraction,
+            FractionFailed: dominantFraction >= settings.MaxSameDirectionFraction,
+            EntropyFailed: entropy <= settings.EntropyThreshold,
+            RunsFailed: runsZScore <= settings.RunsZScoreThreshold,
+            LongestRunFailed: longestRunFraction >= settings.LongestRunFraction);
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
+    private static string BuildAlertConditionJson(
+        ModelSnapshot model,
+        DirectionStreakDiagnostics diagnostics,
+        bool severe,
+        MLDirectionStreakWorkerSettings settings,
+        DateTime nowUtc)
+        => Truncate(JsonSerializer.Serialize(new
+        {
+            reason = "direction_streak",
+            severity = severe ? "severe" : "warning",
+            destination = settings.AlertDestination,
+            worker = WorkerName,
+            symbol = model.Symbol,
+            timeframe = model.Timeframe.ToString(),
+            modelId = model.Id,
+            dominantDirection = diagnostics.DominantDirection.ToString(),
+            dominantFraction = Math.Round(diagnostics.DominantFraction, 4),
+            buyCount = diagnostics.BuyCount,
+            sellCount = diagnostics.SellCount,
+            entropy = Math.Round(diagnostics.Entropy, 4),
+            runsZScore = Math.Round(diagnostics.RunsZScore, 4),
+            runs = diagnostics.Runs,
+            expectedRuns = Math.Round(diagnostics.ExpectedRuns, 2),
+            longestConsecutiveRun = diagnostics.LongestRun,
+            longestRunFraction = Math.Round(diagnostics.LongestRunFraction, 4),
+            windowSize = settings.WindowSize,
+            testsFailedCount = diagnostics.FailedTestCount(settings),
+            fractionFailed = diagnostics.FractionFailed,
+            entropyFailed = diagnostics.EntropyFailed,
+            runsFailed = diagnostics.RunsFailed,
+            longestRunFailed = diagnostics.LongestRunFailed,
+            detectedAt = NormalizeUtc(nowUtc)
+        }, JsonOptions), AlertConditionMaxLength);
 
-    /// <summary>
-    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
-    /// <paramref name="defaultValue"/> if the key is absent or unparseable.
-    /// </summary>
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    private static string BuildAlertMessage(
+        ModelSnapshot model,
+        DirectionStreakDiagnostics diagnostics,
+        bool severe,
+        MLDirectionStreakWorkerSettings settings)
+        => $"ML direction streak {(severe ? "severe" : "warning")} for {model.Symbol}/{model.Timeframe} model {model.Id}: " +
+           $"{diagnostics.DominantDirection} is {diagnostics.DominantFraction:P1} of the last {settings.WindowSize} predictions. " +
+           $"Destination={settings.AlertDestination}.";
+
+    private static string BuildAlertKey(ModelSnapshot model)
+        => $"{AlertDeduplicationPrefix}{model.Symbol}:{model.Timeframe}:{model.Id}";
+
+    private static string NormalizeSymbol(string? symbol)
+        => string.IsNullOrWhiteSpace(symbol)
+            ? string.Empty
+            : symbol.Trim().ToUpperInvariant();
+
+    private static bool IsValidSymbol(string symbol)
+        => symbol.Length is > 0 and <= 20;
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind switch
+        {
+            DateTimeKind.Local => value.ToUniversalTime(),
+            DateTimeKind.Unspecified => DateTime.SpecifyKind(value, DateTimeKind.Utc),
+            _ => value
+        };
+
+    private static string NormalizeDestination(string? destination, string fallback)
     {
-        var entry = await ctx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+        var value = string.IsNullOrWhiteSpace(destination)
+            ? fallback
+            : destination.Trim();
 
-        if (entry?.Value is null) return defaultValue;
-
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        return value.Length > 100 ? value[..100] : value;
     }
+
+    private static bool IsWithinCooldown(DateTime? lastTriggeredAt, DateTime nowUtc, TimeSpan cooldown)
+    {
+        if (!lastTriggeredAt.HasValue || cooldown <= TimeSpan.Zero)
+            return false;
+
+        return nowUtc - NormalizeUtc(lastTriggeredAt.Value) < cooldown;
+    }
+
+    private static TimeSpan GetIntervalWithJitter(MLDirectionStreakWorkerSettings settings)
+    {
+        if (settings.PollJitter <= TimeSpan.Zero)
+            return settings.PollInterval;
+
+        var jitterMs = Random.Shared.NextDouble() * settings.PollJitter.TotalMilliseconds;
+        return settings.PollInterval + TimeSpan.FromMilliseconds(jitterMs);
+    }
+
+    private static TimeSpan CalculateDelay(TimeSpan baseDelay, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+            return baseDelay;
+
+        var multiplier = Math.Min(8, 1 << Math.Min(consecutiveFailures, 3));
+        return TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * multiplier);
+    }
+
+    private void RecordModelSkipped(string reason)
+        => _metrics?.MLDirectionStreakModelsSkipped.Add(1, Tag("reason", reason));
+
+    private void RecordCycleSkipped(string reason)
+        => _metrics?.MLDirectionStreakCyclesSkipped.Add(1, Tag("reason", reason));
+
+    private static bool GetBool(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        bool defaultValue)
+    {
+        if (!config.TryGetValue(key, out var value))
+            return defaultValue;
+
+        if (bool.TryParse(value, out var parsed))
+            return parsed;
+
+        return value.Trim() switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => defaultValue
+        };
+    }
+
+    private static int GetInt(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        int defaultValue,
+        int min,
+        int max)
+    {
+        if (!config.TryGetValue(key, out var value)
+            || !int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return defaultValue;
+        }
+
+        return Clamp(parsed, min, max);
+    }
+
+    private static double GetDouble(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        double defaultValue,
+        double min,
+        double max)
+    {
+        if (!config.TryGetValue(key, out var value)
+            || !double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            || double.IsNaN(parsed)
+            || double.IsInfinity(parsed))
+        {
+            return defaultValue;
+        }
+
+        return Clamp(parsed, min, max);
+    }
+
+    private static string GetString(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        string defaultValue,
+        int maxLength)
+    {
+        if (!config.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value))
+            return defaultValue;
+
+        var trimmed = value.Trim();
+        return trimmed.Length > maxLength ? trimmed[..maxLength] : trimmed;
+    }
+
+    private static int Clamp(int value, int min, int max) => Math.Clamp(value, min, max);
+
+    private static double Clamp(double value, double min, double max) => Math.Clamp(value, min, max);
+
+    private static string Truncate(string value, int maxLength)
+        => value.Length <= maxLength ? value : value[..maxLength];
+
+    private static KeyValuePair<string, object?> Tag(string key, object? value) => new(key, value);
+
+    private sealed record ModelSnapshot(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        bool HasModelBytes);
+
+    private sealed record LoadModelsResult(
+        IReadOnlyList<ModelSnapshot> ModelsToEvaluate,
+        IReadOnlySet<string> ActiveAlertKeys,
+        int ModelsSkipped,
+        bool Truncated);
+
+    private sealed record AlertDispatchResult(bool Dispatched, bool SuppressedByCooldown);
+
+    private sealed record ModelStreakProcessResult(
+        string? SkippedReason,
+        bool StreakDetected,
+        bool SevereStreak,
+        bool AlertDispatched,
+        bool AlertSuppressedByCooldown,
+        bool AlertResolved,
+        bool RetrainQueued,
+        DirectionStreakDiagnostics? Diagnostics);
+}
+
+internal sealed record MLDirectionStreakWorkerSettings
+{
+    public bool Enabled { get; init; } = true;
+    public TimeSpan InitialDelay { get; init; } = TimeSpan.FromSeconds(60);
+    public TimeSpan PollInterval { get; init; } = TimeSpan.FromHours(1);
+    public TimeSpan PollJitter { get; init; } = TimeSpan.FromMinutes(2);
+    public int WindowSize { get; init; } = 30;
+    public double MaxSameDirectionFraction { get; init; } = 0.85;
+    public double EntropyThreshold { get; init; } = 0.50;
+    public double RunsZScoreThreshold { get; init; } = -2.0;
+    public double LongestRunFraction { get; init; } = 0.60;
+    public int MinFailedTestsToAlert { get; init; } = 2;
+    public int MinFailedTestsToRetrain { get; init; } = 3;
+    public bool AutoQueueRetrain { get; init; } = true;
+    public int RetrainLookbackDays { get; init; } = 365;
+    public int MaxModelsPerCycle { get; init; } = 1_000;
+    public int MaxRetrainsPerCycle { get; init; } = 25;
+    public TimeSpan AlertCooldown { get; init; } = TimeSpan.FromHours(1);
+    public TimeSpan LockTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    public string AlertDestination { get; init; } = "ml-ops";
+}
+
+internal sealed record MLDirectionStreakCycleResult(
+    MLDirectionStreakWorkerSettings Settings,
+    string? SkippedReason,
+    int ModelsEvaluated,
+    int ModelsSkipped,
+    int StreaksDetected,
+    int SevereStreaks,
+    int AlertsDispatched,
+    int AlertsSuppressedByCooldown,
+    int RetrainsQueued,
+    int AlertsResolved,
+    bool Truncated)
+{
+    public static MLDirectionStreakCycleResult Skipped(
+        MLDirectionStreakWorkerSettings settings,
+        string reason)
+        => new(settings, reason, 0, 0, 0, 0, 0, 0, 0, 0, false);
+}
+
+internal sealed record DirectionStreakDiagnostics(
+    int BuyCount,
+    int SellCount,
+    TradeDirection DominantDirection,
+    double DominantFraction,
+    double Entropy,
+    int Runs,
+    double ExpectedRuns,
+    double RunsZScore,
+    int LongestRun,
+    double LongestRunFraction,
+    bool FractionFailed,
+    bool EntropyFailed,
+    bool RunsFailed,
+    bool LongestRunFailed)
+{
+    public int FailedTestCount(MLDirectionStreakWorkerSettings settings)
+        => (FractionFailed ? 1 : 0)
+           + (EntropyFailed ? 1 : 0)
+           + (RunsFailed ? 1 : 0)
+           + (LongestRunFailed ? 1 : 0);
 }
