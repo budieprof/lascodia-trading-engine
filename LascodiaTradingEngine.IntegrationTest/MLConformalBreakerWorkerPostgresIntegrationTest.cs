@@ -145,6 +145,73 @@ public class MLConformalBreakerWorkerPostgresIntegrationTest : IClassFixture<Pos
         }
     }
 
+    [Fact]
+    public async Task UpsertChronicTripAlertAsync_TwoConcurrentInvocations_ProduceExactlyOneAlertOnPostgres()
+    {
+        await EnsureMigratedAsync();
+
+        var nowUtc = DateTime.UtcNow;
+        const long modelId = 4242;
+        var context = new MLConformalBreakerWorker.ModelContext("CADCHF", Timeframe.H1);
+        var dedupKey = $"ml-conformal-chronic-trip:{modelId}";
+
+        var settings = new MLConformalBreakerWorker.MLConformalBreakerWorkerSettings(
+            InitialDelay: TimeSpan.Zero,
+            PollInterval: TimeSpan.FromHours(24),
+            PollJitterSeconds: 0,
+            MaxLogs: 200,
+            MinLogs: 30,
+            ConsecutiveUncoveredTrigger: 3,
+            CoverageTolerance: 0.05,
+            MaxSuspensionBars: 96,
+            ModelBatchSize: 250,
+            MaxCycleModels: 10000,
+            MaxCalibrationAgeDays: 30,
+            RequireCalibrationAfterModelActivation: true,
+            LockTimeoutSeconds: 5,
+            ThresholdMismatchEpsilon: 0.000001,
+            UseWilsonCoverageFloor: true,
+            WilsonConfidenceLevel: 0.95,
+            StatisticalAlpha: 0.01,
+            MaxAlertsPerCycle: 50,
+            ChronicTripThreshold: 4);
+
+        // Two parallel invocations of the atomic upsert with the same dedup key. The
+        // INSERT ... ON CONFLICT (DeduplicationKey) WHERE ... DO UPDATE statement is
+        // serialized by Postgres' partial unique index — exactly one INSERT can succeed,
+        // the other becomes a DO UPDATE on the row that won. Either way, the row count
+        // for that dedup key must remain 1.
+        async Task RunOneAsync(int streak)
+        {
+            await using var ctx = CreateContext();
+            await MLConformalBreakerWorker.UpsertChronicTripAlertAsync(
+                ctx, dedupKey, context, modelId, streak, settings, nowUtc, CancellationToken.None);
+            // No SaveChangesAsync needed — the atomic SQL committed implicitly. The
+            // post-fetch Apply* path is skipped on Postgres precisely because the SQL
+            // already wrote the latest fields.
+        }
+
+        await Task.WhenAll(
+            RunOneAsync(streak: 4),
+            RunOneAsync(streak: 5),
+            RunOneAsync(streak: 6),
+            RunOneAsync(streak: 7));
+
+        await using var assertCtx = CreateContext();
+        var alerts = await assertCtx.Set<Alert>()
+            .Where(a => a.DeduplicationKey == dedupKey)
+            .ToListAsync();
+
+        Assert.Single(alerts);
+        Assert.True(alerts[0].IsActive);
+        Assert.Equal(AlertType.MLModelDegraded, alerts[0].AlertType);
+        Assert.Equal(AlertSeverity.High, alerts[0].Severity);
+        Assert.Equal(context.Symbol, alerts[0].Symbol);
+        // ConditionJson reflects whichever invocation won the last DO UPDATE — all four
+        // are valid latest-writer outcomes; only the dedup-key uniqueness matters here.
+        Assert.False(string.IsNullOrEmpty(alerts[0].ConditionJson));
+    }
+
     private async Task RunWorkerCycleAsync(IAlertDispatcher dispatcher)
     {
         var services = new ServiceCollection();

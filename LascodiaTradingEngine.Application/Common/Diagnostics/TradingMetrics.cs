@@ -229,6 +229,15 @@ public sealed class TradingMetrics
     public Histogram<double> MLDirectionStreakDominantFraction { get; }
     public Histogram<double> MLDirectionStreakEntropy { get; }
     public Histogram<double> MLDirectionStreakCycleDurationMs { get; }
+    public Counter<long>     MLEwmaModelsEvaluated { get; }
+    public Counter<long>     MLEwmaModelsSkipped { get; }
+    public Counter<long>     MLEwmaPredictionLogsProcessed { get; }
+    public Counter<long>     MLEwmaAlertTransitions { get; }
+    public Counter<long>     MLEwmaLockAttempts { get; }
+    public Counter<long>     MLEwmaCyclesSkipped { get; }
+    public Histogram<double> MLEwmaAccuracy { get; }
+    public Histogram<double> MLEwmaCycleDurationMs { get; }
+    public Histogram<double> MLEwmaTimeSinceLastSuccessSec { get; }
     public Counter<long>     MLAdaptiveThresholdModelsEvaluated { get; }
     public Counter<long>     MLAdaptiveThresholdModelsUpdated { get; }
     public Counter<long>     MLAdaptiveThresholdModelsSkipped { get; }
@@ -334,9 +343,12 @@ public sealed class TradingMetrics
     public Counter<long>     MLErgodicityModelsSkipped { get; }
     public Counter<long>     MLErgodicityLogsWritten { get; }
     public Counter<long>     MLErgodicityLockAttempts { get; }
+    public Counter<long>     MLErgodicityCyclesSkipped { get; }
     public Histogram<double> MLErgodicityGap { get; }
     public Histogram<double> MLErgodicityAdjustedKelly { get; }
     public Histogram<double> MLErgodicityGrowthVariance { get; }
+    public Histogram<double> MLErgodicityCycleDurationMs { get; }
+    public Histogram<double> MLErgodicityTimeSinceLastSuccessSec { get; }
     public Counter<long>     MLFeatureConsensusSnapshots { get; }
     public Counter<long>     MLFeatureConsensusPairsSkipped { get; }
     public Counter<long>     MLFeatureConsensusModelRejects { get; }
@@ -805,6 +817,15 @@ public sealed class TradingMetrics
         MLDirectionStreakDominantFraction = _meter.CreateHistogram<double>("trading.ml.direction_streak.dominant_fraction", "ratio", "Dominant prediction direction fraction in each evaluated model window.");
         MLDirectionStreakEntropy = _meter.CreateHistogram<double>("trading.ml.direction_streak.entropy", "bits", "Binary entropy of recent prediction direction windows.");
         MLDirectionStreakCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.direction_streak.cycle_duration_ms", "ms", "MLDirectionStreakWorker cycle duration.");
+        MLEwmaModelsEvaluated = _meter.CreateCounter<long>("trading.ml.ewma.models_evaluated", "models", "Active ML models evaluated by MLEwmaAccuracyWorker.");
+        MLEwmaModelsSkipped = _meter.CreateCounter<long>("trading.ml.ewma.models_skipped", "models", "Active ML models skipped by EWMA evaluation, tagged by reason.");
+        MLEwmaPredictionLogsProcessed = _meter.CreateCounter<long>("trading.ml.ewma.prediction_logs_processed", "logs", "Resolved prediction logs incorporated into EWMA state.");
+        MLEwmaAlertTransitions = _meter.CreateCounter<long>("trading.ml.ewma.alert_transitions", "alerts", "EWMA accuracy alert transitions, tagged by transition={dispatched|resolved|escalated}.");
+        MLEwmaLockAttempts = _meter.CreateCounter<long>("trading.ml.ewma.lock_attempts", "cycles", "EWMA accuracy distributed-lock attempts, tagged by outcome=acquired|busy|unavailable.");
+        MLEwmaCyclesSkipped = _meter.CreateCounter<long>("trading.ml.ewma.cycles_skipped", "cycles", "EWMA accuracy cycles skipped without evaluation, tagged by reason.");
+        MLEwmaAccuracy = _meter.CreateHistogram<double>("trading.ml.ewma.accuracy", "ratio", "Latest EWMA accuracy value by evaluated model.");
+        MLEwmaCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.ewma.cycle_duration_ms", "ms", "MLEwmaAccuracyWorker cycle duration.");
+        MLEwmaTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.ewma.time_since_last_success_seconds", "s", "Seconds since the last successful MLEwmaAccuracyWorker cycle, recorded each wake.");
         MLAdwinCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.adwin.cycle_duration_ms", "ms", "MLAdwinDriftWorker cycle duration.");
         MLAdaptiveThresholdModelsEvaluated = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_evaluated", "models", "ML models evaluated by MLAdaptiveThresholdWorker.");
         MLAdaptiveThresholdModelsUpdated = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_updated", "models", "ML models whose adaptive-threshold snapshot was updated.");
@@ -909,11 +930,14 @@ public sealed class TradingMetrics
         MLCorrelatedSignalConflictCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.correlated_signal_conflict.cycle_duration_ms", "ms", "MLCorrelatedSignalConflictWorker cycle duration");
         MLErgodicityModelsEvaluated = _meter.CreateCounter<long>("trading.ml.ergodicity.models_evaluated", "models", "Active ML models with enough resolved outcomes evaluated for ergodicity economics");
         MLErgodicityModelsSkipped = _meter.CreateCounter<long>("trading.ml.ergodicity.models_skipped", "models", "Active ML models skipped by ergodicity evaluation, tagged by reason");
-        MLErgodicityLogsWritten = _meter.CreateCounter<long>("trading.ml.ergodicity.logs_written", "logs", "MLErgodicityLog rows written");
+        MLErgodicityLogsWritten = _meter.CreateCounter<long>("trading.ml.ergodicity.logs_written", "logs", "MLErgodicityLog rows inserted or updated, tagged by operation");
         MLErgodicityLockAttempts = _meter.CreateCounter<long>("trading.ml.ergodicity.lock_attempts", "cycles", "Ergodicity distributed-lock attempts, tagged by outcome=acquired|busy|unavailable");
+        MLErgodicityCyclesSkipped = _meter.CreateCounter<long>("trading.ml.ergodicity.cycles_skipped", "cycles", "Ergodicity cycles skipped without evaluation, tagged by reason");
         MLErgodicityGap = _meter.CreateHistogram<double>("trading.ml.ergodicity.gap", "return", "Ergodicity gap between ensemble and time-average growth");
         MLErgodicityAdjustedKelly = _meter.CreateHistogram<double>("trading.ml.ergodicity.adjusted_kelly", "fraction", "Ergodicity-adjusted Kelly fraction");
         MLErgodicityGrowthVariance = _meter.CreateHistogram<double>("trading.ml.ergodicity.growth_variance", "variance", "Variance of per-outcome return proxies used by ergodicity metrics");
+        MLErgodicityCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.ergodicity.cycle_duration_ms", "ms", "MLErgodicityWorker cycle duration");
+        MLErgodicityTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.ergodicity.time_since_last_success_seconds", "s", "Seconds since the last successful MLErgodicityWorker cycle, recorded each wake");
         MLFeatureConsensusSnapshots = _meter.CreateCounter<long>("trading.ml.feature_consensus.snapshots", "snapshots", "Feature consensus snapshots written. Tagged by symbol and timeframe.");
         MLFeatureConsensusPairsSkipped = _meter.CreateCounter<long>("trading.ml.feature_consensus.pairs_skipped", "pairs", "Feature consensus pairs skipped. Tagged by reason.");
         MLFeatureConsensusModelRejects = _meter.CreateCounter<long>("trading.ml.feature_consensus.model_rejects", "models", "Models excluded from feature consensus. Tagged by reason.");

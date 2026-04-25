@@ -1195,6 +1195,90 @@ public sealed class MLCalibrationMonitorWorkerTest
     }
 
     [Fact]
+    public async Task ResolveMaxEceAsync_RegimeScopedTier_TightensInsideRegimeOnly()
+    {
+        // Regime-scoped row tightens MaxEce only when the active regime matches; the
+        // regime-agnostic global default still applies to other regimes and to the
+        // regime-null (global) path.
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:Regime:HighVolatility:MaxEce", "0.05");
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:MaxEce", "0.20");
+            });
+
+        await harness.WithDbContextAsync(async db =>
+        {
+            // HighVolatility → most-specific regime-scoped row wins.
+            double inHighVol = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None,
+                regime: MarketRegime.HighVolatility);
+            Assert.Equal(0.05, inHighVol, 6);
+
+            // Different regime → no regime-scoped match → falls to regime-agnostic 0.20.
+            double inRanging = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None,
+                regime: MarketRegime.Ranging);
+            Assert.Equal(0.20, inRanging, 6);
+
+            // Regime-null (global path) → regime tiers skipped; regime-agnostic applies.
+            double globalPath = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None);
+            Assert.Equal(0.20, globalPath, 6);
+        });
+    }
+
+    [Fact]
+    public async Task ResolveMaxEceAsync_RegimeScopedFleetWildcard_AppliesAcrossSymbolsInRegime()
+    {
+        // Fleet-wide regime override: tighten DegradationDelta-equivalent (here MaxEce)
+        // only in HighVolatility, regardless of symbol/timeframe.
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:*:*:Regime:HighVolatility:MaxEce", "0.06");
+            });
+
+        await harness.WithDbContextAsync(async db =>
+        {
+            // Any symbol/timeframe in HighVolatility → fleet-wide regime override applies.
+            Assert.Equal(0.06, await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, 0.5, CancellationToken.None,
+                regime: MarketRegime.HighVolatility), 6);
+            Assert.Equal(0.06, await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "GBPUSD", Timeframe.D1, 0.5, CancellationToken.None,
+                regime: MarketRegime.HighVolatility), 6);
+
+            // Same symbols outside HighVolatility → no match → global default.
+            Assert.Equal(0.5, await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, 0.5, CancellationToken.None,
+                regime: MarketRegime.Trending), 6);
+        });
+    }
+
+    [Fact]
+    public async Task ResolveMaxEceAsync_RegimeTierInvalid_FallsThroughToRegimeAgnostic()
+    {
+        // Regime-scoped row exists but is out of range. Resolver rejects it, walks down
+        // to the symbol-specific regime-agnostic row (0.18), and returns that — not the
+        // global default.
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:Regime:HighVolatility:MaxEce", "9.99"); // out of range
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:MaxEce", "0.18");
+            });
+
+        await harness.WithDbContextAsync(async db =>
+        {
+            double v = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None,
+                regime: MarketRegime.HighVolatility);
+            Assert.Equal(0.18, v, 6);
+        });
+    }
+
+    [Fact]
     public async Task RunCycleAsync_BoundedParallelism_EvaluatesAllModels()
     {
         // Parallelism > 1 must produce the same outcome as the sequential path: every
@@ -1247,6 +1331,117 @@ public sealed class MLCalibrationMonitorWorkerTest
             var rows = await harness.LoadCalibrationLogsAsync(baseId + s);
             Assert.Contains(rows, row => row.Regime == null);
         }
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideRegimeTypoAtStartup_LogsWarning()
+    {
+        // A typo in the regime segment (HighVol instead of HighVolatility) silently
+        // falls through override tiers; the startup-time validator should call it out
+        // with a Warning log so operators don't have to debug "the override didn't apply"
+        // by reading source.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:Regime:HighVol:MaxEce", "0.05"); // typo
+                AddConfig(db, "MLCalibration:Override:GBPUSD:H4:Regime:HighVolatility:MaxEce", "0.06"); // valid
+                SeedActiveModel(db, modelId: 700, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var warnings = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning)
+            .Select(entry => entry.Message)
+            .ToList();
+        Assert.Contains(warnings, msg =>
+            msg.Contains("regime name that doesn't match", StringComparison.OrdinalIgnoreCase) &&
+            msg.Contains("HighVol", StringComparison.OrdinalIgnoreCase));
+        // Valid entry should NOT be flagged.
+        Assert.DoesNotContain(warnings, msg =>
+            msg.Contains("HighVolatility:MaxEce", StringComparison.Ordinal) &&
+            msg.Contains("regime name that doesn't match", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideRegimeNamesAllValid_NoStartupWarning()
+    {
+        // Sanity check: when all override regime tokens are valid, the validator emits
+        // nothing — the startup signal must be silent in the happy path or operators
+        // will tune it out.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:Regime:HighVolatility:MaxEce", "0.05");
+                AddConfig(db, "MLCalibration:Override:*:*:Regime:Trending:DegradationDelta", "0.03");
+                SeedActiveModel(db, modelId: 701, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(capturingLogger.Entries, entry =>
+            entry.Level == LogLevel.Warning &&
+            entry.Message.Contains("regime name that doesn't match", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_TwoModelsOnSameContext_OverrideAppliesToBoth()
+    {
+        // Two models share (Symbol, Timeframe). The cycle pre-loads overrides once per
+        // unique pair, so both models see the per-context override applied. This proves
+        // (a) the dict is shared correctly across iterations, and (b) the override knob
+        // takes effect on every model in the pair, not just the first one drawn.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:MaxEce", "0.50");
+                AddConfig(db, "MLCalibration:DegradationDelta", "0.50");
+                // Per-context override: AUDCAD/H4 should use a tight 0.001 ceiling.
+                AddConfig(db, "MLCalibration:Override:AUDCAD:H4:MaxEce", "0.001");
+
+                // Two models on AUDCAD/H4. With the override at 0.001 and synthetic
+                // confidence-only logs producing ECE > 0.001, both should breach the
+                // threshold and emit alert audit rows.
+                foreach (long modelId in new long[] { 800, 801 })
+                {
+                    SeedActiveModel(db, modelId: modelId, symbol: "AUDCAD",
+                        timeframe: Timeframe.H4, baselineEce: 0.0005);
+                    for (int index = 0; index < 12; index++)
+                    {
+                        SeedConfidenceOnlyLog(
+                            db,
+                            id: modelId * 100 + index,
+                            modelId: modelId,
+                            symbol: "AUDCAD",
+                            timeframe: Timeframe.H4,
+                            outcomeRecordedAtUtc: now.AddHours(-(index + 1)).UtcDateTime,
+                            predictedDirection: TradeDirection.Buy,
+                            actualDirection: index % 3 == 0 ? TradeDirection.Buy : TradeDirection.Sell,
+                            confidenceScore: 0.85m);
+                    }
+                }
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(2, result.EvaluatedModelCount);
+        // With the tight 0.001 override applied to both, both should breach the threshold.
+        Assert.True(result.WarningModelCount + result.CriticalModelCount >= 2,
+            $"Expected both models to breach the 0.001 override; got warning={result.WarningModelCount}, critical={result.CriticalModelCount}.");
     }
 
     private sealed class CapturingLogger<T> : ILogger<T>

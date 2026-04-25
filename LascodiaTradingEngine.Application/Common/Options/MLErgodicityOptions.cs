@@ -5,6 +5,12 @@ namespace LascodiaTradingEngine.Application.Common.Options;
 /// <summary>Configuration defaults and bounds for ergodicity economics monitoring.</summary>
 public class MLErgodicityOptions : ConfigurationOption<MLErgodicityOptions>
 {
+    /// <summary>Whether ergodicity economics monitoring is enabled.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Additional startup delay after the shared worker startup sequencer.</summary>
+    public int InitialDelaySeconds { get; set; }
+
     /// <summary>How often the worker computes model ergodicity metrics.</summary>
     public int PollIntervalHours { get; set; } = 24;
 
@@ -25,6 +31,9 @@ public class MLErgodicityOptions : ConfigurationOption<MLErgodicityOptions>
 
     /// <summary>Timeout for acquiring the singleton ergodicity-cycle distributed lock.</summary>
     public int LockTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>Relational database command timeout applied to each ergodicity cycle.</summary>
+    public int DbCommandTimeoutSeconds { get; set; } = 30;
 
     /// <summary>Absolute cap applied to persisted Kelly fractions.</summary>
     public double MaxKellyAbs { get; set; } = 2.0;

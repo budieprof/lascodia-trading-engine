@@ -133,6 +133,84 @@ public class MLErgodicityWorkerTest
         Assert.Empty(await db.Set<MLErgodicityLog>().ToListAsync());
     }
 
+    [Fact]
+    public async Task RunCycleDetailedAsync_Skips_When_Disabled_By_Runtime_Config()
+    {
+        await using var db = CreateDbContext();
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLErgodicity:Enabled",
+            Value = "false",
+            DataType = ConfigDataType.Bool,
+            IsHotReloadable = true
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        var result = await worker.RunCycleDetailedAsync(CancellationToken.None);
+
+        Assert.Equal("disabled", result.SkippedReason);
+        Assert.Empty(await db.Set<MLErgodicityLog>().ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Updates_Recent_Log_Instead_Of_Duplicating()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD");
+        db.Set<MLModel>().Add(model);
+        AddPredictionLogs(db, model, now, correctCount: 16, incorrectCount: 4, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, options: new MLErgodicityOptions
+        {
+            MinSamples = 20,
+            MaxLogsPerModel = 20,
+            PollIntervalHours = 24
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+        var firstLog = await db.Set<MLErgodicityLog>().SingleAsync();
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var logs = await db.Set<MLErgodicityLog>().ToListAsync();
+        Assert.Single(logs);
+        Assert.Equal(firstLog.Id, logs[0].Id);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Treats_Unprofitable_Positive_Magnitude_As_Negative_Return()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD");
+        db.Set<MLModel>().Add(model);
+        AddPredictionLogs(
+            db,
+            model,
+            now,
+            correctCount: 0,
+            incorrectCount: 20,
+            startTradeSignalId: 1,
+            incorrectMagnitudePips: 12m);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, options: new MLErgodicityOptions
+        {
+            MinSamples = 20,
+            MaxLogsPerModel = 20,
+            ReturnPipScale = 100
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var log = await db.Set<MLErgodicityLog>().SingleAsync();
+        Assert.True(log.EnsembleGrowthRate < 0m);
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()
@@ -186,7 +264,8 @@ public class MLErgodicityWorkerTest
         DateTime now,
         int correctCount,
         int incorrectCount,
-        long startTradeSignalId)
+        long startTradeSignalId,
+        decimal incorrectMagnitudePips = -10m)
     {
         int total = correctCount + incorrectCount;
         for (int i = 0; i < total; i++)
@@ -203,7 +282,7 @@ public class MLErgodicityWorkerTest
                 OutcomeRecordedAt = now.AddMinutes(-total + i),
                 DirectionCorrect = correct,
                 ActualDirection = correct ? TradeDirection.Buy : TradeDirection.Sell,
-                ActualMagnitudePips = correct ? 12m : -10m,
+                ActualMagnitudePips = correct ? 12m : incorrectMagnitudePips,
                 WasProfitable = correct,
                 ServedCalibratedProbability = 0.75m,
                 ConfidenceScore = 0.75m

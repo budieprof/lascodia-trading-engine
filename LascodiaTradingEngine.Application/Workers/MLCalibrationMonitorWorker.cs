@@ -40,6 +40,11 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const int MaxAuditDiagnosticsLength = 4_000;
     private const int FleetAlertMinModels = 5;
 
+    // Cached once at type-load time. Used to size the per-cycle audit list so it doesn't
+    // resize on the first regime that appears past the literal capacity hint. Enum.GetValues
+    // allocates a fresh array each call, so we cache the length only.
+    private static readonly int RegimeCount = Enum.GetValues<MarketRegimeEnum>().Length;
+
     private const string CK_Enabled = "MLCalibration:Enabled";
     private const string CK_PollSecs = "MLCalibration:PollIntervalSeconds";
     private const string CK_WindowDays = "MLCalibration:WindowDays";
@@ -63,6 +68,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const string CK_TrendSmoothingWindow = "MLCalibration:TrendSmoothingWindow";
     private const string CK_StaleSkipAlertThreshold = "MLCalibration:StaleSkipAlertThreshold";
     private const string CK_MaxDegreeOfParallelism = "MLCalibration:MaxDegreeOfParallelism";
+    private const string CK_LongCycleWarnSeconds = "MLCalibration:LongCycleWarnSeconds";
     private const string StaleAlertDeduplicationPrefix = "ml-calibration-monitor-stale:";
 
     private const int DefaultPollSeconds = 60 * 60;
@@ -167,6 +173,15 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const int MinMaxDegreeOfParallelism = 1;
     private const int MaxMaxDegreeOfParallelism = 16;
 
+    // Wall-clock-cycle warning threshold. The cycle-level distributed lock is held for the
+    // duration of one cycle; if the cycle wall-time approaches or exceeds the lock TTL the
+    // lock can be re-acquired by another replica before this one finishes. Default 300s
+    // (5 minutes); set to 0 to disable. Operators should keep this below the IDistributedLock
+    // implementation's TTL.
+    private const int DefaultLongCycleWarnSeconds = 300;
+    private const int MinLongCycleWarnSeconds = 0;
+    private const int MaxLongCycleWarnSeconds = 24 * 60 * 60;
+
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
 
@@ -180,6 +195,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
 
     private int _consecutiveFailures;
     private bool _missingDistributedLockWarningEmitted;
+    private int _overrideRegimeValidationDone;
 
     private readonly record struct ActiveModelCandidate(
         long Id,
@@ -290,8 +306,23 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                     _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
                     _metrics?.WorkerCycleDurationMs.Record(
                         durationMs,
-                        new KeyValuePair<string, object?>("worker", WorkerName));
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("parallelism", result.Settings.MaxDegreeOfParallelism));
                     _metrics?.MLCalibrationMonitorCycleDurationMs.Record(durationMs);
+
+                    // Long-cycle guard: warn when wall-time approaches the lock TTL window.
+                    // Cycle-level distributed lock is held for the whole cycle, so a long
+                    // cycle risks the lock expiring and another replica re-acquiring before
+                    // this one finishes flushing audits. The duration histogram (with the
+                    // parallelism tag above) is the source of truth for alerting; this log
+                    // is the operator's prompt to verify the IDistributedLock TTL.
+                    int warnSec = result.Settings.LongCycleWarnSeconds;
+                    if (warnSec > 0 && durationMs > warnSec * 1000L)
+                    {
+                        _logger.LogWarning(
+                            "{Worker}: cycle wall-time {DurationMs}ms exceeded LongCycleWarnSeconds={WarnSec}s. Verify the IDistributedLock TTL is at least this long; otherwise another replica may re-acquire the cycle lock mid-flight.",
+                            WorkerName, durationMs, warnSec);
+                    }
 
                     if (result.SkippedReason is { Length: > 0 })
                     {
@@ -480,10 +511,24 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             return MLCalibrationMonitorCycleResult.Skipped(settings, "no_active_models");
         }
 
+        // Once-per-process audit of override-key regime tokens. Helps operators catch typos
+        // early instead of having keys silently fall through tiers. Gated via Interlocked
+        // CompareExchange so concurrent first cycles still run it once.
+        if (Interlocked.CompareExchange(ref _overrideRegimeValidationDone, 1, 0) == 0)
+        {
+            await ValidateOverrideRegimeNamesAsync(db, ct);
+        }
+
         // Pre-load per-model latest NewestOutcomeAt across all prior cycles. Survives restarts
         // and is shared across replicas via the audit table.
         var modelIds = models.Select(model => model.Id).ToList();
         var lastNewestOutcome = await LoadLastNewestOutcomeMapAsync(db, modelIds, ct);
+
+        // Pre-load per-context overrides once per unique (Symbol, Timeframe) so parallel
+        // model iterations share a single read. With one model per pair (typical) this is
+        // identical to the previous per-model load; with multiple variants per pair it
+        // collapses N reads to one. The dict is immutable plain data and safe to share.
+        var overridesByContext = await LoadOverridesByContextAsync(db, models, ct);
 
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
         int parallelism = Math.Clamp(settings.MaxDegreeOfParallelism, 1, MaxMaxDegreeOfParallelism);
@@ -505,6 +550,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             async (model, modelCt) =>
             {
                 lastNewestOutcome.TryGetValue(model.Id, out var lastSeen);
+                var overrides = overridesByContext[(model.Symbol, model.Timeframe)];
 
                 await using var modelScope = _scopeFactory.CreateAsyncScope();
                 var modelWriteCtx = modelScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
@@ -512,12 +558,18 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
 
                 try
                 {
+                    // Refresh the worker heartbeat before each model evaluation. Long
+                    // cycles (large fleet / DOP=1) would otherwise leave the health
+                    // monitor without a signal until the cycle ends.
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
                     var outcome = await EvaluateModelWithLockAsync(
                         modelScope.ServiceProvider,
                         modelWriteCtx,
                         modelDb,
                         model,
                         settings,
+                        overrides,
                         lastSeen,
                         nowUtc,
                         modelCt);
@@ -533,13 +585,21 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                             new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
                     }
                 }
+                catch (OperationCanceledException) when (modelCt.IsCancellationRequested)
+                {
+                    // Shutdown propagation, not a model failure. Re-throw so
+                    // Parallel.ForEachAsync surfaces it; the ExecuteAsync loop will
+                    // honour stoppingToken and exit cleanly.
+                    throw;
+                }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref failedModels);
                     _metrics?.WorkerErrors.Add(
                         1,
                         new KeyValuePair<string, object?>("worker", WorkerName),
-                        new KeyValuePair<string, object?>("reason", "ml_calibration_monitor_model"));
+                        new KeyValuePair<string, object?>("reason", "ml_calibration_monitor_model"),
+                        new KeyValuePair<string, object?>("exception_type", ex.GetType().Name));
                     _logger.LogWarning(
                         ex,
                         "{Worker}: failed to evaluate calibration for model {ModelId} ({Symbol}/{Timeframe}).",
@@ -617,6 +677,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         DbContext db,
         ActiveModelCandidate model,
         MLCalibrationMonitorWorkerSettings settings,
+        IReadOnlyDictionary<string, string> overrides,
         DateTime? lastSeenOutcomeAt,
         DateTime nowUtc,
         CancellationToken ct)
@@ -638,7 +699,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         try
         {
             return await EvaluateModelAsync(serviceProvider, writeContext, db, model, settings,
-                lastSeenOutcomeAt, nowUtc, ct);
+                overrides, lastSeenOutcomeAt, nowUtc, ct);
         }
         finally
         {
@@ -653,48 +714,29 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         DbContext db,
         ActiveModelCandidate model,
         MLCalibrationMonitorWorkerSettings settings,
+        IReadOnlyDictionary<string, string> overrides,
         DateTime? lastSeenOutcomeAt,
         DateTime nowUtc,
         CancellationToken ct)
     {
         // Audit rows accumulate locally and flush in a dedicated DI scope at the end. Keeps
         // audit IO from implicitly committing pending changes on the snapshot scope and gives
-        // operators a durable trail regardless of failure mode. Capacity sized for the global
-        // row plus one per matched regime (MarketRegime has fewer than 16 members today).
-        var pendingAudits = new List<MLCalibrationLog>(16);
+        // operators a durable trail regardless of failure mode. Capacity = 1 global + one per
+        // possible regime, derived from the enum so it self-adjusts if MarketRegime grows.
+        var pendingAudits = new List<MLCalibrationLog>(1 + RegimeCount);
         // Bootstrap-cache writes accumulate across the global + per-regime evaluation paths
         // and flush in a single batched upsert at the end of the cycle. With N matched
         // regimes and a full cache miss this collapses (1 + N) round-trips into 1.
         var pendingCacheSpecs = new List<EngineConfigUpsertSpec>(8);
 
-        // Resolve every per-context override in a single round-trip and clone the settings
-        // record with the effective values. The resolver walks the four wildcard tiers
-        // (Symbol+TF → Symbol-only → TF-only → fleet-wide) per knob in memory, so a single
-        // `*:H1:MaxEce` row tightens the ceiling on every H1 model without per-symbol rows.
-        var overrides = await LoadAllPerContextOverridesAsync(db, model.Symbol, model.Timeframe, ct);
-        settings = settings with
-        {
-            MaxEce = ResolveOverride(overrides, model.Symbol, model.Timeframe, "MaxEce",
-                TryParseFiniteDouble,
-                v => v >= MinMaxEce && v <= MaxMaxEce,
-                settings.MaxEce),
-            DegradationDelta = ResolveOverride(overrides, model.Symbol, model.Timeframe, "DegradationDelta",
-                TryParseFiniteDouble,
-                v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
-                settings.DegradationDelta),
-            RegressionGuardK = ResolveOverride(overrides, model.Symbol, model.Timeframe, "RegressionGuardK",
-                TryParseFiniteDouble,
-                v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
-                settings.RegressionGuardK),
-            BootstrapCacheStaleHours = ResolveOverride(overrides, model.Symbol, model.Timeframe, "BootstrapCacheStaleHours",
-                TryParseStrictInt,
-                v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
-                settings.BootstrapCacheStaleHours),
-            RetrainOnBaselineCritical = ResolveOverride(overrides, model.Symbol, model.Timeframe, "RetrainOnBaselineCritical",
-                TryParseBoolish,
-                _ => true,
-                settings.RetrainOnBaselineCritical),
-        };
+        // Apply per-context overrides on top of the cycle-wide defaults. The `overrides`
+        // dict is pre-loaded once per unique (Symbol, Timeframe) at the cycle level and
+        // shared across iterations, so two models on the same context hit a single read.
+        // ApplyPerContextOverrides walks the 8-tier hierarchy per knob in memory:
+        // regime-scoped tiers first when a regime is supplied (here, null for the global
+        // path), then the four regime-agnostic tiers
+        // (Symbol+TF → Symbol-only → TF-only → fleet-wide).
+        settings = ApplyPerContextOverrides(settings, overrides, model.Symbol, model.Timeframe);
 
         try
         {
@@ -924,8 +966,10 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
 
             // Per-regime breakdown: pool samples by the active regime at PredictedAt and
             // measure ECE per regime. Each regime gets its own audit row so dashboards can
-            // see whether miscalibration is regime-localised.
-            await EvaluatePerRegimeAsync(db, model, samples, settings, nowUtc, pendingAudits, pendingCacheSpecs, ct);
+            // see whether miscalibration is regime-localised. The same `overrides` dict is
+            // re-used so regime-scoped tiers can tighten knobs only in specific regimes
+            // without a second round-trip per regime.
+            await EvaluatePerRegimeAsync(db, model, samples, settings, overrides, nowUtc, pendingAudits, pendingCacheSpecs, ct);
 
             _logger.LogDebug(
                 "{Worker}: model {ModelId} ({Symbol}/{Timeframe}) ece={Ece:F6}±{Stderr:F6}, accuracy={Accuracy:P1}, meanConfidence={MeanConfidence:F4}, previous={PreviousEce}, baseline={BaselineEce}, trendDelta={TrendDelta:F6}, baselineDelta={BaselineDelta:F6}, samples={Samples}, state={State}.",
@@ -964,6 +1008,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         ActiveModelCandidate model,
         List<CalibrationSample> samples,
         MLCalibrationMonitorWorkerSettings settings,
+        IReadOnlyDictionary<string, string> overrides,
         DateTime nowUtc,
         List<MLCalibrationLog> pendingAudits,
         List<EngineConfigUpsertSpec> pendingCacheSpecs,
@@ -995,23 +1040,30 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         {
             if (regimeSamples.Count < settings.PerRegimeMinSamples) continue;
 
+            // Apply regime-scoped overrides on top of the regime-agnostic settings clone.
+            // ResolveOverride walks the 8 tiers (4 regime-scoped → 4 regime-agnostic) so a
+            // row like `*:*:Regime:HighVolatility:DegradationDelta` tightens that knob in
+            // exactly the regimes operators care about, without affecting the global path.
+            var regimeSettings = ApplyPerContextOverrides(
+                settings, overrides, model.Symbol, model.Timeframe, regime);
+
             // Per-regime stderr is cached under its own scope key so each regime amortises
             // bootstrap CPU separately. RowVersion check ensures a model swap invalidates
-            // every regime's cache simultaneously. Per-context override applies the same
-            // staleness window resolution as the global path.
+            // every regime's cache simultaneously.
             double? regimeCachedStderr = await LoadFreshBootstrapStderrAsync(
-                db, model.Id, regime, model.RowVersion, nowUtc, settings.BootstrapCacheStaleHours, ct);
+                db, model.Id, regime, model.RowVersion, nowUtc, regimeSettings.BootstrapCacheStaleHours, ct);
             bool regimeBootstrapCacheHit = regimeCachedStderr.HasValue;
             _metrics?.MLCalibrationMonitorBootstrapCacheLookups.Add(
                 1,
                 new KeyValuePair<string, object?>("outcome", regimeBootstrapCacheHit ? "hit" : "miss"),
                 new KeyValuePair<string, object?>("scope", "regime"),
                 new KeyValuePair<string, object?>("symbol", model.Symbol),
-                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                new KeyValuePair<string, object?>("regime", regime.ToString()));
 
             var regimeSummary = ComputeCalibrationSummary(
-                regimeSamples, settings.BootstrapResamples, nowUtc,
-                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay,
+                regimeSamples, regimeSettings.BootstrapResamples, nowUtc,
+                regimeSettings.TimeDecayHalfLifeDays, regimeSettings.MinSamplesForTimeDecay,
                 regimeCachedStderr, model.Id);
             if (!regimeBootstrapCacheHit && regimeSummary.EceStderr > 0)
             {
@@ -1023,16 +1075,16 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             // regime drift is detected even when the global trend is flat. Returns null on
             // first cycle for a given regime, in which case the trend signal stays inert.
             double? regimePreviousEce = await LoadSmoothedPreviousEceAsync(
-                db, model.Id, regime, settings.TrendSmoothingWindow, ct);
+                db, model.Id, regime, regimeSettings.TrendSmoothingWindow, ct);
             var regimeSignals = BuildSignals(
                 regimeSummary.CurrentEce,
                 regimeSummary.EceStderr,
                 previousEce: regimePreviousEce,
                 baselineEce: TryResolveBaselineEce(model.ModelBytes, regime),
-                settings.MaxEce,
-                settings.DegradationDelta,
-                settings.RegressionGuardK);
-            var regimeState = ResolveAlertState(regimeSummary.CurrentEce, regimeSignals, settings);
+                regimeSettings.MaxEce,
+                regimeSettings.DegradationDelta,
+                regimeSettings.RegressionGuardK);
+            var regimeState = ResolveAlertState(regimeSummary.CurrentEce, regimeSignals, regimeSettings);
 
             string regimeOutcome = regimeState switch
             {
@@ -1052,7 +1104,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 signals: regimeSignals,
                 alertState: regimeState,
                 newestOutcomeAt: regimeSummary.NewestOutcomeAt,
-                diagnostics: BuildDiagnosticsWithBins(regimeSummary, regimeSignals, settings, regimeBootstrapCacheHit),
+                diagnostics: BuildDiagnosticsWithBins(regimeSummary, regimeSignals, regimeSettings, regimeBootstrapCacheHit),
                 evaluatedAt: nowUtc);
         }
     }
@@ -1821,7 +1873,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             CK_TimeDecayHalfLifeDays, CK_MinSamplesForTimeDecay,
             CK_TrendSmoothingWindow, CK_StaleSkipAlertThreshold,
             CK_BootstrapCacheStaleHours, CK_RetrainOnBaselineCritical,
-            CK_MaxDegreeOfParallelism,
+            CK_MaxDegreeOfParallelism, CK_LongCycleWarnSeconds,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -1885,7 +1937,10 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             RetrainOnBaselineCritical: GetBool(values, CK_RetrainOnBaselineCritical, false),
             MaxDegreeOfParallelism: ClampInt(
                 GetInt(values, CK_MaxDegreeOfParallelism, DefaultMaxDegreeOfParallelism),
-                DefaultMaxDegreeOfParallelism, MinMaxDegreeOfParallelism, MaxMaxDegreeOfParallelism));
+                DefaultMaxDegreeOfParallelism, MinMaxDegreeOfParallelism, MaxMaxDegreeOfParallelism),
+            LongCycleWarnSeconds: ClampIntAllowingZero(
+                GetInt(values, CK_LongCycleWarnSeconds, DefaultLongCycleWarnSeconds),
+                DefaultLongCycleWarnSeconds, MinLongCycleWarnSeconds, MaxLongCycleWarnSeconds));
     }
 
     private static MLCalibrationMonitorAlertState ResolveAlertState(
@@ -2099,12 +2154,13 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
 
     /// <summary>
     /// Loads every per-context override row that could apply to <paramref name="symbol"/>/
-    /// <paramref name="timeframe"/> in a single round-trip: the four wildcard tiers
-    /// (<c>{symbol}:{tf}</c>, <c>{symbol}:*</c>, <c>*:{tf}</c>, <c>*:*</c>) are all OR'd into
-    /// one prefix scan. Caller resolves precedence in memory via
-    /// <see cref="ResolveOverride{T}"/>, so all five override knobs share the one query.
+    /// <paramref name="timeframe"/> in a single round-trip. The four base wildcard tiers
+    /// (<c>{symbol}:{tf}</c>, <c>{symbol}:*</c>, <c>*:{tf}</c>, <c>*:*</c>) are OR'd into
+    /// one prefix scan; this also captures any regime-scoped variants that share those
+    /// base prefixes (e.g. <c>{symbol}:{tf}:Regime:HighVolatility:{knob}</c>). Caller
+    /// resolves precedence in memory via <see cref="ResolveOverride{T}"/>.
     /// </summary>
-    private static async Task<IReadOnlyDictionary<string, string>> LoadAllPerContextOverridesAsync(
+    internal static async Task<IReadOnlyDictionary<string, string>> LoadAllPerContextOverridesAsync(
         DbContext db, string symbol, Timeframe timeframe, CancellationToken ct)
     {
         string tfStr = timeframe.ToString();
@@ -2123,36 +2179,166 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     }
 
     /// <summary>
+    /// Pre-loads per-context overrides once per unique <c>(Symbol, Timeframe)</c> in the
+    /// candidate set, before fanning out to parallel model evaluation. Two model variants
+    /// on the same context now share a single read instead of duplicating the prefix scan
+    /// per iteration.
+    /// </summary>
+    private static async Task<Dictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>>>
+        LoadOverridesByContextAsync(
+            DbContext db, IReadOnlyList<ActiveModelCandidate> models, CancellationToken ct)
+    {
+        var contexts = new HashSet<(string, Timeframe)>(models.Count);
+        foreach (var model in models)
+        {
+            contexts.Add((model.Symbol, model.Timeframe));
+        }
+
+        var result = new Dictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>>(contexts.Count);
+        foreach (var (symbol, timeframe) in contexts)
+        {
+            result[(symbol, timeframe)] = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Once-per-process audit of override-key regime tokens. Scans every override key with
+    /// a <c>:Regime:</c> segment and logs a warning when the segment doesn't parse to a
+    /// <see cref="MarketRegimeEnum"/> value. Catches typos like <c>Regime:HighVol:</c>
+    /// (vs. <c>HighVolatility</c>) at startup instead of having them silently fall through
+    /// override tiers.
+    /// </summary>
+    private async Task ValidateOverrideRegimeNamesAsync(DbContext db, CancellationToken ct)
+    {
+        var keys = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(c => c.Key.StartsWith("MLCalibration:Override:") && c.Key.Contains(":Regime:"))
+            .Select(c => c.Key)
+            .ToListAsync(ct);
+
+        if (keys.Count == 0) return;
+
+        var unmatched = new List<string>();
+        foreach (var key in keys)
+        {
+            // Format: MLCalibration:Override:{Symbol}:{TF}:Regime:{Regime}:{Knob}
+            // Find the segment immediately after "Regime" and try to parse it.
+            var parts = key.Split(':');
+            for (int i = 0; i < parts.Length - 1; i++)
+            {
+                if (parts[i] != "Regime") continue;
+                if (!Enum.TryParse<MarketRegimeEnum>(parts[i + 1], ignoreCase: false, out _))
+                    unmatched.Add(key);
+                break;
+            }
+        }
+
+        if (unmatched.Count > 0)
+        {
+            _logger.LogWarning(
+                "{Worker}: {Count} override key(s) reference a regime name that doesn't match any MarketRegime enum value. These rows will silently fall through to the next override tier. Keys: {Keys}",
+                WorkerName, unmatched.Count, string.Join(", ", unmatched));
+        }
+    }
+
+    /// <summary>
     /// Walks the override-precedence chain (most-specific → least-specific) for a single
     /// setting and returns the first row that parses cleanly and clears <paramref name="validate"/>.
-    /// Order: <c>{Symbol}:{TF}</c> → <c>{Symbol}:*</c> → <c>*:{TF}</c> → <c>*:*</c> →
-    /// <paramref name="globalDefault"/>. Parsing or validation failures fall through to the
-    /// next tier, not silent acceptance of bad data.
+    /// When <paramref name="regime"/> is non-null the four regime-scoped tiers run first
+    /// (<c>:Regime:{r}:</c> form) before the four regime-agnostic tiers, giving an 8-tier
+    /// lookup that lets operators tighten knobs only in specific regimes (e.g.
+    /// <c>*:*:Regime:HighVolatility:DegradationDelta</c>). Parsing or validation failures
+    /// fall through to the next tier, not silent acceptance of bad data.
     /// </summary>
-    private static T ResolveOverride<T>(
+    internal static T ResolveOverride<T>(
         IReadOnlyDictionary<string, string> overrides,
         string symbol,
         Timeframe timeframe,
+        MarketRegimeEnum? regime,
         string settingName,
         Func<string, (bool ok, T value)> tryParse,
         Func<T, bool> validate,
         T globalDefault)
+        where T : struct
     {
         string tfStr = timeframe.ToString();
-        string[] keys =
-        [
-            $"MLCalibration:Override:{symbol}:{tfStr}:{settingName}",
-            $"MLCalibration:Override:{symbol}:*:{settingName}",
-            $"MLCalibration:Override:*:{tfStr}:{settingName}",
-            $"MLCalibration:Override:*:*:{settingName}",
-        ];
-        foreach (var key in keys)
+        // Regime-scoped tiers first, most specific to least specific. Each tier is built and
+        // probed lazily — no upfront array allocation, and unused tiers never construct the
+        // string at all.
+        if (regime is not null)
         {
-            if (!overrides.TryGetValue(key, out var raw) || raw is null) continue;
-            var (ok, value) = tryParse(raw);
-            if (ok && validate(value)) return value;
+            string r = regime.Value.ToString();
+            if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:{tfStr}:Regime:{r}:{settingName}", tryParse, validate, out var v1)) return v1;
+            if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:*:Regime:{r}:{settingName}", tryParse, validate, out var v2)) return v2;
+            if (TryResolveTier(overrides, $"MLCalibration:Override:*:{tfStr}:Regime:{r}:{settingName}", tryParse, validate, out var v3)) return v3;
+            if (TryResolveTier(overrides, $"MLCalibration:Override:*:*:Regime:{r}:{settingName}", tryParse, validate, out var v4)) return v4;
         }
+
+        if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:{tfStr}:{settingName}", tryParse, validate, out var v5)) return v5;
+        if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:*:{settingName}", tryParse, validate, out var v6)) return v6;
+        if (TryResolveTier(overrides, $"MLCalibration:Override:*:{tfStr}:{settingName}", tryParse, validate, out var v7)) return v7;
+        if (TryResolveTier(overrides, "MLCalibration:Override:*:*:" + settingName, tryParse, validate, out var v8)) return v8;
+
         return globalDefault;
+    }
+
+    private static bool TryResolveTier<T>(
+        IReadOnlyDictionary<string, string> overrides,
+        string key,
+        Func<string, (bool ok, T value)> tryParse,
+        Func<T, bool> validate,
+        out T value)
+        where T : struct
+    {
+        if (overrides.TryGetValue(key, out var raw) && raw is not null)
+        {
+            var (ok, parsed) = tryParse(raw);
+            if (ok && validate(parsed))
+            {
+                value = parsed;
+                return true;
+            }
+        }
+        value = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Clones <paramref name="settings"/> with every per-context overrideable knob resolved
+    /// against <paramref name="overrides"/>. Pass a non-null <paramref name="regime"/> from
+    /// per-regime evaluation paths so regime-scoped tiers take precedence.
+    /// </summary>
+    private static MLCalibrationMonitorWorkerSettings ApplyPerContextOverrides(
+        MLCalibrationMonitorWorkerSettings settings,
+        IReadOnlyDictionary<string, string> overrides,
+        string symbol,
+        Timeframe timeframe,
+        MarketRegimeEnum? regime = null)
+    {
+        return settings with
+        {
+            MaxEce = ResolveOverride(overrides, symbol, timeframe, regime, "MaxEce",
+                TryParseFiniteDouble,
+                v => v >= MinMaxEce && v <= MaxMaxEce,
+                settings.MaxEce),
+            DegradationDelta = ResolveOverride(overrides, symbol, timeframe, regime, "DegradationDelta",
+                TryParseFiniteDouble,
+                v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
+                settings.DegradationDelta),
+            RegressionGuardK = ResolveOverride(overrides, symbol, timeframe, regime, "RegressionGuardK",
+                TryParseFiniteDouble,
+                v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
+                settings.RegressionGuardK),
+            BootstrapCacheStaleHours = ResolveOverride(overrides, symbol, timeframe, regime, "BootstrapCacheStaleHours",
+                TryParseStrictInt,
+                v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
+                settings.BootstrapCacheStaleHours),
+            RetrainOnBaselineCritical = ResolveOverride(overrides, symbol, timeframe, regime, "RetrainOnBaselineCritical",
+                TryParseBoolish,
+                _ => true,
+                settings.RetrainOnBaselineCritical),
+        };
     }
 
     // Shared parsers for the override resolvers — strict (no decimal-to-int truncation),
@@ -2174,61 +2360,66 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         return (false, false);
     }
 
-    /// <summary>Resolves the effective <c>BootstrapCacheStaleHours</c> for a (Symbol, Timeframe) pair.</summary>
+    /// <summary>Resolves the effective <c>BootstrapCacheStaleHours</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
     internal static async Task<int> ResolveBootstrapCacheStaleHoursAsync(
-        DbContext db, string symbol, Timeframe timeframe, int globalDefault, CancellationToken ct)
+        DbContext db, string symbol, Timeframe timeframe, int globalDefault, CancellationToken ct,
+        MarketRegimeEnum? regime = null)
     {
         var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
         return ResolveOverride(
-            overrides, symbol, timeframe, "BootstrapCacheStaleHours",
+            overrides, symbol, timeframe, regime, "BootstrapCacheStaleHours",
             TryParseStrictInt,
             v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
             globalDefault);
     }
 
-    /// <summary>Resolves the effective <c>RetrainOnBaselineCritical</c> for a (Symbol, Timeframe) pair.</summary>
+    /// <summary>Resolves the effective <c>RetrainOnBaselineCritical</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
     internal static async Task<bool> ResolveRetrainOnBaselineCriticalAsync(
-        DbContext db, string symbol, Timeframe timeframe, bool globalDefault, CancellationToken ct)
+        DbContext db, string symbol, Timeframe timeframe, bool globalDefault, CancellationToken ct,
+        MarketRegimeEnum? regime = null)
     {
         var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
         return ResolveOverride(
-            overrides, symbol, timeframe, "RetrainOnBaselineCritical",
+            overrides, symbol, timeframe, regime, "RetrainOnBaselineCritical",
             TryParseBoolish,
             _ => true,
             globalDefault);
     }
 
-    /// <summary>Resolves the effective <c>MaxEce</c> ceiling for a (Symbol, Timeframe) pair.</summary>
+    /// <summary>Resolves the effective <c>MaxEce</c> ceiling for a (Symbol, Timeframe[, Regime]) tuple.</summary>
     internal static async Task<double> ResolveMaxEceAsync(
-        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct)
+        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct,
+        MarketRegimeEnum? regime = null)
     {
         var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
         return ResolveOverride(
-            overrides, symbol, timeframe, "MaxEce",
+            overrides, symbol, timeframe, regime, "MaxEce",
             TryParseFiniteDouble,
             v => v >= MinMaxEce && v <= MaxMaxEce,
             globalDefault);
     }
 
-    /// <summary>Resolves the effective <c>DegradationDelta</c> for a (Symbol, Timeframe) pair.</summary>
+    /// <summary>Resolves the effective <c>DegradationDelta</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
     internal static async Task<double> ResolveDegradationDeltaAsync(
-        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct)
+        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct,
+        MarketRegimeEnum? regime = null)
     {
         var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
         return ResolveOverride(
-            overrides, symbol, timeframe, "DegradationDelta",
+            overrides, symbol, timeframe, regime, "DegradationDelta",
             TryParseFiniteDouble,
             v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
             globalDefault);
     }
 
-    /// <summary>Resolves the effective <c>RegressionGuardK</c> for a (Symbol, Timeframe) pair.</summary>
+    /// <summary>Resolves the effective <c>RegressionGuardK</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
     internal static async Task<double> ResolveRegressionGuardKAsync(
-        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct)
+        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct,
+        MarketRegimeEnum? regime = null)
     {
         var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
         return ResolveOverride(
-            overrides, symbol, timeframe, "RegressionGuardK",
+            overrides, symbol, timeframe, regime, "RegressionGuardK",
             TryParseFiniteDouble,
             v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
             globalDefault);
@@ -2496,7 +2687,8 @@ internal sealed record MLCalibrationMonitorWorkerSettings(
     int StaleSkipAlertThreshold,
     int BootstrapCacheStaleHours,
     bool RetrainOnBaselineCritical,
-    int MaxDegreeOfParallelism);
+    int MaxDegreeOfParallelism,
+    int LongCycleWarnSeconds);
 
 internal sealed record MLCalibrationMonitorCycleResult(
     MLCalibrationMonitorWorkerSettings Settings,

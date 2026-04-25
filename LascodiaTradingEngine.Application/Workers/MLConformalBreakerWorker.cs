@@ -58,6 +58,7 @@ public sealed class MLConformalBreakerWorker : BackgroundService
     internal const string WorkerName = nameof(MLConformalBreakerWorker);
     private const string DistributedLockKey = "ml:conformal-breaker:cycle";
     private const string ChronicTripDeduplicationPrefix = "ml-conformal-chronic-trip:";
+    private const string PostgresProviderName = "Npgsql.EntityFrameworkCore.PostgreSQL";
 
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
@@ -118,13 +119,17 @@ public sealed class MLConformalBreakerWorker : BackgroundService
         int ExpiredCount,
         int ActiveBreakers,
         int AlertDispatchCount,
-        int AlertBackpressureSkippedCount,
+        int TripAlertBackpressureSkippedCount,
+        int ChronicAlertBackpressureSkippedCount,
         int ChronicTripAlertCount)
     {
+        public int AlertBackpressureSkippedCount
+            => TripAlertBackpressureSkippedCount + ChronicAlertBackpressureSkippedCount;
+
         public static MLConformalBreakerCycleResult Skipped(
             MLConformalBreakerWorkerSettings settings,
             string reason)
-            => new(settings, reason, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            => new(settings, reason, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     private readonly record struct ActiveBreakerSnapshot(
@@ -405,7 +410,7 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             new KeyValuePair<string, object?>("worker", WorkerName));
 
         _logger.LogInformation(
-            "{Worker}: cycle {CycleId} complete. evaluated={Evaluated} skippedNoCalibration={SkippedCalibration} skippedInsufficient={SkippedInsufficient} tripped={Tripped} refreshed={Refreshed} recovered={Recovered} expired={Expired} duplicateRepairs={DuplicateRepairs} alerts={Alerts} alertBackpressureSkipped={AlertBackpressureSkipped} chronicTripAlerts={ChronicTripAlerts} active={Active}",
+            "{Worker}: cycle {CycleId} complete. evaluated={Evaluated} skippedNoCalibration={SkippedCalibration} skippedInsufficient={SkippedInsufficient} tripped={Tripped} refreshed={Refreshed} recovered={Recovered} expired={Expired} duplicateRepairs={DuplicateRepairs} alerts={Alerts} tripAlertBackpressureSkipped={TripBackpressure} chronicAlertBackpressureSkipped={ChronicBackpressure} chronicTripAlerts={ChronicTripAlerts} active={Active}",
             WorkerName,
             cycleId,
             evaluationOutcome.EvaluatedCount,
@@ -417,7 +422,8 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             stateResult.ExpiredCount,
             stateResult.DuplicateActiveBreakersDeactivated,
             dispatchOutcome.AlertDispatchCount,
-            dispatchOutcome.AlertBackpressureSkippedCount,
+            dispatchOutcome.TripAlertBackpressureSkippedCount,
+            dispatchOutcome.ChronicAlertBackpressureSkippedCount,
             dispatchOutcome.ChronicTripAlertCount,
             stateResult.ActiveBreakers);
 
@@ -434,7 +440,8 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             ExpiredCount: stateResult.ExpiredCount,
             ActiveBreakers: stateResult.ActiveBreakers,
             AlertDispatchCount: dispatchOutcome.AlertDispatchCount,
-            AlertBackpressureSkippedCount: dispatchOutcome.AlertBackpressureSkippedCount,
+            TripAlertBackpressureSkippedCount: dispatchOutcome.TripAlertBackpressureSkippedCount,
+            ChronicAlertBackpressureSkippedCount: dispatchOutcome.ChronicAlertBackpressureSkippedCount,
             ChronicTripAlertCount: dispatchOutcome.ChronicTripAlertCount);
     }
 
@@ -454,12 +461,13 @@ public sealed class MLConformalBreakerWorker : BackgroundService
         public required Dictionary<long, ModelContext> ContextByModelId { get; init; }
     }
 
-    private readonly record struct ModelContext(string Symbol, Timeframe Timeframe);
+    internal readonly record struct ModelContext(string Symbol, Timeframe Timeframe);
 
     private sealed class DispatchOutcome
     {
         public int AlertDispatchCount;
-        public int AlertBackpressureSkippedCount;
+        public int TripAlertBackpressureSkippedCount;
+        public int ChronicAlertBackpressureSkippedCount;
         public int ChronicTripAlertCount;
     }
 
@@ -763,7 +771,7 @@ public sealed class MLConformalBreakerWorker : BackgroundService
                 {
                     if (!budget.TryConsume())
                     {
-                        outcome.AlertBackpressureSkippedCount++;
+                        outcome.TripAlertBackpressureSkippedCount++;
                         _metrics.MLConformalBreakerCyclesSkipped.Add(
                             1,
                             new KeyValuePair<string, object?>("reason", "alert_backpressure"));
@@ -821,7 +829,7 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             {
                 if (!budget.TryConsume())
                 {
-                    outcome.AlertBackpressureSkippedCount++;
+                    outcome.ChronicAlertBackpressureSkippedCount++;
                     continue;
                 }
 
@@ -912,7 +920,7 @@ public sealed class MLConformalBreakerWorker : BackgroundService
         return outcome;
     }
 
-    private static async Task<Alert> UpsertChronicTripAlertAsync(
+    internal static async Task<Alert> UpsertChronicTripAlertAsync(
         DbContext dbContext,
         string dedupKey,
         ModelContext context,
@@ -922,11 +930,14 @@ public sealed class MLConformalBreakerWorker : BackgroundService
         DateTime nowUtc,
         CancellationToken ct)
     {
-        // Step 1 (Postgres only): atomic INSERT ... ON CONFLICT DO NOTHING. This closes the
-        // read-then-add race window — if another replica already inserted, we no-op and
-        // re-fetch below. The conflict target is the partial unique index on
-        // DeduplicationKey (active + non-deleted rows only).
-        if (string.Equals(dbContext.Database.ProviderName, "Npgsql.EntityFrameworkCore.PostgreSQL", StringComparison.Ordinal))
+        bool isPostgres = string.Equals(dbContext.Database.ProviderName, PostgresProviderName, StringComparison.Ordinal);
+
+        // Postgres: single-statement atomic upsert. INSERT ... ON CONFLICT DO UPDATE SET
+        // writes the latest field values whether we win the insert or another replica
+        // already inserted. We then re-fetch into the EF tracker so the dispatcher can
+        // mutate LastTriggeredAt and the end-of-cycle save can persist that one column —
+        // no redundant UPDATE for already-current fields.
+        if (isPostgres)
         {
             string conditionJson = BuildChronicTripConditionJson(context, modelId, streak, settings, nowUtc);
             string symbol = context.Symbol;
@@ -940,22 +951,24 @@ public sealed class MLConformalBreakerWorker : BackgroundService
                      3600, {conditionJson}, true, false)
                 ON CONFLICT (""DeduplicationKey"")
                     WHERE ""IsActive"" = TRUE AND ""IsDeleted"" = FALSE AND ""DeduplicationKey"" IS NOT NULL
-                DO NOTHING",
+                DO UPDATE SET
+                    ""AlertType"" = EXCLUDED.""AlertType"",
+                    ""Symbol"" = EXCLUDED.""Symbol"",
+                    ""Severity"" = EXCLUDED.""Severity"",
+                    ""CooldownSeconds"" = EXCLUDED.""CooldownSeconds"",
+                    ""ConditionJson"" = EXCLUDED.""ConditionJson"",
+                    ""AutoResolvedAt"" = NULL",
                 ct);
         }
 
-        // Step 2: re-fetch the row. After step 1, the row exists either because we
-        // inserted it or because the conflict path no-op'd onto a row another replica
-        // inserted. Either way, the entity is now in the DB and gets loaded into the
-        // tracker for subsequent field updates.
         var existing = await dbContext.Set<Alert>()
             .FirstOrDefaultAsync(a => !a.IsDeleted
                                    && a.IsActive
                                    && a.DeduplicationKey == dedupKey, ct);
 
-        // Step 3 (non-Postgres providers like InMemoryDatabase tests): no atomic insert
-        // was attempted, so we fall back to read-then-add. The dedup-race recovery in the
-        // caller still handles the unlikely concurrent-add race for these providers.
+        // Non-Postgres providers (InMemoryDatabase tests, Sqlite, etc.) take the
+        // read-then-add path with field-apply. The dedup-race recovery in the caller
+        // still handles the unlikely concurrent-add race for these providers.
         if (existing is null)
         {
             existing = new Alert
@@ -965,9 +978,17 @@ public sealed class MLConformalBreakerWorker : BackgroundService
                 IsActive = true,
             };
             dbContext.Set<Alert>().Add(existing);
+            ApplyChronicTripAlertFields(existing, context, modelId, streak, settings, nowUtc);
         }
+        else if (!isPostgres)
+        {
+            // Existing row found on a non-Postgres provider — the SQL upsert path didn't
+            // refresh fields; do it here.
+            ApplyChronicTripAlertFields(existing, context, modelId, streak, settings, nowUtc);
+        }
+        // Postgres path skips the field-apply: the SQL already set every relevant column,
+        // and re-applying them through the tracker would emit a redundant UPDATE.
 
-        ApplyChronicTripAlertFields(existing, context, modelId, streak, settings, nowUtc);
         return existing;
     }
 

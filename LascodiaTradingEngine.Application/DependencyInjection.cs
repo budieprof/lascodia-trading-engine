@@ -180,6 +180,13 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLErgodicityOptions>>().Value);
 
+        services.RemoveAll<MLEwmaAccuracyOptions>();
+        services.AddSingleton<IValidateOptions<MLEwmaAccuracyOptions>, MLEwmaAccuracyOptionsValidator>();
+        services.AddOptions<MLEwmaAccuracyOptions>()
+            .Bind(configuration.GetSection(nameof(MLEwmaAccuracyOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLEwmaAccuracyOptions>>().Value);
+
         services.RemoveAll<CorrelationMatrixOptions>();
         services.AddSingleton<IValidateOptions<CorrelationMatrixOptions>, CorrelationMatrixOptionsValidator>();
         services.AddOptions<CorrelationMatrixOptions>()

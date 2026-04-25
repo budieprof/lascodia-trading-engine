@@ -169,6 +169,183 @@ public class MLEwmaAccuracyWorkerTest
     }
 
     [Fact]
+    public async Task UpdateEwmaAsync_SkipsAllWork_WhenDisabledByConfig()
+    {
+        await using var fixture = await EwmaFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+
+        db.Set<EngineConfig>().Add(Config("MLEwma:Enabled", "false"));
+        await SeedPredictionAsync(
+            db,
+            model,
+            DateTime.UtcNow.AddMinutes(-10),
+            DateTime.UtcNow.AddMinutes(-1),
+            false);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateWorker().UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        Assert.Empty(await db.Set<MLModelEwmaAccuracy>().ToListAsync());
+        Assert.Empty(await db.Set<Alert>().ToListAsync());
+    }
+
+    [Fact]
+    public async Task UpdateEwmaAsync_EscalatesActiveWarningAlert_ToCritical()
+    {
+        await using var fixture = await EwmaFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddHours(-1);
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLEwma:Alpha", "0.5"),
+            Config("MLEwma:MinPredictions", "1"),
+            Config("MLEwma:WarnThreshold", "0.40"),
+            Config("MLEwma:CriticalThreshold", "0.20"));
+
+        await SeedPredictionAsync(db, model, t0, t0.AddMinutes(1), false);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        var worker = CreateWorker();
+        await worker.UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var alert = await db.Set<Alert>().SingleAsync();
+        Assert.Equal(AlertSeverity.Medium, alert.Severity);
+        Assert.Contains("\"severity\":\"warning\"", alert.ConditionJson);
+
+        await SeedPredictionAsync(db, model, t0.AddMinutes(2), t0.AddMinutes(3), false);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await worker.UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        alert = await db.Set<Alert>().SingleAsync();
+        Assert.True(alert.IsActive);
+        Assert.Null(alert.AutoResolvedAt);
+        Assert.Equal(AlertSeverity.Critical, alert.Severity);
+        Assert.Contains("\"severity\":\"critical\"", alert.ConditionJson);
+    }
+
+    [Fact]
+    public async Task UpdateEwmaAsync_ResolvesActiveAlert_WhenEwmaRecoversAboveWarning()
+    {
+        await using var fixture = await EwmaFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddHours(-1);
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLEwma:Alpha", "1"),
+            Config("MLEwma:MinPredictions", "1"),
+            Config("MLEwma:WarnThreshold", "0.50"),
+            Config("MLEwma:CriticalThreshold", "0.48"));
+
+        await SeedPredictionAsync(db, model, t0, t0.AddMinutes(1), false);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        var worker = CreateWorker();
+        await worker.UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var alert = await db.Set<Alert>().SingleAsync();
+        Assert.True(alert.IsActive);
+
+        await SeedPredictionAsync(db, model, t0.AddMinutes(2), t0.AddMinutes(3), true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await worker.UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        alert = await db.Set<Alert>().SingleAsync();
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task UpdateEwmaAsync_ResolvesWorkerOwnedAlert_WhenModelLeavesActiveSet()
+    {
+        await using var fixture = await EwmaFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+
+        db.Attach(model);
+        model.IsSuppressed = true;
+        db.Set<Alert>().Add(new Alert
+        {
+            Symbol = model.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            DeduplicationKey = $"MLEwma:{model.Id}:{model.Symbol}:{model.Timeframe}",
+            ConditionJson = "{}",
+            IsActive = true,
+            Severity = AlertSeverity.Critical,
+        });
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateWorker().UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var alert = await db.Set<Alert>().SingleAsync();
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task UpdateEwmaAsync_IgnoresChallengerPredictionLogs()
+    {
+        await using var fixture = await EwmaFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddHours(-1);
+
+        await SeedPredictionAsync(db, model, t0, t0.AddMinutes(1), false, ModelRole.Challenger);
+        await SeedPredictionAsync(db, model, t0.AddMinutes(2), t0.AddMinutes(3), true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateWorker().UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var row = await db.Set<MLModelEwmaAccuracy>().SingleAsync();
+        Assert.Equal(1, row.TotalPredictions);
+        Assert.Equal(0.525, row.EwmaAccuracy, 3);
+    }
+
+    [Fact]
+    public async Task UpdateEwmaAsync_ProcessesResolvedOutcomesAcrossConfiguredBatches()
+    {
+        await using var fixture = await EwmaFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddHours(-1);
+
+        db.Set<EngineConfig>().Add(Config("MLEwma:PredictionLogBatchSize", "1"));
+
+        var first = await SeedPredictionAsync(db, model, t0, t0.AddMinutes(1), true);
+        var second = await SeedPredictionAsync(db, model, t0.AddMinutes(2), t0.AddMinutes(3), false);
+        var third = await SeedPredictionAsync(db, model, t0.AddMinutes(4), t0.AddMinutes(5), true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateWorker().UpdateEwmaAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var row = await db.Set<MLModelEwmaAccuracy>().SingleAsync();
+        Assert.Equal(3, row.TotalPredictions);
+        Assert.Equal(third.Id, row.LastPredictionLogId);
+        Assert.True(row.LastPredictionLogId > first.Id);
+        Assert.True(row.LastPredictionLogId > second.Id);
+    }
+
+    [Fact]
     public void NormalizeHelpers_RejectUnsafeValues()
     {
         Assert.Equal(0.05, MLEwmaAccuracyWorker.NormalizeAlpha(double.NaN));
@@ -232,7 +409,8 @@ public class MLEwmaAccuracyWorkerTest
         MLModel model,
         DateTime predictedAt,
         DateTime resolvedAt,
-        bool correct)
+        bool correct,
+        ModelRole role = ModelRole.Champion)
     {
         var strategy = await db.Set<Strategy>().SingleAsync();
         var signal = new TradeSignal
@@ -255,7 +433,7 @@ public class MLEwmaAccuracyWorkerTest
         {
             TradeSignalId = signal.Id,
             MLModelId = model.Id,
-            ModelRole = ModelRole.Champion,
+            ModelRole = role,
             Symbol = model.Symbol,
             Timeframe = model.Timeframe,
             PredictedDirection = TradeDirection.Buy,
