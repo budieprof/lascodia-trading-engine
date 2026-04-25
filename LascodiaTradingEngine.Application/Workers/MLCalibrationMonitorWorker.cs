@@ -56,6 +56,11 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const string CK_PerRegimeMinSamples = "MLCalibration:PerRegimeMinSamples";
     private const string CK_PerRegimeMaxSnapshots = "MLCalibration:PerRegimeMaxSnapshots";
     private const string CK_WriteLegacyAlias = "MLCalibration:WriteLegacyAlias";
+    private const string CK_TimeDecayHalfLifeDays = "MLCalibration:TimeDecayHalfLifeDays";
+    private const string CK_MinSamplesForTimeDecay = "MLCalibration:MinSamplesForTimeDecay";
+    private const string CK_TrendSmoothingWindow = "MLCalibration:TrendSmoothingWindow";
+    private const string CK_StaleSkipAlertThreshold = "MLCalibration:StaleSkipAlertThreshold";
+    private const string StaleAlertDeduplicationPrefix = "ml-calibration-monitor-stale:";
 
     private const int DefaultPollSeconds = 60 * 60;
     private const int MinPollSeconds = 60;
@@ -118,6 +123,30 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const int DefaultPerRegimeMaxSnapshots = 5_000;
     private const int MinPerRegimeMaxSnapshots = 100;
     private const int MaxPerRegimeMaxSnapshots = 50_000;
+
+    // Time decay defaults to off (auto-disabled below MinSamplesForTimeDecay regardless).
+    // Calibration is less time-sensitive than threshold tuning, so most deployments leave
+    // this at 0; turn on (e.g. 30d half-life) for fast-moving regimes.
+    private const double DefaultTimeDecayHalfLifeDays = 0.0;
+    private const double MinTimeDecayHalfLifeDays = 0.0;
+    private const double MaxTimeDecayHalfLifeDays = 365.0;
+
+    private const int DefaultMinSamplesForTimeDecay = 200;
+    private const int MinMinSamplesForTimeDecay = 0;
+    private const int MaxMinSamplesForTimeDecay = 5_000;
+
+    // Smoothing window: 1 = single-cycle delta (current behavior), 3 = average over last 3
+    // cycles. Higher values dampen transient single-cycle noise at the cost of slower
+    // response to a real shift.
+    private const int DefaultTrendSmoothingWindow = 1;
+    private const int MinTrendSmoothingWindow = 1;
+    private const int MaxTrendSmoothingWindow = 30;
+
+    // Number of consecutive `no_recent_resolved_predictions` skips before the staleness
+    // alert fires. Default 5 ≈ 5 hours at the default 1h cycle.
+    private const int DefaultStaleSkipAlertThreshold = 5;
+    private const int MinStaleSkipAlertThreshold = 1;
+    private const int MaxStaleSkipAlertThreshold = 1000;
 
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
@@ -620,7 +649,10 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 .ToListAsync(ct);
 
             if (resolvedLogs.Count == 0)
+            {
+                await TrackStaleAndAlertIfNeededAsync(serviceProvider, db, writeContext, model, settings, nowUtc, ct);
                 return ModelEvaluationOutcome.Skipped("no_recent_resolved_predictions");
+            }
 
             var samples = new List<CalibrationSample>(resolvedLogs.Count);
             foreach (var log in resolvedLogs)
@@ -631,6 +663,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
 
             if (samples.Count < settings.MinSamples)
             {
+                await TrackStaleAndAlertIfNeededAsync(serviceProvider, db, writeContext, model, settings, nowUtc, ct);
                 EnqueueAudit(pendingAudits, model, regime: null,
                     outcome: "skipped_data",
                     reason: "insufficient_resolved_samples",
@@ -643,6 +676,9 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 return ModelEvaluationOutcome.Skipped("insufficient_resolved_calibration_history");
             }
 
+            // Reset the consecutive-skip counter: this model has fresh resolved logs.
+            await ResetStaleSkipCounterAsync(db, model.Id, ct);
+
             DateTime newestOutcomeAt = samples.Max(sample => sample.OutcomeAt);
 
             // Cross-restart short-circuit: if no new resolved logs since the last cycle, the
@@ -651,8 +687,15 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             if (lastSeenOutcomeAt.HasValue && newestOutcomeAt <= lastSeenOutcomeAt.Value)
                 return ModelEvaluationOutcome.Skipped("no_new_outcomes");
 
-            var summary = ComputeCalibrationSummary(samples, settings.BootstrapResamples);
-            double? previousEce = await LoadExistingMetricAsync(db, $"MLCalibration:Model:{model.Id}:CurrentEce", ct);
+            var summary = ComputeCalibrationSummary(
+                samples, settings.BootstrapResamples, nowUtc,
+                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay);
+            // Smoothed previous-ECE: average over the last N global audit rows for this model.
+            // With TrendSmoothingWindow = 1 (default) this collapses to single-cycle behavior;
+            // higher values dampen transient one-cycle spikes that auto-resolve next cycle.
+            double? previousEce = await LoadSmoothedPreviousEceAsync(
+                db, model.Id, regime: null, settings.TrendSmoothingWindow, ct)
+                ?? await LoadExistingMetricAsync(db, $"MLCalibration:Model:{model.Id}:CurrentEce", ct);
             double? baselineEce = TryResolveBaselineEce(model.ModelBytes);
             var signals = BuildSignals(
                 summary.CurrentEce,
@@ -850,15 +893,18 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         {
             if (regimeSamples.Count < settings.PerRegimeMinSamples) continue;
 
-            var regimeSummary = ComputeCalibrationSummary(regimeSamples, settings.BootstrapResamples);
-            // Per-regime signals reuse the global trend/baseline thresholds. We don't carry
-            // a per-regime previous (regimes can come and go between cycles), so the trend
-            // signal is simply the global one repeated for context. The threshold and
-            // baseline signals stand on their own per-regime ECE.
+            var regimeSummary = ComputeCalibrationSummary(
+                regimeSamples, settings.BootstrapResamples, nowUtc,
+                settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay);
+            // Per-regime trend signal reads the prior per-regime ECE from the audit log so
+            // regime drift is detected even when the global trend is flat. Returns null on
+            // first cycle for a given regime, in which case the trend signal stays inert.
+            double? regimePreviousEce = await LoadSmoothedPreviousEceAsync(
+                db, model.Id, regime, settings.TrendSmoothingWindow, ct);
             var regimeSignals = BuildSignals(
                 regimeSummary.CurrentEce,
                 regimeSummary.EceStderr,
-                previousEce: null,
+                previousEce: regimePreviousEce,
                 baselineEce: TryResolveBaselineEce(model.ModelBytes),
                 settings.MaxEce,
                 settings.DegradationDelta,
@@ -956,76 +1002,106 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     }
 
     private static CalibrationSummary ComputeCalibrationSummary(
-        IReadOnlyList<CalibrationSample> samples, int bootstrapResamples)
+        IReadOnlyList<CalibrationSample> samples,
+        int bootstrapResamples,
+        DateTime nowUtc,
+        double timeDecayHalfLifeDays,
+        int minSamplesForTimeDecay)
     {
-        var binCounts = new int[NumBins];
-        var binCorrect = new int[NumBins];
+        // Time decay is auto-disabled below MinSamplesForTimeDecay so the tilt cannot
+        // dominate floating-point noise on small samples.
+        double effectiveHalfLife = samples.Count >= minSamplesForTimeDecay
+            ? timeDecayHalfLifeDays
+            : 0.0;
+
+        var binCounts = new double[NumBins];
+        var binCorrect = new double[NumBins];
         var binConfidenceSum = new double[NumBins];
 
         double correctSum = 0.0;
         double confidenceSum = 0.0;
+        double totalWeight = 0.0;
         DateTime oldestOutcomeAt = DateTime.MaxValue;
         DateTime newestOutcomeAt = DateTime.MinValue;
 
         foreach (var sample in samples)
         {
+            double weight = ComputeTimeDecayWeight(sample.OutcomeAt, nowUtc, effectiveHalfLife);
+            if (!double.IsFinite(weight) || weight <= 0) continue;
+
             int bin = Math.Clamp((int)(sample.Confidence * NumBins), 0, NumBins - 1);
-            binCounts[bin]++;
-            binConfidenceSum[bin] += sample.Confidence;
-            confidenceSum += sample.Confidence;
+            binCounts[bin] += weight;
+            binConfidenceSum[bin] += sample.Confidence * weight;
+            confidenceSum += sample.Confidence * weight;
+            totalWeight += weight;
 
             if (sample.Correct)
             {
-                binCorrect[bin]++;
-                correctSum += 1.0;
+                binCorrect[bin] += weight;
+                correctSum += weight;
             }
 
             if (sample.OutcomeAt < oldestOutcomeAt) oldestOutcomeAt = sample.OutcomeAt;
             if (sample.OutcomeAt > newestOutcomeAt) newestOutcomeAt = sample.OutcomeAt;
         }
 
-        double ece = ComputeEceFromBins(binCounts, binCorrect, binConfidenceSum, samples.Count);
+        double ece = ComputeEceFromBins(binCounts, binCorrect, binConfidenceSum, totalWeight);
 
         var binAccuracy = new double[NumBins];
         var binMeanConfidence = new double[NumBins];
+        var binCountsForAudit = new int[NumBins];
         for (int i = 0; i < NumBins; i++)
         {
-            if (binCounts[i] == 0) continue;
-            binAccuracy[i] = (double)binCorrect[i] / binCounts[i];
+            // Round effective counts for the audit-log integer bin counts; the weighted ECE
+            // calculation above uses the doubles directly.
+            binCountsForAudit[i] = (int)Math.Round(binCounts[i]);
+            if (binCounts[i] <= 0) continue;
+            binAccuracy[i] = binCorrect[i] / binCounts[i];
             binMeanConfidence[i] = binConfidenceSum[i] / binCounts[i];
         }
 
-        double eceStderr = ComputeBootstrapEceStderr(samples, bootstrapResamples);
+        double eceStderr = ComputeBootstrapEceStderr(samples, bootstrapResamples, nowUtc, effectiveHalfLife);
 
         return new CalibrationSummary(
             ResolvedCount: samples.Count,
             CurrentEce: ece,
-            Accuracy: correctSum / samples.Count,
-            MeanConfidence: confidenceSum / samples.Count,
+            Accuracy: totalWeight > 0 ? correctSum / totalWeight : 0,
+            MeanConfidence: totalWeight > 0 ? confidenceSum / totalWeight : 0,
             OldestOutcomeAt: oldestOutcomeAt,
             NewestOutcomeAt: newestOutcomeAt,
-            BinCounts: binCounts,
+            BinCounts: binCountsForAudit,
             BinAccuracy: binAccuracy,
             BinMeanConfidence: binMeanConfidence,
             EceStderr: eceStderr);
     }
 
-    private static double ComputeEceFromBins(
-        int[] binCounts, int[] binCorrect, double[] binConfidenceSum, int total)
+    private static double ComputeTimeDecayWeight(DateTime outcomeAt, DateTime nowUtc, double halfLifeDays)
     {
+        if (halfLifeDays <= 0) return 1.0;
+        double ageDays = Math.Max(0, (nowUtc - outcomeAt).TotalDays);
+        return Math.Pow(0.5, ageDays / halfLifeDays);
+    }
+
+    private static double ComputeEceFromBins(
+        double[] binCounts, double[] binCorrect, double[] binConfidenceSum, double total)
+    {
+        if (total <= 0) return 0.0;
         double ece = 0.0;
         for (int i = 0; i < binCounts.Length; i++)
         {
-            if (binCounts[i] == 0) continue;
-            double accuracy = (double)binCorrect[i] / binCounts[i];
+            if (binCounts[i] <= 0) continue;
+            double accuracy = binCorrect[i] / binCounts[i];
             double meanConfidence = binConfidenceSum[i] / binCounts[i];
-            ece += ((double)binCounts[i] / total) * Math.Abs(accuracy - meanConfidence);
+            ece += (binCounts[i] / total) * Math.Abs(accuracy - meanConfidence);
         }
         return ece;
     }
 
     private static double ComputeBootstrapEceStderr(
-        IReadOnlyList<CalibrationSample> samples, int resamples)
+        IReadOnlyList<CalibrationSample> samples,
+        int resamples,
+        DateTime nowUtc,
+        double effectiveHalfLifeDays)
     {
         if (resamples <= 0 || samples.Count < 2) return 0.0;
 
@@ -1036,8 +1112,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         if (samples.Count > 1) seed ^= samples[^1].OutcomeAt.Ticks;
         var rng = new Random(unchecked((int)seed));
 
-        var binCounts = new int[NumBins];
-        var binCorrect = new int[NumBins];
+        var binCounts = new double[NumBins];
+        var binCorrect = new double[NumBins];
         var binConfidenceSum = new double[NumBins];
 
         double sum = 0.0;
@@ -1049,17 +1125,22 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             Array.Clear(binCounts);
             Array.Clear(binCorrect);
             Array.Clear(binConfidenceSum);
+            double total = 0.0;
 
             for (int i = 0; i < n; i++)
             {
                 var sample = samples[rng.Next(n)];
+                double weight = ComputeTimeDecayWeight(sample.OutcomeAt, nowUtc, effectiveHalfLifeDays);
+                if (!double.IsFinite(weight) || weight <= 0) continue;
+
                 int bin = Math.Clamp((int)(sample.Confidence * NumBins), 0, NumBins - 1);
-                binCounts[bin]++;
-                binConfidenceSum[bin] += sample.Confidence;
-                if (sample.Correct) binCorrect[bin]++;
+                binCounts[bin] += weight;
+                binConfidenceSum[bin] += sample.Confidence * weight;
+                total += weight;
+                if (sample.Correct) binCorrect[bin] += weight;
             }
 
-            double ece = ComputeEceFromBins(binCounts, binCorrect, binConfidenceSum, n);
+            double ece = ComputeEceFromBins(binCounts, binCorrect, binConfidenceSum, total);
             sum += ece;
             sumSq += ece * ece;
         }
@@ -1464,6 +1545,112 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         return true;
     }
 
+    /// <summary>
+    /// Increments the per-model consecutive-skip counter and dispatches a one-time
+    /// <see cref="AlertType.DataQualityIssue"/> alert when the configured threshold is reached.
+    /// Surfaces broken outcome-resolution pipelines that would otherwise leave a model silently
+    /// skipped cycle after cycle. Counter is reset by <see cref="ResetStaleSkipCounterAsync"/>
+    /// the moment fresh resolved logs return.
+    /// </summary>
+    private async Task TrackStaleAndAlertIfNeededAsync(
+        IServiceProvider serviceProvider,
+        DbContext db,
+        IWriteApplicationDbContext writeContext,
+        ActiveModelCandidate model,
+        MLCalibrationMonitorWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string counterKey = $"MLCalibration:Model:{model.Id}:ConsecutiveSkips";
+        int current = (int)(await LoadExistingMetricAsync(db, counterKey, ct) ?? 0);
+        int next = current + 1;
+
+        await EngineConfigUpsert.UpsertAsync(
+            db,
+            counterKey,
+            next.ToString(CultureInfo.InvariantCulture),
+            ConfigDataType.Int,
+            "Consecutive cycles where MLCalibrationMonitorWorker found no fresh resolved logs for this model.",
+            isHotReloadable: false,
+            ct);
+
+        if (next < settings.StaleSkipAlertThreshold) return;
+
+        // Threshold reached: dispatch a single dedup'd alert. The dedup key prevents flooding
+        // while the condition persists; the calibration-monitor's auto-resolve path clears it
+        // once fresh logs return.
+        var dispatcher = ResolveAlertDispatcher(serviceProvider);
+        if (dispatcher is null) return;
+
+        try
+        {
+            string dedupKey = StaleAlertDeduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture);
+            bool exists = await db.Set<Alert>()
+                .AnyAsync(a => a.DeduplicationKey == dedupKey && a.IsActive && !a.IsDeleted, ct);
+            if (exists) return;
+
+            int cooldownSec = await AlertCooldownDefaults.GetCooldownAsync(
+                db, AlertCooldownDefaults.CK_MLMonitoring, AlertCooldownDefaults.Default_MLMonitoring, ct);
+
+            string conditionJson = JsonSerializer.Serialize(new
+            {
+                detector = "MLCalibrationMonitor",
+                modelId = model.Id,
+                symbol = model.Symbol,
+                timeframe = model.Timeframe.ToString(),
+                consecutiveSkips = next,
+                threshold = settings.StaleSkipAlertThreshold,
+                detectedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture)
+            });
+
+            var alert = new Alert
+            {
+                AlertType = AlertType.DataQualityIssue,
+                Severity = AlertSeverity.High,
+                DeduplicationKey = dedupKey,
+                CooldownSeconds = cooldownSec,
+                ConditionJson = Truncate(conditionJson, AlertConditionMaxLength),
+                Symbol = model.Symbol,
+                IsActive = true,
+            };
+
+            db.Set<Alert>().Add(alert);
+            await writeContext.SaveChangesAsync(ct);
+
+            string message = string.Format(
+                CultureInfo.InvariantCulture,
+                "MLCalibrationMonitor: model {0} ({1}/{2}) has been skipped {3} consecutive cycles (no fresh resolved prediction logs). Outcome-resolution pipeline may be stalled.",
+                model.Id, model.Symbol, model.Timeframe, next);
+
+            await dispatcher.DispatchAsync(alert, message, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "{Worker}: failed to dispatch staleness alert for model {ModelId}.",
+                WorkerName, model.Id);
+        }
+    }
+
+    /// <summary>
+    /// Resets the consecutive-skip counter and auto-resolves any active staleness alert when
+    /// fresh resolved logs return. Called from the success path of <c>EvaluateModelAsync</c>.
+    /// </summary>
+    private static async Task ResetStaleSkipCounterAsync(DbContext db, long modelId, CancellationToken ct)
+    {
+        string counterKey = $"MLCalibration:Model:{modelId}:ConsecutiveSkips";
+        int current = (int)(await LoadExistingMetricAsync(db, counterKey, ct) ?? 0);
+        if (current <= 0) return;
+
+        await EngineConfigUpsert.UpsertAsync(
+            db,
+            counterKey,
+            "0",
+            ConfigDataType.Int,
+            "Consecutive cycles where MLCalibrationMonitorWorker found no fresh resolved logs for this model.",
+            isHotReloadable: false,
+            ct);
+    }
+
     private async Task<bool> RaiseFleetDegradationAlertAsync(
         int evaluated, int warningCount, int criticalCount, double ratio, DateTime nowUtc, CancellationToken ct)
     {
@@ -1535,6 +1722,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             CK_ModelLockTimeoutSeconds, CK_RegressionGuardK, CK_BootstrapResamples,
             CK_FleetDegradationRatio, CK_PerRegimeMinSamples, CK_PerRegimeMaxSnapshots,
             CK_WriteLegacyAlias,
+            CK_TimeDecayHalfLifeDays, CK_MinSamplesForTimeDecay,
+            CK_TrendSmoothingWindow, CK_StaleSkipAlertThreshold,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -1582,7 +1771,15 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 DefaultPerRegimeMinSamples, MinPerRegimeMinSamples, MaxPerRegimeMinSamples),
             PerRegimeMaxSnapshots: ClampInt(GetInt(values, CK_PerRegimeMaxSnapshots, DefaultPerRegimeMaxSnapshots),
                 DefaultPerRegimeMaxSnapshots, MinPerRegimeMaxSnapshots, MaxPerRegimeMaxSnapshots),
-            WriteLegacyAlias: GetBool(values, CK_WriteLegacyAlias, true));
+            WriteLegacyAlias: GetBool(values, CK_WriteLegacyAlias, true),
+            TimeDecayHalfLifeDays: ClampDoubleAllowingZero(GetDouble(values, CK_TimeDecayHalfLifeDays, DefaultTimeDecayHalfLifeDays),
+                DefaultTimeDecayHalfLifeDays, MinTimeDecayHalfLifeDays, MaxTimeDecayHalfLifeDays),
+            MinSamplesForTimeDecay: ClampIntAllowingZero(GetInt(values, CK_MinSamplesForTimeDecay, DefaultMinSamplesForTimeDecay),
+                DefaultMinSamplesForTimeDecay, MinMinSamplesForTimeDecay, MaxMinSamplesForTimeDecay),
+            TrendSmoothingWindow: ClampInt(GetInt(values, CK_TrendSmoothingWindow, DefaultTrendSmoothingWindow),
+                DefaultTrendSmoothingWindow, MinTrendSmoothingWindow, MaxTrendSmoothingWindow),
+            StaleSkipAlertThreshold: ClampInt(GetInt(values, CK_StaleSkipAlertThreshold, DefaultStaleSkipAlertThreshold),
+                DefaultStaleSkipAlertThreshold, MinStaleSkipAlertThreshold, MaxStaleSkipAlertThreshold));
     }
 
     private static MLCalibrationMonitorAlertState ResolveAlertState(
@@ -1666,6 +1863,44 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             out var parsed)
             ? parsed
             : null;
+    }
+
+    /// <summary>
+    /// Reads the most recent <paramref name="window"/> global (or per-regime) calibration
+    /// audit rows for the given model and returns the mean of their <c>CurrentEce</c>. With
+    /// <paramref name="window"/> = 1 this collapses to the prior cycle's ECE; higher values
+    /// dampen single-cycle noise. Returns <c>null</c> when no rows exist (first cycle for
+    /// that scope), so the caller can fall back to the legacy EngineConfig scalar or treat
+    /// the trend signal as inert.
+    /// </summary>
+    private static async Task<double?> LoadSmoothedPreviousEceAsync(
+        DbContext db,
+        long modelId,
+        MarketRegimeEnum? regime,
+        int window,
+        CancellationToken ct)
+    {
+        if (window <= 0) return null;
+
+        var query = db.Set<MLCalibrationLog>()
+            .AsNoTracking()
+            .Where(log => log.MLModelId == modelId
+                       && !log.IsDeleted
+                       && log.Outcome != "skipped_data"
+                       && log.Outcome != "skipped_lock");
+
+        query = regime is null
+            ? query.Where(log => log.Regime == null)
+            : query.Where(log => log.Regime == regime);
+
+        var rows = await query
+            .OrderByDescending(log => log.EvaluatedAt)
+            .Take(window)
+            .Select(log => log.CurrentEce)
+            .ToListAsync(ct);
+
+        if (rows.Count == 0) return null;
+        return rows.Average();
     }
 
     private static void EnqueueAudit(
@@ -1890,7 +2125,11 @@ internal sealed record MLCalibrationMonitorWorkerSettings(
     double FleetDegradationRatio,
     int PerRegimeMinSamples,
     int PerRegimeMaxSnapshots,
-    bool WriteLegacyAlias);
+    bool WriteLegacyAlias,
+    double TimeDecayHalfLifeDays,
+    int MinSamplesForTimeDecay,
+    int TrendSmoothingWindow,
+    int StaleSkipAlertThreshold);
 
 internal sealed record MLCalibrationMonitorCycleResult(
     MLCalibrationMonitorWorkerSettings Settings,

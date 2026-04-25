@@ -20,7 +20,10 @@ public class MLCausalFeatureAuditConfiguration : IEntityTypeConfiguration<MLCaus
         builder.Property(x => x.FeatureName).IsRequired().HasMaxLength(50);
 
         builder.Property(x => x.GrangerFStat).HasPrecision(10, 4);
-        builder.Property(x => x.GrangerPValue).HasPrecision(10, 8);
+        // GrangerPValue / GrangerQValue map to PostgreSQL double precision so the full
+        // floating-point range (down to ~1e-308) is preserved. The legacy decimal(10,8)
+        // schema underflowed to zero for very strong signals, losing fidelity in the
+        // audit table. EF picks the right column type from the property's CLR type.
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

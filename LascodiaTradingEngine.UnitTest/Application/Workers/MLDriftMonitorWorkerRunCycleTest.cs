@@ -122,6 +122,92 @@ public sealed class MLDriftMonitorWorkerRunCycleTest
         Assert.Empty(await harness.LoadTrainingRunsAsync());
     }
 
+    [Fact]
+    public async Task RunCycleAsync_DisabledViaConfig_ReturnsDisabledSkipReason()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                db.Set<EngineConfig>().Add(new EngineConfig
+                {
+                    Key = "MLDrift:Enabled",
+                    Value = "false",
+                    DataType = ConfigDataType.String,
+                    IsHotReloadable = true,
+                    LastUpdatedAt = now.UtcDateTime,
+                    IsDeleted = false,
+                });
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("disabled", result.SkippedReason);
+        Assert.Equal(0, result.CandidateModelCount);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_InvalidSettingsAreClampedToDefaults()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLDrift:PollIntervalSeconds", "-1");
+                AddConfig(db, "MLTraining:DriftAccuracyThreshold", "999");   // out-of-range
+                AddConfig(db, "MLDrift:MaxBrierScore", "-0.5");              // out-of-range
+                AddConfig(db, "MLDrift:RelativeDegradationRatio", "10");     // out-of-range
+                AddConfig(db, "MLDrift:LockTimeoutSeconds", "-7");
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        // Manually drive LoadSettingsAsync via harness — exercising the clamper.
+        await using var scope = harness.NewScope();
+        var ctx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>().GetDbContext();
+        var settings = await MLDriftMonitorWorker.LoadSettingsAsync(ctx, CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromSeconds(300), settings.PollInterval);
+        Assert.Equal(0.50, settings.AccuracyThreshold, 6);
+        Assert.Equal(0.30, settings.MaxBrierScore, 6);
+        Assert.Equal(0.85, settings.RelativeDegradationRatio, 6);
+        Assert.Equal(5, settings.LockTimeoutSeconds);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_LockBusy_StillReturnsPollInterval()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLDrift:PollIntervalSeconds", "120");
+            },
+            timeProvider: new TestTimeProvider(now),
+            distributedLock: new TestDistributedLock(lockAvailable: false));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("lock_busy", result.SkippedReason);
+        Assert.Equal(TimeSpan.FromSeconds(120), result.PollInterval);
+    }
+
+    private static void AddConfig(MLDriftMonitorWorkerTestContext db, string key, string value)
+    {
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = key,
+            Value = value,
+            DataType = ConfigDataType.String,
+            IsHotReloadable = true,
+            LastUpdatedAt = DateTime.UtcNow,
+            IsDeleted = false,
+        });
+    }
+
     private static WorkerHarness CreateHarness(
         Action<MLDriftMonitorWorkerTestContext> seed,
         TimeProvider? timeProvider = null,
@@ -171,6 +257,8 @@ public sealed class MLDriftMonitorWorkerRunCycleTest
             var db = scope.ServiceProvider.GetRequiredService<MLDriftMonitorWorkerTestContext>();
             return await db.Set<MLTrainingRun>().AsNoTracking().OrderBy(r => r.Id).ToListAsync();
         }
+
+        public AsyncServiceScope NewScope() => provider.CreateAsyncScope();
 
         public void Dispose()
         {

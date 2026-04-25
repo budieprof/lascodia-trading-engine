@@ -7,6 +7,7 @@ using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Drift;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
@@ -986,7 +987,7 @@ public sealed class MLAdwinDriftWorker : BackgroundService
         {
             await db.SaveChangesAsync(ct);
         }
-        catch (DbUpdateException ex) when (IsUniqueViolation(ex))
+        catch (DbUpdateException ex) when (DbExceptions.IsUniqueViolation(ex))
         {
             // Concurrent worker (or another auto-retrain trigger) won the race and inserted
             // its own Queued/Running row through the partial unique index. Treat as a
@@ -1006,21 +1007,6 @@ public sealed class MLAdwinDriftWorker : BackgroundService
         return true;
     }
 
-    private static bool IsUniqueViolation(DbUpdateException ex)
-    {
-        // Postgres SQLSTATE 23505 — unique_violation. Avoid a hard reference to Npgsql by
-        // sniffing the SqlState property reflectively, falling back to a string match.
-        for (Exception? cur = ex; cur is not null; cur = cur.InnerException)
-        {
-            var sqlStateProp = cur.GetType().GetProperty("SqlState");
-            if (sqlStateProp?.GetValue(cur) is string sqlState && sqlState == "23505")
-                return true;
-            if (cur.Message.Contains("unique constraint", StringComparison.OrdinalIgnoreCase) ||
-                cur.Message.Contains("UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
 
     /// <summary>
     /// Single-query batched fetch of the top-N resolved outcomes per model using

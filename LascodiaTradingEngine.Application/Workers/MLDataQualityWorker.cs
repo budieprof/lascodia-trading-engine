@@ -1,436 +1,1239 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Guards the quality of market-data inputs fed to active ML models.
-///
-/// <b>Why this matters:</b> Degraded input data silently corrupts live predictions.
-/// A gap in candle history causes the feature extractor to use stale values;
-/// a price spike inflates volatility features far beyond the training distribution;
-/// a stale <see cref="LivePrice"/> record means all Kelly sizing and confidence
-/// modifiers are working from an outdated mid price.
-///
-/// <b>Checks performed per active (Symbol, Timeframe) pair:</b>
-/// <list type="number">
-///   <item><b>Candle gap</b> — the most recent closed candle was delivered more
-///         than <c>GapMultiplier × expected_bar_seconds</c> ago, meaning at least
-///         one bar is missing from the feed.</item>
-///   <item><b>Price spike</b> — the latest closed candle's close deviates more
-///         than <c>SpikeSigmas</c> standard deviations from the rolling 50-bar
-///         mean, indicating a data-feed error or extreme outlier.</item>
-///   <item><b>Stale live price</b> — <see cref="LivePrice.Timestamp"/> has not
-///         been updated within <c>LivePriceStalenessSeconds</c>.</item>
-/// </list>
-///
-/// Configuration keys (read from <see cref="EngineConfig"/>):
-/// <list type="bullet">
-///   <item><c>MLDataQuality:PollIntervalSeconds</c>        — default 300 (5 min)</item>
-///   <item><c>MLDataQuality:GapMultiplier</c>              — bar-gap multiplier, default 2.5</item>
-///   <item><c>MLDataQuality:SpikeSigmas</c>                — spike detection threshold, default 4.0</item>
-///   <item><c>MLDataQuality:SpikeLookbackBars</c>          — rolling window for spike check, default 50</item>
-///   <item><c>MLDataQuality:LivePriceStalenessSeconds</c>  — live price max age, default 300</item>
-///   <item><c>MLDataQuality:AlertDestination</c>           — default "market-data"</item>
-/// </list>
+/// Guards the market-data inputs used by active ML models.
 /// </summary>
 public sealed class MLDataQualityWorker : BackgroundService
 {
-    private const string CK_PollSecs      = "MLDataQuality:PollIntervalSeconds";
-    private const string CK_GapMult       = "MLDataQuality:GapMultiplier";
-    private const string CK_SpikeSigmas   = "MLDataQuality:SpikeSigmas";
-    private const string CK_SpikeBars     = "MLDataQuality:SpikeLookbackBars";
-    private const string CK_LiveStale     = "MLDataQuality:LivePriceStalenessSeconds";
-    private const string CK_AlertDest     = "MLDataQuality:AlertDestination";
+    private const string WorkerName = nameof(MLDataQualityWorker);
+    private const string DistributedLockKey = "ml:data-quality:cycle";
+    private const string AlertDedupPrefix = "ml-data-quality:";
+    private const string SymbolScope = "symbol";
+    private const int AlertConditionMaxLength = 1_000;
+    private const double StdEpsilon = 1e-12;
 
-    // Expected bar duration in seconds per Timeframe enum value
-    private static readonly Dictionary<Timeframe, int> BarSeconds = new()
-    {
-        { Timeframe.M1,  60     },
-        { Timeframe.M5,  300    },
-        { Timeframe.M15, 900    },
-        { Timeframe.H1,  3600   },
-        { Timeframe.H4,  14400  },
-        { Timeframe.D1,  86400  },
-    };
+    private const string CK_Enabled = "MLDataQuality:Enabled";
+    private const string CK_PollSecs = "MLDataQuality:PollIntervalSeconds";
+    private const string CK_GapMult = "MLDataQuality:GapMultiplier";
+    private const string CK_SpikeSigmas = "MLDataQuality:SpikeSigmas";
+    private const string CK_SpikeBars = "MLDataQuality:SpikeLookbackBars";
+    private const string CK_MinSpikeBaselineBars = "MLDataQuality:MinSpikeBaselineBars";
+    private const string CK_LiveStale = "MLDataQuality:LivePriceStalenessSeconds";
+    private const string CK_FutureTimestampTolerance = "MLDataQuality:FutureTimestampToleranceSeconds";
+    private const string CK_MaxPairs = "MLDataQuality:MaxPairsPerCycle";
+    private const string CK_LockTimeout = "MLDataQuality:LockTimeoutSeconds";
+    private const string CK_AlertCooldown = "MLDataQuality:AlertCooldownSeconds";
+    private const string CK_AlertDest = "MLDataQuality:AlertDestination";
 
-    private readonly IServiceScopeFactory              _scopeFactory;
-    private readonly ILogger<MLDataQualityWorker>      _logger;
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    /// <summary>
-    /// Initializes the worker.
-    /// </summary>
-    /// <param name="scopeFactory">Per-iteration DI scope factory.</param>
-    /// <param name="logger">Structured logger.</param>
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<MLDataQualityWorker> _logger;
+    private readonly MLDataQualityOptions _options;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
+
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
+    private bool _missingAlertDispatcherWarningEmitted;
+
+    /// <summary>Initializes the worker.</summary>
     public MLDataQualityWorker(
-        IServiceScopeFactory          scopeFactory,
-        ILogger<MLDataQualityWorker>  logger)
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLDataQualityWorker> logger,
+        MLDataQualityOptions? options = null,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
         _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _logger = logger;
+        _options = options ?? new MLDataQualityOptions();
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
     /// <summary>
-    /// Background service main loop. Polls every 5 minutes by default — the most
-    /// frequent among the ML workers because data quality issues (candle gaps, price
-    /// spikes, stale live prices) can appear suddenly and silently corrupt live
-    /// predictions within a single bar period if left undetected.
+    /// Main background loop. Data quality runs more frequently than most ML monitors
+    /// because stale candles or live prices can corrupt predictions within one bar.
     /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLDataQualityWorker started.");
+        var initialSettings = BuildSettings(_options);
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Detects missing candles, anomalous closes, and stale live prices for active ML model feeds.",
+            initialSettings.PollInterval);
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            int pollSecs = 300;
+            var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName) + initialSettings.InitialDelay;
+            if (initialDelay > TimeSpan.Zero)
+                await Task.Delay(initialDelay, _timeProvider, stoppingToken);
 
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                await using var scope   = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx     = readDb.GetDbContext();
-                var wCtx    = writeDb.GetDbContext();
+                var started = Stopwatch.GetTimestamp();
+                var delaySettings = BuildSettings(_options);
 
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 300, stoppingToken);
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                    var result = await RunCycleAsync(stoppingToken);
+                    delaySettings = result.Settings;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.IssuesDetected);
+                    _healthMonitor?.RecordCycleSuccess(
+                        WorkerName,
+                        (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
-                await CheckAllPairsAsync(ctx, wCtx, stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "MLDataQualityWorker loop error");
-            }
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _consecutiveFailures = 0;
+                    }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _metrics?.WorkerErrors.Add(1, Tag("worker", WorkerName));
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
 
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
+                await Task.Delay(
+                    CalculateDelay(GetIntervalWithJitter(delaySettings), _consecutiveFailures),
+                    _timeProvider,
+                    stoppingToken);
+            }
         }
-
-        _logger.LogInformation("MLDataQualityWorker stopping.");
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopping.", WorkerName);
+        }
     }
 
-    // ── Check core ────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Resolves the distinct (Symbol, Timeframe) pairs covered by active models,
-    /// then runs all three data quality checks for each pair. A single <c>now</c>
-    /// timestamp is computed once and passed through to avoid clock drift across
-    /// the per-pair checks within one iteration.
-    /// </summary>
-    private async Task CheckAllPairsAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
+    internal async Task<MLDataQualityCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        double gapMult     = await GetConfigAsync<double>(readCtx, CK_GapMult,     2.5,          ct);
-        double spikeSigmas = await GetConfigAsync<double>(readCtx, CK_SpikeSigmas, 4.0,          ct);
-        int    spikeBars   = await GetConfigAsync<int>   (readCtx, CK_SpikeBars,   50,           ct);
-        int    liveStale   = await GetConfigAsync<int>   (readCtx, CK_LiveStale,   300,          ct);
-        string alertDest   = await GetConfigAsync<string>(readCtx, CK_AlertDest,   "market-data", ct);
+        var started = Stopwatch.GetTimestamp();
+        var settings = BuildSettings(_options);
 
-        // Distinct (Symbol, Timeframe) pairs — each pair maps to a different candle feed
-        // and live price stream, so data quality is checked at the pair level.
-        var pairs = await readCtx.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted)
-            .AsNoTracking()
-            .Select(m => new { m.Symbol, m.Timeframe })
-            .Distinct()
-            .ToListAsync(ct);
+        try
+        {
+            if (!settings.Enabled)
+            {
+                RecordCycleSkipped("disabled");
+                return MLDataQualityCycleResult.Skipped(settings, "disabled");
+            }
 
-        // Capture a single "now" for the iteration so all gap/staleness checks
-        // use a consistent reference time rather than accumulating micro-drift.
-        var now = DateTime.UtcNow;
+            IAsyncDisposable? cycleLock = null;
+            if (_distributedLock is null)
+            {
+                _metrics?.MLDataQualityLockAttempts.Add(1, Tag("outcome", "unavailable"));
+                if (!_missingDistributedLockWarningEmitted)
+                {
+                    _logger.LogWarning(
+                        "{Worker} running without IDistributedLock; duplicate alerts are possible in multi-instance deployments.",
+                        WorkerName);
+                    _missingDistributedLockWarningEmitted = true;
+                }
+            }
+            else
+            {
+                cycleLock = await _distributedLock.TryAcquireAsync(
+                    DistributedLockKey,
+                    settings.LockTimeout,
+                    ct);
+
+                if (cycleLock is null)
+                {
+                    _metrics?.MLDataQualityLockAttempts.Add(1, Tag("outcome", "busy"));
+                    RecordCycleSkipped("lock_busy");
+                    return MLDataQualityCycleResult.Skipped(settings, "lock_busy");
+                }
+
+                _metrics?.MLDataQualityLockAttempts.Add(1, Tag("outcome", "acquired"));
+            }
+
+            await using (cycleLock)
+            {
+                await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+                try
+                {
+                    await using var scope = _scopeFactory.CreateAsyncScope();
+                    var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    var db = writeContext.GetDbContext();
+                    var dispatcher = scope.ServiceProvider.GetService<IAlertDispatcher>();
+
+                    if (dispatcher is null && !_missingAlertDispatcherWarningEmitted)
+                    {
+                        _logger.LogWarning(
+                            "{Worker} could not resolve IAlertDispatcher; DataQualityIssue alerts will be persisted but not notified.",
+                            WorkerName);
+                        _missingAlertDispatcherWarningEmitted = true;
+                    }
+
+                    var runtimeSettings = await LoadRuntimeSettingsAsync(db, settings, ct);
+                    if (!runtimeSettings.Enabled)
+                    {
+                        RecordCycleSkipped("disabled");
+                        return MLDataQualityCycleResult.Skipped(runtimeSettings, "disabled");
+                    }
+
+                    return await CheckAllFeedsAsync(writeContext, db, dispatcher, runtimeSettings, ct);
+                }
+                finally
+                {
+                    WorkerBulkhead.MLMonitoring.Release();
+                }
+            }
+        }
+        finally
+        {
+            _metrics?.MLDataQualityCycleDurationMs.Record(
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        }
+    }
+
+    private async Task<MLDataQualityCycleResult> CheckAllFeedsAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        MLDataQualityWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var loadedPairs = await LoadActivePairsAsync(db, settings, ct);
+        var pairs = loadedPairs.Pairs;
+        var pairsSkipped = loadedPairs.InvalidPairsSkipped;
+        var issuesDetected = 0;
+        var alertsDispatched = 0;
+
+        if (loadedPairs.Truncated)
+            RecordPairSkipped("max_pairs_truncated");
+
+        for (var i = 0; i < loadedPairs.InvalidPairsSkipped; i++)
+            RecordPairSkipped("invalid_symbol");
+
+        var activeIssueKeys = new HashSet<string>(StringComparer.Ordinal);
+        var evaluatedPairKeys = new HashSet<string>(StringComparer.Ordinal);
+        var evaluatedSymbols = new HashSet<string>(StringComparer.Ordinal);
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        if (pairs.Count == 0)
+        {
+            var resolved = await ResolveInactiveAlertsAsync(
+                writeContext,
+                db,
+                dispatcher,
+                settings,
+                activeIssueKeys,
+                evaluatedPairKeys,
+                evaluatedSymbols,
+                resolveAll: true,
+                ct);
+
+            RecordCycleSkipped("no_active_pairs");
+            return new MLDataQualityCycleResult(
+                settings,
+                "no_active_pairs",
+                0,
+                pairsSkipped,
+                0,
+                0,
+                resolved,
+                loadedPairs.Truncated);
+        }
 
         foreach (var pair in pairs)
         {
             ct.ThrowIfCancellationRequested();
 
+            PairEvaluation evaluation;
             try
             {
-                await CheckPairAsync(
-                    pair.Symbol, pair.Timeframe,
-                    now, gapMult, spikeSigmas, spikeBars, liveStale, alertDest,
-                    readCtx, writeCtx, ct);
+                evaluation = await EvaluateCandleFeedAsync(db, pair, nowUtc, settings, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex,
-                    "DataQuality: check failed for {Symbol}/{Tf} — skipping.",
-                    pair.Symbol, pair.Timeframe);
+                pairsSkipped++;
+                RecordPairSkipped("pair_error");
+                _logger.LogWarning(
+                    ex,
+                    "{Worker}: candle-feed quality check failed for {Symbol}/{Timeframe}.",
+                    WorkerName,
+                    pair.Symbol,
+                    pair.Timeframe);
+                continue;
+            }
+
+            if (!evaluation.Evaluated)
+            {
+                pairsSkipped++;
+                RecordPairSkipped(evaluation.SkipReason ?? "unknown");
+                continue;
+            }
+
+            evaluatedPairKeys.Add(PairKey(pair.Symbol, pair.Timeframe));
+            evaluatedSymbols.Add(pair.Symbol);
+            _metrics?.MLDataQualityPairsEvaluated.Add(
+                1,
+                Tag("symbol", pair.Symbol),
+                Tag("timeframe", pair.Timeframe));
+
+            foreach (var issue in evaluation.Issues)
+            {
+                issuesDetected++;
+                activeIssueKeys.Add(issue.DeduplicationKey);
+                RecordIssueDetected(issue);
+
+                if (await UpsertAndDispatchAlertAsync(writeContext, db, dispatcher, issue, settings, nowUtc, ct))
+                    alertsDispatched++;
             }
         }
+
+        foreach (var symbol in pairs.Select(pair => pair.Symbol).Distinct(StringComparer.Ordinal))
+        {
+            ct.ThrowIfCancellationRequested();
+            evaluatedSymbols.Add(symbol);
+
+            var liveIssues = await EvaluateLivePriceAsync(db, symbol, nowUtc, settings, ct);
+            foreach (var issue in liveIssues)
+            {
+                issuesDetected++;
+                activeIssueKeys.Add(issue.DeduplicationKey);
+                RecordIssueDetected(issue);
+
+                if (await UpsertAndDispatchAlertAsync(writeContext, db, dispatcher, issue, settings, nowUtc, ct))
+                    alertsDispatched++;
+            }
+        }
+
+        var alertsResolved = await ResolveInactiveAlertsAsync(
+            writeContext,
+            db,
+            dispatcher,
+            settings,
+            activeIssueKeys,
+            evaluatedPairKeys,
+            evaluatedSymbols,
+            resolveAll: false,
+            ct);
+
+        return new MLDataQualityCycleResult(
+            settings,
+            null,
+            evaluatedPairKeys.Count,
+            pairsSkipped,
+            issuesDetected,
+            alertsDispatched,
+            alertsResolved,
+            loadedPairs.Truncated);
     }
 
-    /// <summary>
-    /// Executes all three data quality checks for a single (symbol, timeframe) pair
-    /// and raises <see cref="AlertType.DataQualityIssue"/> alerts when issues are found.
-    /// Each check is independent — all three run regardless of whether an earlier check
-    /// already detected a problem.
-    /// </summary>
-    /// <param name="symbol">Currency pair symbol (e.g. "EURUSD").</param>
-    /// <param name="timeframe">Model timeframe (determines expected bar duration).</param>
-    /// <param name="now">Consistent UTC reference time for the iteration.</param>
-    /// <param name="gapMultiplier">
-    /// Multiplier applied to the expected bar duration to derive the gap threshold.
-    /// E.g. 2.5 on H1 = alert if no candle for 2.5 hours.
-    /// </param>
-    /// <param name="spikeSigmas">Z-score threshold for the price spike check.</param>
-    /// <param name="spikeLookbackBars">
-    /// Number of prior bars used to compute the rolling mean and std for spike detection.
-    /// </param>
-    /// <param name="livePriceStalenessSeconds">Maximum age of a live price record in seconds.</param>
-    /// <param name="alertDest">Webhook destination for data quality alerts.</param>
-    /// <param name="readCtx">Read-only EF DbContext.</param>
-    /// <param name="writeCtx">Write EF DbContext.</param>
-    /// <param name="ct">Cancellation token.</param>
-    private async Task CheckPairAsync(
-        string                                  symbol,
-        Timeframe                               timeframe,
-        DateTime                                now,
-        double                                  gapMultiplier,
-        double                                  spikeSigmas,
-        int                                     spikeLookbackBars,
-        int                                     livePriceStalenessSeconds,
-        string                                  alertDest,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        CancellationToken                       ct)
+    private async Task<LoadActivePairsResult> LoadActivePairsAsync(
+        DbContext db,
+        MLDataQualityWorkerSettings settings,
+        CancellationToken ct)
     {
-        // Determine expected bar duration in seconds for this timeframe.
-        // Unknown timeframes fall back to H1 (3600 seconds).
-        int barSecs = BarSeconds.TryGetValue(timeframe, out int s) ? s : 3600;
-
-        // ── Check 1: Candle gap ───────────────────────────────────────────────
-        // Detects missing bars in the candle feed. The gap threshold is a multiple
-        // of the expected bar duration:
-        //   gapThreshold = gapMultiplier × barSecs
-        // E.g. gapMultiplier=2.5, barSecs=3600 → alert if no H1 candle for 9000s (2.5h).
-        // This tolerates minor delays (DST transitions, brief feed interruptions) while
-        // catching genuine data outages.
-        var latestCandle = await readCtx.Set<Candle>()
-            .Where(c => c.Symbol    == symbol    &&
-                        c.Timeframe == timeframe  &&
-                        c.IsClosed               &&
-                        !c.IsDeleted)
-            .OrderByDescending(c => c.Timestamp)
+        var rawPairs = await db.Set<MLModel>()
+            .Where(model => model.IsActive && !model.IsDeleted)
+            .OrderBy(model => model.Symbol)
+            .ThenBy(model => model.Timeframe)
+            .Select(model => new ActivePairProjection(model.Symbol, model.Timeframe))
+            .Take(settings.MaxPairsPerCycle + 1)
             .AsNoTracking()
-            .Select(c => new { c.Timestamp })
-            .FirstOrDefaultAsync(ct);
-
-        if (latestCandle is not null)
-        {
-            double secondsSinceLast = (now - latestCandle.Timestamp).TotalSeconds;
-            double gapThreshold     = gapMultiplier * barSecs;
-
-            _logger.LogDebug(
-                "DataQuality: {Symbol}/{Tf} — lastCandle={Ts} secsSince={S:F0} gapThr={G:F0}",
-                symbol, timeframe, latestCandle.Timestamp, secondsSinceLast, gapThreshold);
-
-            if (secondsSinceLast > gapThreshold)
-            {
-                // Logged at Debug for the same reason stale-live-price was downgraded —
-                // MLFeatureDataFreshnessWorker and PriceCacheFreshnessCheck already surface
-                // the underlying data-feed-stale condition to operators. The per-symbol-per-
-                // timeframe Warning from this worker was producing ~100/30min of redundant
-                // output during EA outages. The DB alert row below still fires so downstream
-                // alerting is unchanged.
-                _logger.LogDebug(
-                    "DataQuality: {Symbol}/{Tf} — CANDLE GAP: {S:F0}s since last bar (threshold {G:F0}s).",
-                    symbol, timeframe, secondsSinceLast, gapThreshold);
-
-                await TryAddAlertAsync(writeCtx, readCtx, symbol, alertDest,
-                    System.Text.Json.JsonSerializer.Serialize(new
-                    {
-                        reason              = "data_quality_gap",
-                        severity            = "warning",
-                        symbol,
-                        timeframe           = timeframe.ToString(),
-                        secondsSinceLastBar = secondsSinceLast,
-                        gapThresholdSeconds = gapThreshold,
-                        lastCandleTimestamp = latestCandle.Timestamp,
-                    }), ct);
-            }
-        }
-
-        // ── Check 2: Price spike ──────────────────────────────────────────────
-        // Detects data-feed errors or extreme outliers in the latest candle close price.
-        // Algorithm:
-        //   1. Load the spikeLookbackBars + 1 most recent closed candles.
-        //   2. The most recent candle (index 0) is the candidate; the prior N form the baseline.
-        //   3. Compute rolling mean and std over the baseline closes.
-        //   4. Z-score = |latestClose − mean| / std
-        //   5. Alert if Z-score > spikeSigmas (default 4.0 — a 4-sigma event).
-        //
-        // A 4-sigma threshold ensures common volatility events don't trigger false positives
-        // while catching genuine data errors (e.g. a broker feed returning a price 10× off).
-        var recentCandles = await readCtx.Set<Candle>()
-            .Where(c => c.Symbol    == symbol    &&
-                        c.Timeframe == timeframe  &&
-                        c.IsClosed               &&
-                        !c.IsDeleted)
-            .OrderByDescending(c => c.Timestamp)
-            .Take(spikeLookbackBars + 1)        // +1 so the latest is tested against the prior N
-            .AsNoTracking()
-            .Select(c => new { c.Timestamp, c.Close })
             .ToListAsync(ct);
 
-        if (recentCandles.Count >= 3)
+        var truncated = rawPairs.Count > settings.MaxPairsPerCycle;
+        if (truncated)
+            rawPairs.RemoveAt(rawPairs.Count - 1);
+
+        var pairs = new List<ActiveModelPair>(rawPairs.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var invalidPairsSkipped = 0;
+
+        foreach (var rawPair in rawPairs)
         {
-            // Baseline = all bars except the most recent (index 0)
-            var baseline = recentCandles.Skip(1).Select(c => (double)c.Close).ToList();
-            double mean  = baseline.Average();
-            // Population standard deviation over the baseline window
-            double std   = Math.Sqrt(baseline.Average(v => (v - mean) * (v - mean)));
-
-            if (std > 0)
+            var symbol = NormalizeSymbol(rawPair.Symbol);
+            if (symbol.Length == 0 || symbol.Length > 10)
             {
-                double latestClose = (double)recentCandles[0].Close;
-                // Z-score measures how many standard deviations the latest close is
-                // from the rolling mean — high values indicate anomalous price movement.
-                double zScore      = Math.Abs(latestClose - mean) / std;
+                invalidPairsSkipped++;
+                continue;
+            }
 
-                _logger.LogDebug(
-                    "DataQuality: {Symbol}/{Tf} — close={C} mean={M:F5} std={Sd:F5} z={Z:F2}",
-                    symbol, timeframe, latestClose, mean, std, zScore);
+            var key = PairKey(symbol, rawPair.Timeframe);
+            if (seen.Add(key))
+                pairs.Add(new ActiveModelPair(symbol, rawPair.Timeframe));
+        }
 
-                if (zScore > spikeSigmas)
+        return new LoadActivePairsResult(pairs, invalidPairsSkipped, truncated);
+    }
+
+    private async Task<PairEvaluation> EvaluateCandleFeedAsync(
+        DbContext db,
+        ActiveModelPair pair,
+        DateTime nowUtc,
+        MLDataQualityWorkerSettings settings,
+        CancellationToken ct)
+    {
+        if (!TryGetBarDuration(pair.Timeframe, out var barDuration))
+            return PairEvaluation.Skipped("unsupported_timeframe");
+
+        var candles = await db.Set<Candle>()
+            .Where(candle => candle.Symbol == pair.Symbol
+                          && candle.Timeframe == pair.Timeframe
+                          && candle.IsClosed
+                          && !candle.IsDeleted)
+            .OrderByDescending(candle => candle.Timestamp)
+            .Take(settings.SpikeLookbackBars + 1)
+            .AsNoTracking()
+            .Select(candle => new CandleSample(
+                candle.Timestamp,
+                candle.Open,
+                candle.High,
+                candle.Low,
+                candle.Close))
+            .ToListAsync(ct);
+
+        var issues = new List<DataQualityIssue>();
+        if (candles.Count == 0)
+        {
+            issues.Add(CreateIssue(
+                "data_quality_missing_candles",
+                pair.Symbol,
+                pair.Timeframe,
+                AlertSeverity.High,
+                "No closed candles exist for an active ML model feed.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>
+                {
+                    ["expectedBarSeconds"] = barDuration.TotalSeconds
+                }));
+
+            return PairEvaluation.Completed(issues);
+        }
+
+        var latest = candles[0];
+        var futureSkew = latest.Timestamp - nowUtc;
+        if (futureSkew > settings.FutureTimestampTolerance)
+        {
+            issues.Add(CreateIssue(
+                "data_quality_future_candle",
+                pair.Symbol,
+                pair.Timeframe,
+                AlertSeverity.High,
+                "Latest closed candle timestamp is in the future.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>
+                {
+                    ["candleTimestamp"] = latest.Timestamp,
+                    ["futureSkewSeconds"] = futureSkew.TotalSeconds,
+                    ["toleranceSeconds"] = settings.FutureTimestampTolerance.TotalSeconds
+                }));
+        }
+        else
+        {
+            var candleAgeSeconds = Math.Max(0, (nowUtc - latest.Timestamp).TotalSeconds);
+            var gapThresholdSeconds = settings.GapMultiplier * barDuration.TotalSeconds;
+            _metrics?.MLDataQualityGapAgeSeconds.Record(
+                candleAgeSeconds,
+                Tag("symbol", pair.Symbol),
+                Tag("timeframe", pair.Timeframe));
+
+            if (candleAgeSeconds > gapThresholdSeconds)
+            {
+                issues.Add(CreateIssue(
+                    "data_quality_gap",
+                    pair.Symbol,
+                    pair.Timeframe,
+                    AlertSeverity.Medium,
+                    "Latest closed candle is older than the configured gap threshold.",
+                    settings,
+                    nowUtc,
+                    new Dictionary<string, object?>
+                    {
+                        ["secondsSinceLastBar"] = candleAgeSeconds,
+                        ["gapThresholdSeconds"] = gapThresholdSeconds,
+                        ["expectedBarSeconds"] = barDuration.TotalSeconds,
+                        ["lastCandleTimestamp"] = latest.Timestamp
+                    }));
+            }
+        }
+
+        if (!IsValidCandlePrice(latest))
+        {
+            issues.Add(CreateIssue(
+                "data_quality_invalid_candle",
+                pair.Symbol,
+                pair.Timeframe,
+                AlertSeverity.High,
+                "Latest closed candle contains invalid OHLC prices.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>
+                {
+                    ["candleTimestamp"] = latest.Timestamp,
+                    ["open"] = latest.Open,
+                    ["high"] = latest.High,
+                    ["low"] = latest.Low,
+                    ["close"] = latest.Close
+                }));
+
+            return PairEvaluation.Completed(issues);
+        }
+
+        AddSpikeIssueIfNeeded(candles, pair, nowUtc, settings, issues);
+        return PairEvaluation.Completed(issues);
+    }
+
+    private void AddSpikeIssueIfNeeded(
+        IReadOnlyList<CandleSample> candles,
+        ActiveModelPair pair,
+        DateTime nowUtc,
+        MLDataQualityWorkerSettings settings,
+        List<DataQualityIssue> issues)
+    {
+        if (candles.Count < settings.MinSpikeBaselineBars + 1)
+            return;
+
+        var baseline = candles
+            .Skip(1)
+            .Where(IsValidCandlePrice)
+            .Select(candle => (double)candle.Close)
+            .Take(settings.SpikeLookbackBars)
+            .ToList();
+
+        if (baseline.Count < settings.MinSpikeBaselineBars)
+            return;
+
+        var latestClose = (double)candles[0].Close;
+        var mean = baseline.Average();
+        var variance = baseline.Average(value => (value - mean) * (value - mean));
+        var stdDev = Math.Sqrt(variance);
+
+        if (stdDev <= StdEpsilon)
+            return;
+
+        var zScore = Math.Abs(latestClose - mean) / stdDev;
+        _metrics?.MLDataQualitySpikeZScore.Record(
+            zScore,
+            Tag("symbol", pair.Symbol),
+            Tag("timeframe", pair.Timeframe));
+
+        if (zScore < settings.SpikeSigmas)
+            return;
+
+        issues.Add(CreateIssue(
+            "data_quality_spike",
+            pair.Symbol,
+            pair.Timeframe,
+            AlertSeverity.High,
+            "Latest closed candle close is an anomalous rolling z-score outlier.",
+            settings,
+            nowUtc,
+            new Dictionary<string, object?>
+            {
+                ["latestClose"] = latestClose,
+                ["rollingMean"] = mean,
+                ["rollingStdDev"] = stdDev,
+                ["zScore"] = zScore,
+                ["spikeThreshold"] = settings.SpikeSigmas,
+                ["baselineBars"] = baseline.Count,
+                ["candleTimestamp"] = candles[0].Timestamp
+            }));
+    }
+
+    private async Task<IReadOnlyList<DataQualityIssue>> EvaluateLivePriceAsync(
+        DbContext db,
+        string symbol,
+        DateTime nowUtc,
+        MLDataQualityWorkerSettings settings,
+        CancellationToken ct)
+    {
+        var livePrice = await db.Set<LivePrice>()
+            .Where(price => price.Symbol == symbol)
+            .OrderByDescending(price => price.Timestamp)
+            .AsNoTracking()
+            .Select(price => new LivePriceSample(price.Timestamp, price.Bid, price.Ask))
+            .FirstOrDefaultAsync(ct);
+
+        var issues = new List<DataQualityIssue>();
+        if (livePrice is null)
+        {
+            issues.Add(CreateIssue(
+                "live_price_missing",
+                symbol,
+                timeframe: null,
+                AlertSeverity.High,
+                "No persisted live price snapshot exists for an active ML model symbol.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>()));
+            return issues;
+        }
+
+        if (livePrice.Bid <= 0 || livePrice.Ask <= 0 || livePrice.Ask < livePrice.Bid)
+        {
+            issues.Add(CreateIssue(
+                "live_price_invalid",
+                symbol,
+                timeframe: null,
+                AlertSeverity.High,
+                "Persisted live price contains invalid bid/ask values.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>
+                {
+                    ["bid"] = livePrice.Bid,
+                    ["ask"] = livePrice.Ask,
+                    ["livePriceTimestamp"] = livePrice.Timestamp
+                }));
+        }
+
+        var futureSkew = livePrice.Timestamp - nowUtc;
+        if (futureSkew > settings.FutureTimestampTolerance)
+        {
+            issues.Add(CreateIssue(
+                "live_price_future_timestamp",
+                symbol,
+                timeframe: null,
+                AlertSeverity.High,
+                "Persisted live price timestamp is in the future.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>
+                {
+                    ["livePriceTimestamp"] = livePrice.Timestamp,
+                    ["futureSkewSeconds"] = futureSkew.TotalSeconds,
+                    ["toleranceSeconds"] = settings.FutureTimestampTolerance.TotalSeconds
+                }));
+
+            return issues;
+        }
+
+        var ageSeconds = Math.Max(0, (nowUtc - livePrice.Timestamp).TotalSeconds);
+        _metrics?.MLDataQualityLivePriceAgeSeconds.Record(ageSeconds, Tag("symbol", symbol));
+
+        if (ageSeconds > settings.LivePriceStaleness.TotalSeconds)
+        {
+            issues.Add(CreateIssue(
+                "live_price_stale",
+                symbol,
+                timeframe: null,
+                AlertSeverity.Medium,
+                "Persisted live price snapshot is older than the configured staleness threshold.",
+                settings,
+                nowUtc,
+                new Dictionary<string, object?>
+                {
+                    ["livePriceTimestamp"] = livePrice.Timestamp,
+                    ["ageSeconds"] = ageSeconds,
+                    ["stalenessThresholdSeconds"] = settings.LivePriceStaleness.TotalSeconds
+                }));
+        }
+
+        return issues;
+    }
+
+    private async Task<bool> UpsertAndDispatchAlertAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        DataQualityIssue issue,
+        MLDataQualityWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(existing => existing.AlertType == AlertType.DataQualityIssue
+                                          && existing.IsActive
+                                          && !existing.IsDeleted
+                                          && existing.DeduplicationKey == issue.DeduplicationKey,
+                ct);
+
+        var created = alert is null;
+        if (created)
+        {
+            alert = new Alert
+            {
+                AlertType = AlertType.DataQualityIssue,
+                DeduplicationKey = issue.DeduplicationKey
+            };
+            db.Set<Alert>().Add(alert);
+        }
+
+        var previousTriggeredAt = alert!.LastTriggeredAt;
+        ApplyIssueToAlert(alert, issue, settings);
+
+        try
+        {
+            await writeContext.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (created)
+        {
+            db.Entry(alert).State = EntityState.Detached;
+            var existing = await db.Set<Alert>()
+                .FirstOrDefaultAsync(a => a.AlertType == AlertType.DataQualityIssue
+                                       && a.IsActive
+                                       && !a.IsDeleted
+                                       && a.DeduplicationKey == issue.DeduplicationKey,
+                    ct);
+
+            if (existing is null)
+                throw;
+
+            ApplyIssueToAlert(existing, issue, settings);
+            await writeContext.SaveChangesAsync(ct);
+            _logger.LogDebug(
+                ex,
+                "{Worker}: recovered duplicate alert insert race for {DeduplicationKey}.",
+                WorkerName,
+                issue.DeduplicationKey);
+            return false;
+        }
+
+        if (IsWithinCooldown(previousTriggeredAt, nowUtc, settings.AlertCooldown))
+            return false;
+
+        if (dispatcher is null)
+            return false;
+
+        var lastTriggeredBeforeDispatch = alert.LastTriggeredAt;
+        try
+        {
+            await dispatcher.DispatchAsync(alert, issue.Message, ct);
+            await writeContext.SaveChangesAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to dispatch alert {DeduplicationKey}.",
+                WorkerName,
+                issue.DeduplicationKey);
+            return false;
+        }
+
+        var dispatched = alert.LastTriggeredAt.HasValue
+                         && alert.LastTriggeredAt != lastTriggeredBeforeDispatch;
+        if (dispatched)
+        {
+            _metrics?.MLDataQualityAlertsDispatched.Add(
+                1,
+                Tag("reason", issue.Reason),
+                Tag("symbol", issue.Symbol),
+                Tag("timeframe", issue.Timeframe?.ToString() ?? SymbolScope));
+        }
+
+        return dispatched;
+    }
+
+    private async Task<int> ResolveInactiveAlertsAsync(
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        IAlertDispatcher? dispatcher,
+        MLDataQualityWorkerSettings settings,
+        IReadOnlySet<string> activeIssueKeys,
+        IReadOnlySet<string> evaluatedPairKeys,
+        IReadOnlySet<string> evaluatedSymbols,
+        bool resolveAll,
+        CancellationToken ct)
+    {
+        var alerts = await db.Set<Alert>()
+            .Where(alert => alert.AlertType == AlertType.DataQualityIssue
+                         && alert.IsActive
+                         && !alert.IsDeleted
+                         && alert.DeduplicationKey != null
+                         && alert.DeduplicationKey.StartsWith(AlertDedupPrefix))
+            .ToListAsync(ct);
+
+        var staleAlerts = alerts
+            .Where(alert => !activeIssueKeys.Contains(alert.DeduplicationKey!)
+                         && IsWithinEvaluationScope(
+                             alert.DeduplicationKey!,
+                             evaluatedPairKeys,
+                             evaluatedSymbols,
+                             resolveAll))
+            .ToList();
+
+        if (staleAlerts.Count == 0)
+            return 0;
+
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        foreach (var alert in staleAlerts)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            alert.IsActive = false;
+            alert.CooldownSeconds = (int)settings.AlertCooldown.TotalSeconds;
+
+            if (dispatcher is not null)
+            {
+                try
+                {
+                    await dispatcher.TryAutoResolveAsync(alert, conditionStillActive: false, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
                 {
                     _logger.LogWarning(
-                        "DataQuality: {Symbol}/{Tf} — PRICE SPIKE: z={Z:F2} (threshold {T:F1}). close={C}",
-                        symbol, timeframe, zScore, spikeSigmas, latestClose);
-
-                    await TryAddAlertAsync(writeCtx, readCtx, symbol, alertDest,
-                        System.Text.Json.JsonSerializer.Serialize(new
-                        {
-                            reason          = "data_quality_spike",
-                            severity        = "warning",
-                            symbol,
-                            timeframe       = timeframe.ToString(),
-                            latestClose,
-                            rollingMean     = mean,
-                            rollingStdDev   = std,
-                            zScore,
-                            spikeThreshold  = spikeSigmas,
-                            candleTimestamp = recentCandles[0].Timestamp,
-                        }), ct);
+                        ex,
+                        "{Worker}: failed to dispatch data-quality resolution for {DeduplicationKey}.",
+                        WorkerName,
+                        alert.DeduplicationKey);
                 }
             }
+
+            alert.AutoResolvedAt ??= nowUtc;
         }
 
-        // ── Check 3: Stale live price ─────────────────────────────────────────
-        // Detects when the live price stream has stopped updating. The live price is
-        // used by MLSignalScorer for Kelly sizing and spread computation. A stale price
-        // means the scorer is working from outdated market data, potentially sizing
-        // positions incorrectly or failing spread filters.
-        //
-        // The staleness threshold (default 300s = 5 min) is intentionally equal to the
-        // worker poll interval so that a stale live price is caught on the next cycle.
-        var livePrice = await readCtx.Set<LivePrice>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(p => p.Symbol == symbol, ct);
+        await writeContext.SaveChangesAsync(ct);
+        _metrics?.MLDataQualityAlertsResolved.Add(staleAlerts.Count);
+        return staleAlerts.Count;
+    }
 
-        if (livePrice is not null)
+    private async Task<MLDataQualityWorkerSettings> LoadRuntimeSettingsAsync(
+        DbContext db,
+        MLDataQualityWorkerSettings defaults,
+        CancellationToken ct)
+    {
+        var keys = new[]
         {
-            double livePriceAge = (now - livePrice.Timestamp).TotalSeconds;
+            CK_Enabled,
+            CK_PollSecs,
+            CK_GapMult,
+            CK_SpikeSigmas,
+            CK_SpikeBars,
+            CK_MinSpikeBaselineBars,
+            CK_LiveStale,
+            CK_FutureTimestampTolerance,
+            CK_MaxPairs,
+            CK_LockTimeout,
+            CK_AlertCooldown,
+            CK_AlertDest,
+        };
 
-            _logger.LogDebug(
-                "DataQuality: {Symbol} — livePrice.Timestamp={Ts} ageSecs={A:F0}",
-                symbol, livePrice.Timestamp, livePriceAge);
+        var config = await db.Set<EngineConfig>()
+            .Where(entry => keys.Contains(entry.Key) && !entry.IsDeleted)
+            .AsNoTracking()
+            .ToDictionaryAsync(entry => entry.Key, entry => entry.Value, ct);
 
-            if (livePriceAge > livePriceStalenessSeconds)
+        var spikeLookbackBars = GetInt(config, CK_SpikeBars, defaults.SpikeLookbackBars, 3, 10_000);
+        var minSpikeBaselineBars = Math.Min(
+            GetInt(config, CK_MinSpikeBaselineBars, defaults.MinSpikeBaselineBars, 3, 10_000),
+            spikeLookbackBars);
+
+        return defaults with
+        {
+            Enabled = GetBool(config, CK_Enabled, defaults.Enabled),
+            PollInterval = TimeSpan.FromSeconds(GetInt(config, CK_PollSecs, (int)defaults.PollInterval.TotalSeconds, 30, 86_400)),
+            GapMultiplier = GetDouble(config, CK_GapMult, defaults.GapMultiplier, 1.0, 100.0),
+            SpikeSigmas = GetDouble(config, CK_SpikeSigmas, defaults.SpikeSigmas, 1.0, 20.0),
+            SpikeLookbackBars = spikeLookbackBars,
+            MinSpikeBaselineBars = minSpikeBaselineBars,
+            LivePriceStaleness = TimeSpan.FromSeconds(GetInt(config, CK_LiveStale, (int)defaults.LivePriceStaleness.TotalSeconds, 1, 86_400)),
+            FutureTimestampTolerance = TimeSpan.FromSeconds(GetInt(config, CK_FutureTimestampTolerance, (int)defaults.FutureTimestampTolerance.TotalSeconds, 0, 3_600)),
+            MaxPairsPerCycle = GetInt(config, CK_MaxPairs, defaults.MaxPairsPerCycle, 1, 10_000),
+            LockTimeout = TimeSpan.FromSeconds(GetInt(config, CK_LockTimeout, (int)defaults.LockTimeout.TotalSeconds, 0, 300)),
+            AlertCooldown = TimeSpan.FromSeconds(GetInt(config, CK_AlertCooldown, (int)defaults.AlertCooldown.TotalSeconds, 0, 86_400)),
+            AlertDestination = GetString(config, CK_AlertDest, defaults.AlertDestination, 100),
+        };
+    }
+
+    private static MLDataQualityWorkerSettings BuildSettings(MLDataQualityOptions options)
+    {
+        var spikeLookbackBars = Clamp(options.SpikeLookbackBars, 3, 10_000);
+        var minSpikeBaselineBars = Math.Min(
+            Clamp(options.MinSpikeBaselineBars, 3, 10_000),
+            spikeLookbackBars);
+
+        return new MLDataQualityWorkerSettings
+        {
+            Enabled = options.Enabled,
+            InitialDelay = TimeSpan.FromSeconds(Clamp(options.InitialDelaySeconds, 0, 86_400)),
+            PollInterval = TimeSpan.FromSeconds(Clamp(options.PollIntervalSeconds, 30, 86_400)),
+            PollJitter = TimeSpan.FromSeconds(Clamp(options.PollJitterSeconds, 0, 86_400)),
+            GapMultiplier = ClampFinite(options.GapMultiplier, 1.0, 100.0),
+            SpikeSigmas = ClampFinite(options.SpikeSigmas, 1.0, 20.0),
+            SpikeLookbackBars = spikeLookbackBars,
+            MinSpikeBaselineBars = minSpikeBaselineBars,
+            LivePriceStaleness = TimeSpan.FromSeconds(Clamp(options.LivePriceStalenessSeconds, 1, 86_400)),
+            FutureTimestampTolerance = TimeSpan.FromSeconds(Clamp(options.FutureTimestampToleranceSeconds, 0, 3_600)),
+            MaxPairsPerCycle = Clamp(options.MaxPairsPerCycle, 1, 10_000),
+            LockTimeout = TimeSpan.FromSeconds(Clamp(options.LockTimeoutSeconds, 0, 300)),
+            AlertCooldown = TimeSpan.FromSeconds(Clamp(options.AlertCooldownSeconds, 0, 86_400)),
+            AlertDestination = NormalizeDestination(options.AlertDestination),
+        };
+    }
+
+    private static void ApplyIssueToAlert(
+        Alert alert,
+        DataQualityIssue issue,
+        MLDataQualityWorkerSettings settings)
+    {
+        alert.AlertType = AlertType.DataQualityIssue;
+        alert.Symbol = issue.Symbol;
+        alert.ConditionJson = issue.ConditionJson;
+        alert.IsActive = true;
+        alert.Severity = issue.Severity;
+        alert.DeduplicationKey = issue.DeduplicationKey;
+        alert.CooldownSeconds = (int)settings.AlertCooldown.TotalSeconds;
+        alert.AutoResolvedAt = null;
+    }
+
+    private static DataQualityIssue CreateIssue(
+        string reason,
+        string symbol,
+        Timeframe? timeframe,
+        AlertSeverity severity,
+        string summary,
+        MLDataQualityWorkerSettings settings,
+        DateTime nowUtc,
+        IReadOnlyDictionary<string, object?> details)
+    {
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["reason"] = reason,
+            ["worker"] = WorkerName,
+            ["severity"] = severity.ToString(),
+            ["symbol"] = symbol,
+            ["timeframe"] = timeframe?.ToString(),
+            ["destination"] = settings.AlertDestination,
+            ["detectedAt"] = nowUtc
+        };
+
+        foreach (var (key, value) in details)
+            payload[key] = value;
+
+        var conditionJson = JsonSerializer.Serialize(payload, JsonOptions);
+        if (conditionJson.Length > AlertConditionMaxLength)
+        {
+            conditionJson = JsonSerializer.Serialize(new
             {
-                // Logged at Debug because operator-facing visibility already comes from
-                // PriceCacheFreshnessCheck (health endpoint) and InDatabaseLivePriceCache's
-                // simultaneous-staleness CRITICAL alert. Per-symbol duplicate Warnings
-                // here were producing ~8/min of redundant log output during EA outage.
-                // The DB alert row is still written so downstream alerting is unaffected.
-                _logger.LogDebug(
-                    "DataQuality: {Symbol} — STALE LIVE PRICE: {A:F0}s old (threshold {T}s).",
-                    symbol, livePriceAge, livePriceStalenessSeconds);
-
-                await TryAddAlertAsync(writeCtx, readCtx, symbol, alertDest,
-                    System.Text.Json.JsonSerializer.Serialize(new
-                    {
-                        reason                 = "live_price_stale",
-                        severity               = "warning",
-                        symbol,
-                        livePriceTimestamp     = livePrice.Timestamp,
-                        ageSeconds             = livePriceAge,
-                        stalenessThresholdSecs = livePriceStalenessSeconds,
-                    }), ct);
-            }
+                reason,
+                worker = WorkerName,
+                severity = severity.ToString(),
+                symbol,
+                timeframe = timeframe?.ToString(),
+                destination = settings.AlertDestination,
+                detectedAt = nowUtc,
+                truncated = true
+            }, JsonOptions);
         }
+
+        var scope = timeframe.HasValue ? $"{symbol}/{timeframe}" : symbol;
+        return new DataQualityIssue(
+            reason,
+            symbol,
+            timeframe,
+            severity,
+            conditionJson,
+            $"ML data-quality issue '{reason}' for {scope}: {summary}",
+            BuildDedupKey(reason, symbol, timeframe));
     }
 
-    // ── Alert helper ──────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Inserts a <see cref="AlertType.DataQualityIssue"/> alert for the given symbol
-    /// if no active alert of that type already exists (deduplication guard). Uses a
-    /// separate read context for the existence check and the write context for the insert
-    /// so the check and write operate on consistent snapshots within the same DI scope.
-    /// </summary>
-    /// <param name="writeCtx">Write EF DbContext for inserting the alert.</param>
-    /// <param name="readCtx">Read-only EF DbContext for the deduplication check.</param>
-    /// <param name="symbol">Currency pair symbol associated with the data quality issue.</param>
-    /// <param name="alertDest">Webhook destination label.</param>
-    /// <param name="conditionJson">Serialized JSON containing the issue details.</param>
-    /// <param name="ct">Cancellation token.</param>
-    private static async Task TryAddAlertAsync(
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        string                                  symbol,
-        string                                  alertDest,
-        string                                  conditionJson,
-        CancellationToken                       ct)
+    private static bool IsWithinCooldown(DateTime? lastTriggeredAt, DateTime nowUtc, TimeSpan cooldown)
     {
-        // Only insert a new alert if there is no existing active DataQualityIssue alert
-        // for this symbol — prevents accumulating duplicate alerts across polling cycles.
-        bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == symbol                    &&
-                           a.AlertType == AlertType.DataQualityIssue &&
-                           a.IsActive  && !a.IsDeleted, ct);
+        if (!lastTriggeredAt.HasValue || cooldown <= TimeSpan.Zero)
+            return false;
 
-        if (alertExists) return;
-
-        writeCtx.Set<Alert>().Add(new Alert
+        var lastUtc = lastTriggeredAt.Value.Kind switch
         {
-            AlertType     = AlertType.DataQualityIssue,
-            Symbol        = symbol,
-            ConditionJson = conditionJson,
-            IsActive      = true,
-        });
+            DateTimeKind.Local => lastTriggeredAt.Value.ToUniversalTime(),
+            DateTimeKind.Unspecified => DateTime.SpecifyKind(lastTriggeredAt.Value, DateTimeKind.Utc),
+            _ => lastTriggeredAt.Value
+        };
 
-        await writeCtx.SaveChangesAsync(ct);
+        return nowUtc - lastUtc < cooldown;
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
-    /// <paramref name="defaultValue"/> if the key is absent or the stored value
-    /// cannot be converted to <typeparamref name="T"/>.
-    /// </summary>
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    private static bool IsWithinEvaluationScope(
+        string deduplicationKey,
+        IReadOnlySet<string> evaluatedPairKeys,
+        IReadOnlySet<string> evaluatedSymbols,
+        bool resolveAll)
     {
-        var entry = await ctx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+        if (resolveAll)
+            return true;
 
-        if (entry?.Value is null) return defaultValue;
+        if (!deduplicationKey.StartsWith(AlertDedupPrefix, StringComparison.Ordinal))
+            return false;
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        var parts = deduplicationKey[AlertDedupPrefix.Length..].Split(':');
+        if (parts.Length < 3)
+            return false;
+
+        var symbol = parts[^2];
+        var scope = parts[^1];
+        return scope == SymbolScope
+            ? evaluatedSymbols.Contains(symbol)
+            : evaluatedPairKeys.Contains($"{symbol}:{scope}");
     }
+
+    private static bool TryGetBarDuration(Timeframe timeframe, out TimeSpan duration)
+    {
+        duration = timeframe switch
+        {
+            Timeframe.M1 => TimeSpan.FromMinutes(1),
+            Timeframe.M5 => TimeSpan.FromMinutes(5),
+            Timeframe.M15 => TimeSpan.FromMinutes(15),
+            Timeframe.H1 => TimeSpan.FromHours(1),
+            Timeframe.H4 => TimeSpan.FromHours(4),
+            Timeframe.D1 => TimeSpan.FromDays(1),
+            _ => TimeSpan.Zero
+        };
+
+        return duration > TimeSpan.Zero;
+    }
+
+    private static bool IsValidCandlePrice(CandleSample candle)
+        => candle.Open > 0
+           && candle.High > 0
+           && candle.Low > 0
+           && candle.Close > 0
+           && candle.High >= candle.Open
+           && candle.High >= candle.Close
+           && candle.Low <= candle.Open
+           && candle.Low <= candle.Close
+           && candle.High >= candle.Low;
+
+    private static string BuildDedupKey(string reason, string symbol, Timeframe? timeframe)
+        => $"{AlertDedupPrefix}{reason}:{symbol}:{timeframe?.ToString() ?? SymbolScope}";
+
+    private static string PairKey(string symbol, Timeframe timeframe)
+        => $"{symbol}:{timeframe}";
+
+    private static string NormalizeSymbol(string? symbol)
+        => string.IsNullOrWhiteSpace(symbol)
+            ? string.Empty
+            : symbol.Trim().ToUpperInvariant();
+
+    private static string NormalizeDestination(string? destination)
+    {
+        var value = string.IsNullOrWhiteSpace(destination)
+            ? "market-data"
+            : destination.Trim();
+
+        return value.Length > 100 ? value[..100] : value;
+    }
+
+    private static TimeSpan GetIntervalWithJitter(MLDataQualityWorkerSettings settings)
+    {
+        if (settings.PollJitter <= TimeSpan.Zero)
+            return settings.PollInterval;
+
+        var jitterMs = Random.Shared.NextDouble() * settings.PollJitter.TotalMilliseconds;
+        return settings.PollInterval + TimeSpan.FromMilliseconds(jitterMs);
+    }
+
+    private static TimeSpan CalculateDelay(TimeSpan baseDelay, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+            return baseDelay;
+
+        var multiplier = Math.Min(8, 1 << Math.Min(consecutiveFailures, 3));
+        return TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * multiplier);
+    }
+
+    private void RecordPairSkipped(string reason)
+        => _metrics?.MLDataQualityPairsSkipped.Add(1, Tag("reason", reason));
+
+    private void RecordCycleSkipped(string reason)
+        => _metrics?.MLDataQualityCyclesSkipped.Add(1, Tag("reason", reason));
+
+    private void RecordIssueDetected(DataQualityIssue issue)
+        => _metrics?.MLDataQualityIssuesDetected.Add(
+            1,
+            Tag("reason", issue.Reason),
+            Tag("symbol", issue.Symbol),
+            Tag("timeframe", issue.Timeframe?.ToString() ?? SymbolScope));
+
+    private static bool GetBool(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        bool defaultValue)
+    {
+        if (!config.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value))
+            return defaultValue;
+
+        if (bool.TryParse(value, out var parsed))
+            return parsed;
+
+        return value.Trim() switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => defaultValue
+        };
+    }
+
+    private static int GetInt(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        int defaultValue,
+        int min,
+        int max)
+    {
+        if (!config.TryGetValue(key, out var value)
+            || !int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return defaultValue;
+        }
+
+        return Clamp(parsed, min, max);
+    }
+
+    private static double GetDouble(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        double defaultValue,
+        double min,
+        double max)
+    {
+        if (!config.TryGetValue(key, out var value)
+            || !double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return defaultValue;
+        }
+
+        return ClampFinite(parsed, min, max);
+    }
+
+    private static string GetString(
+        IReadOnlyDictionary<string, string> config,
+        string key,
+        string defaultValue,
+        int maxLength)
+    {
+        if (!config.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value))
+            return defaultValue;
+
+        var trimmed = value.Trim();
+        return trimmed.Length > maxLength ? trimmed[..maxLength] : trimmed;
+    }
+
+    private static int Clamp(int value, int min, int max) => Math.Clamp(value, min, max);
+
+    private static double ClampFinite(double value, double min, double max)
+        => double.IsFinite(value) ? Math.Clamp(value, min, max) : min;
+
+    private static KeyValuePair<string, object?> Tag(string key, object? value) => new(key, value);
+
+    private sealed record ActivePairProjection(string Symbol, Timeframe Timeframe);
+
+    private sealed record ActiveModelPair(string Symbol, Timeframe Timeframe);
+
+    private sealed record LoadActivePairsResult(
+        List<ActiveModelPair> Pairs,
+        int InvalidPairsSkipped,
+        bool Truncated);
+
+    private sealed record CandleSample(
+        DateTime Timestamp,
+        decimal Open,
+        decimal High,
+        decimal Low,
+        decimal Close);
+
+    private sealed record LivePriceSample(
+        DateTime Timestamp,
+        decimal Bid,
+        decimal Ask);
+
+    private sealed record PairEvaluation(
+        bool Evaluated,
+        string? SkipReason,
+        IReadOnlyList<DataQualityIssue> Issues)
+    {
+        public static PairEvaluation Completed(IReadOnlyList<DataQualityIssue> issues)
+            => new(true, null, issues);
+
+        public static PairEvaluation Skipped(string reason)
+            => new(false, reason, Array.Empty<DataQualityIssue>());
+    }
+
+    private sealed record DataQualityIssue(
+        string Reason,
+        string Symbol,
+        Timeframe? Timeframe,
+        AlertSeverity Severity,
+        string ConditionJson,
+        string Message,
+        string DeduplicationKey);
+}
+
+internal sealed record MLDataQualityWorkerSettings
+{
+    public bool Enabled { get; init; } = true;
+    public TimeSpan InitialDelay { get; init; } = TimeSpan.FromSeconds(45);
+    public TimeSpan PollInterval { get; init; } = TimeSpan.FromMinutes(5);
+    public TimeSpan PollJitter { get; init; } = TimeSpan.FromSeconds(30);
+    public double GapMultiplier { get; init; } = 2.5;
+    public double SpikeSigmas { get; init; } = 4.0;
+    public int SpikeLookbackBars { get; init; } = 50;
+    public int MinSpikeBaselineBars { get; init; } = 20;
+    public TimeSpan LivePriceStaleness { get; init; } = TimeSpan.FromMinutes(5);
+    public TimeSpan FutureTimestampTolerance { get; init; } = TimeSpan.FromSeconds(60);
+    public int MaxPairsPerCycle { get; init; } = 1_000;
+    public TimeSpan LockTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan AlertCooldown { get; init; } = TimeSpan.FromMinutes(30);
+    public string AlertDestination { get; init; } = "market-data";
+}
+
+internal sealed record MLDataQualityCycleResult(
+    MLDataQualityWorkerSettings Settings,
+    string? SkippedReason,
+    int PairsEvaluated,
+    int PairsSkipped,
+    int IssuesDetected,
+    int AlertsDispatched,
+    int AlertsResolved,
+    bool Truncated)
+{
+    public static MLDataQualityCycleResult Skipped(
+        MLDataQualityWorkerSettings settings,
+        string reason)
+        => new(settings, reason, 0, 0, 0, 0, 0, false);
 }

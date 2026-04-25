@@ -148,6 +148,45 @@ public sealed class TradingMetrics
     public Counter<long>     MLDriftMonitorLockAttempts { get; }
     public Counter<long>     MLDriftMonitorCyclesSkipped { get; }
     public Histogram<double> MLDriftMonitorCycleDurationMs { get; }
+    public Histogram<double> MLDriftMonitorTimeSinceLastSuccessSec { get; }
+    public Counter<long>     MLDriftMonitorDriftsDetected { get; }
+    public Counter<long>     MLDriftMonitorRetrainCooldownSkipped { get; }
+    public Counter<long>     MLDriftMonitorAlertsDispatched { get; }
+    public Counter<long>     MLDriftMonitorModelsEvaluated { get; }
+    public Counter<long>     MLDriftMonitorModelsSkipped { get; }
+    public Counter<long>     MLCovariateShiftModelsEvaluated { get; }
+    public Counter<long>     MLCovariateShiftModelsSkipped { get; }
+    public Counter<long>     MLCovariateShiftDetections { get; }
+    public Counter<long>     MLCovariateShiftRetrainingQueued { get; }
+    public Counter<long>     MLCovariateShiftRetrainingSkipped { get; }
+    public Counter<long>     MLCovariateShiftLockAttempts { get; }
+    public Counter<long>     MLCovariateShiftCyclesSkipped { get; }
+    public Histogram<double> MLCovariateShiftWeightedPsi { get; }
+    public Histogram<double> MLCovariateShiftMaxPsi { get; }
+    public Histogram<double> MLCovariateShiftMultivariateScore { get; }
+    public Histogram<double> MLCovariateShiftCycleDurationMs { get; }
+    public Counter<long>     MLDataQualityPairsEvaluated { get; }
+    public Counter<long>     MLDataQualityPairsSkipped { get; }
+    public Counter<long>     MLDataQualityIssuesDetected { get; }
+    public Counter<long>     MLDataQualityAlertsDispatched { get; }
+    public Counter<long>     MLDataQualityAlertsResolved { get; }
+    public Counter<long>     MLDataQualityLockAttempts { get; }
+    public Counter<long>     MLDataQualityCyclesSkipped { get; }
+    public Histogram<double> MLDataQualityGapAgeSeconds { get; }
+    public Histogram<double> MLDataQualitySpikeZScore { get; }
+    public Histogram<double> MLDataQualityLivePriceAgeSeconds { get; }
+    public Histogram<double> MLDataQualityCycleDurationMs { get; }
+    public Counter<long>     MLDeadLetterRunsScanned { get; }
+    public Counter<long>     MLDeadLetterRunsRequeued { get; }
+    public Counter<long>     MLDeadLetterRunsSkipped { get; }
+    public Counter<long>     MLDeadLetterRetryCapsReached { get; }
+    public Counter<long>     MLDeadLetterAlertsDispatched { get; }
+    public Counter<long>     MLDeadLetterAlertsResolved { get; }
+    public Counter<long>     MLDeadLetterRetryCountersReset { get; }
+    public Counter<long>     MLDeadLetterLockAttempts { get; }
+    public Counter<long>     MLDeadLetterCyclesSkipped { get; }
+    public Histogram<double> MLDeadLetterCandidateAgeDays { get; }
+    public Histogram<double> MLDeadLetterCycleDurationMs { get; }
     public Counter<long>     MLAdaptiveThresholdModelsEvaluated { get; }
     public Counter<long>     MLAdaptiveThresholdModelsUpdated { get; }
     public Counter<long>     MLAdaptiveThresholdModelsSkipped { get; }
@@ -642,6 +681,45 @@ public sealed class TradingMetrics
         MLDriftMonitorLockAttempts = _meter.CreateCounter<long>("trading.ml.drift_monitor.lock_attempts", "cycles", "Distributed-lock attempts by MLDriftMonitorWorker.");
         MLDriftMonitorCyclesSkipped = _meter.CreateCounter<long>("trading.ml.drift_monitor.cycles_skipped", "cycles", "MLDriftMonitorWorker cycles skipped, tagged by reason.");
         MLDriftMonitorCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.drift_monitor.cycle_duration_ms", "ms", "MLDriftMonitorWorker cycle duration.");
+        MLDriftMonitorTimeSinceLastSuccessSec = _meter.CreateHistogram<double>("trading.ml.drift_monitor.time_since_last_success_seconds", "s", "Seconds since last successful MLDriftMonitorWorker cycle.");
+        MLDriftMonitorDriftsDetected = _meter.CreateCounter<long>("trading.ml.drift_monitor.drifts_detected", "drifts", "Drift detections by MLDriftMonitorWorker, tagged by trigger=AccuracyDrift|CalibrationDrift|DisagreementDrift|RelativeDegradation|SharpeDrift|MultiSignal.");
+        MLDriftMonitorRetrainCooldownSkipped = _meter.CreateCounter<long>("trading.ml.drift_monitor.retrain_cooldown_skipped", "decisions", "Retrain attempts suppressed by the cooldown window in MLDriftMonitorWorker.");
+        MLDriftMonitorAlertsDispatched = _meter.CreateCounter<long>("trading.ml.drift_monitor.alerts_dispatched", "alerts", "Drift-monitor alerts dispatched via IAlertDispatcher (post-dedupe).");
+        MLDriftMonitorModelsEvaluated = _meter.CreateCounter<long>("trading.ml.drift_monitor.models_evaluated", "models", "Active ML models evaluated by MLDriftMonitorWorker each cycle.");
+        MLDriftMonitorModelsSkipped = _meter.CreateCounter<long>("trading.ml.drift_monitor.models_skipped", "models", "Models skipped by MLDriftMonitorWorker, tagged by reason.");
+        MLCovariateShiftModelsEvaluated = _meter.CreateCounter<long>("trading.ml.covariate_shift.models_evaluated", "models", "Active ML models evaluated by MLCovariateShiftWorker.");
+        MLCovariateShiftModelsSkipped = _meter.CreateCounter<long>("trading.ml.covariate_shift.models_skipped", "models", "ML models skipped by MLCovariateShiftWorker, tagged by reason.");
+        MLCovariateShiftDetections = _meter.CreateCounter<long>("trading.ml.covariate_shift.detections", "drifts", "Covariate shift detections by MLCovariateShiftWorker.");
+        MLCovariateShiftRetrainingQueued = _meter.CreateCounter<long>("trading.ml.covariate_shift.retraining_queued", "runs", "Retraining runs queued by MLCovariateShiftWorker.");
+        MLCovariateShiftRetrainingSkipped = _meter.CreateCounter<long>("trading.ml.covariate_shift.retraining_skipped", "decisions", "Covariate-shift retraining decisions suppressed, tagged by reason.");
+        MLCovariateShiftLockAttempts = _meter.CreateCounter<long>("trading.ml.covariate_shift.lock_attempts", "cycles", "Distributed-lock attempts by MLCovariateShiftWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLCovariateShiftCyclesSkipped = _meter.CreateCounter<long>("trading.ml.covariate_shift.cycles_skipped", "cycles", "MLCovariateShiftWorker cycles skipped without processing, tagged by reason.");
+        MLCovariateShiftWeightedPsi = _meter.CreateHistogram<double>("trading.ml.covariate_shift.weighted_psi", "psi", "Importance-weighted PSI per evaluated model.");
+        MLCovariateShiftMaxPsi = _meter.CreateHistogram<double>("trading.ml.covariate_shift.max_psi", "psi", "Maximum single-feature PSI per evaluated model.");
+        MLCovariateShiftMultivariateScore = _meter.CreateHistogram<double>("trading.ml.covariate_shift.multivariate_score", "score", "Mean squared z-score per evaluated model.");
+        MLCovariateShiftCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.covariate_shift.cycle_duration_ms", "ms", "MLCovariateShiftWorker cycle duration.");
+        MLDataQualityPairsEvaluated = _meter.CreateCounter<long>("trading.ml.data_quality.pairs_evaluated", "pairs", "Active symbol/timeframe feeds evaluated by MLDataQualityWorker.");
+        MLDataQualityPairsSkipped = _meter.CreateCounter<long>("trading.ml.data_quality.pairs_skipped", "pairs", "Active symbol/timeframe feeds skipped by MLDataQualityWorker, tagged by reason.");
+        MLDataQualityIssuesDetected = _meter.CreateCounter<long>("trading.ml.data_quality.issues_detected", "issues", "Data-quality issues detected by MLDataQualityWorker, tagged by reason.");
+        MLDataQualityAlertsDispatched = _meter.CreateCounter<long>("trading.ml.data_quality.alerts_dispatched", "alerts", "Data-quality alerts dispatched by MLDataQualityWorker after cooldown checks.");
+        MLDataQualityAlertsResolved = _meter.CreateCounter<long>("trading.ml.data_quality.alerts_resolved", "alerts", "Worker-owned data-quality alerts auto-resolved after the condition cleared.");
+        MLDataQualityLockAttempts = _meter.CreateCounter<long>("trading.ml.data_quality.lock_attempts", "cycles", "Distributed-lock attempts by MLDataQualityWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLDataQualityCyclesSkipped = _meter.CreateCounter<long>("trading.ml.data_quality.cycles_skipped", "cycles", "MLDataQualityWorker cycles skipped without processing, tagged by reason.");
+        MLDataQualityGapAgeSeconds = _meter.CreateHistogram<double>("trading.ml.data_quality.gap_age_seconds", "s", "Age of the latest closed candle per evaluated active feed.");
+        MLDataQualitySpikeZScore = _meter.CreateHistogram<double>("trading.ml.data_quality.spike_z_score", "z", "Latest-close rolling z-score per evaluated active feed.");
+        MLDataQualityLivePriceAgeSeconds = _meter.CreateHistogram<double>("trading.ml.data_quality.live_price_age_seconds", "s", "Age of the latest persisted live price snapshot per active symbol.");
+        MLDataQualityCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.data_quality.cycle_duration_ms", "ms", "MLDataQualityWorker cycle duration.");
+        MLDeadLetterRunsScanned = _meter.CreateCounter<long>("trading.ml.dead_letter.runs_scanned", "runs", "Eligible failed MLTrainingRun rows scanned by MLDeadLetterWorker.");
+        MLDeadLetterRunsRequeued = _meter.CreateCounter<long>("trading.ml.dead_letter.runs_requeued", "runs", "Dead-lettered MLTrainingRun rows safely reset to Queued.");
+        MLDeadLetterRunsSkipped = _meter.CreateCounter<long>("trading.ml.dead_letter.runs_skipped", "runs", "Eligible failed MLTrainingRun rows skipped by MLDeadLetterWorker, tagged by reason.");
+        MLDeadLetterRetryCapsReached = _meter.CreateCounter<long>("trading.ml.dead_letter.retry_caps_reached", "runs", "Dead-letter candidates whose configured recovery retry cap has been reached.");
+        MLDeadLetterAlertsDispatched = _meter.CreateCounter<long>("trading.ml.dead_letter.alerts_dispatched", "alerts", "Retry-cap alerts dispatched by MLDeadLetterWorker after cooldown checks.");
+        MLDeadLetterAlertsResolved = _meter.CreateCounter<long>("trading.ml.dead_letter.alerts_resolved", "alerts", "Retry-cap alerts auto-resolved after successful retraining.");
+        MLDeadLetterRetryCountersReset = _meter.CreateCounter<long>("trading.ml.dead_letter.retry_counters_reset", "counters", "Per-pair dead-letter retry counters reset after successful retraining.");
+        MLDeadLetterLockAttempts = _meter.CreateCounter<long>("trading.ml.dead_letter.lock_attempts", "cycles", "Distributed-lock attempts by MLDeadLetterWorker, tagged by outcome=acquired|busy|unavailable.");
+        MLDeadLetterCyclesSkipped = _meter.CreateCounter<long>("trading.ml.dead_letter.cycles_skipped", "cycles", "MLDeadLetterWorker cycles skipped without processing, tagged by reason.");
+        MLDeadLetterCandidateAgeDays = _meter.CreateHistogram<double>("trading.ml.dead_letter.candidate_age_days", "d", "Age in days of eligible failed training runs scanned by MLDeadLetterWorker.");
+        MLDeadLetterCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.dead_letter.cycle_duration_ms", "ms", "MLDeadLetterWorker cycle duration.");
         MLAdwinCycleDurationMs = _meter.CreateHistogram<double>("trading.ml.adwin.cycle_duration_ms", "ms", "MLAdwinDriftWorker cycle duration.");
         MLAdaptiveThresholdModelsEvaluated = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_evaluated", "models", "ML models evaluated by MLAdaptiveThresholdWorker.");
         MLAdaptiveThresholdModelsUpdated = _meter.CreateCounter<long>("trading.ml.adaptive_threshold.models_updated", "models", "ML models whose adaptive-threshold snapshot was updated.");

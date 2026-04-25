@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -45,6 +46,36 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// when a model's causal-feature ratio drops by more than <c>RegressionThreshold</c> from the
 /// previous cycle (typically a regime shift or a feature schema break). Both alert paths are
 /// gated by <c>MaxAlertsPerCycle</c>.
+///
+/// <para><b>Winsorization semantics:</b> when <c>WinsorizePercentile</c> &gt; 0, the worker
+/// clips both the realised-return series and each feature series at the
+/// <c>[p, 1-p]</c> empirical quantiles before the F-test. The resulting q-values are
+/// statements about Granger causality on the <em>winsorized</em> series, not the raw series —
+/// i.e. "does this feature predict the bulk of the return distribution after the most
+/// extreme tails are damped." The mean-edge contract used by the trainer is unchanged
+/// because the trainer never sees the winsorized values; this is purely a robustness knob
+/// for the audit, opt-in via config.</para>
+///
+/// <para><b>Operator playbook — when to flip which knob:</b></para>
+/// <list type="bullet">
+///   <item><c>FdrProcedure</c>: keep <see cref="FdrProcedure.BenjaminiHochberg"/> for the
+///         typical case (features roughly independent or with positive regression
+///         dependence). Switch to <see cref="FdrProcedure.BenjaminiYekutieli"/> when the
+///         feature set is known to have heavy collinearity or shared regression bases
+///         (e.g. macro V3 features built off the same underlying series), accepting
+///         ~<c>Σ(1/i)</c>-times less power in exchange for FDR control under arbitrary
+///         dependence.</item>
+///   <item><c>InformationCriterion</c>: <see cref="InformationCriterion.Aic"/> at small
+///         samples (n &lt; ~150). <see cref="InformationCriterion.Bic"/> when n is large
+///         and residuals are heavy-tailed (favours smaller lags, more conservative).
+///         <see cref="InformationCriterion.Hqic"/> is a middle ground often preferred
+///         for time-series lag selection on financial data.</item>
+///   <item><c>WinsorizePercentile</c>: keep at <c>0.0</c> (off) by default. Bump to
+///         <c>0.01</c>–<c>0.05</c> when the realised-return series is contaminated by
+///         gap fills, weekend re-pricing, or whale losses that visibly dominate
+///         regressions. Higher percentiles (e.g. <c>0.10</c>) are appropriate only for
+///         low-quality data streams — they materially change the test's interpretation.</item>
+/// </list>
 /// </remarks>
 public sealed class MLCausalFeatureWorker : BackgroundService
 {
@@ -65,6 +96,9 @@ public sealed class MLCausalFeatureWorker : BackgroundService
     private const string CK_PValueThreshold = "MLCausal:PValueThreshold";
     private const string CK_LockTimeoutSeconds = "MLCausal:LockTimeoutSeconds";
     private const string CK_FdrAlpha = "MLCausal:FdrAlpha";
+    private const string CK_FdrProcedure = "MLCausal:FdrProcedure";
+    private const string CK_InformationCriterion = "MLCausal:InformationCriterion";
+    private const string CK_WinsorizePercentile = "MLCausal:WinsorizePercentile";
     private const string CK_ConsecutiveSkipAlertThreshold = "MLCausal:ConsecutiveSkipAlertThreshold";
     private const string CK_RegressionThreshold = "MLCausal:RegressionThreshold";
     private const string CK_MinPriorCausalForRegression = "MLCausal:MinPriorCausalForRegression";
@@ -121,6 +155,14 @@ public sealed class MLCausalFeatureWorker : BackgroundService
     private const int DefaultMaxAlertsPerCycle = 10;
     private const int MinMaxAlertsPerCycle = 0;
     private const int MaxMaxAlertsPerCycle = 1000;
+
+    private const FdrProcedure DefaultFdrProcedure = FdrProcedure.BenjaminiHochberg;
+
+    private const InformationCriterion DefaultInformationCriterion = InformationCriterion.Aic;
+
+    private const double DefaultWinsorizePercentile = 0.0;
+    private const double MinWinsorizePercentile = 0.0;
+    private const double MaxWinsorizePercentile = 0.20;
 
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
@@ -773,8 +815,12 @@ public sealed class MLCausalFeatureWorker : BackgroundService
             return await HandleSkipAsync(
                 serviceProvider, writeContext, db, model, settings, cycleCtx, "insufficient_realised_returns", nowUtc, ct);
 
+        // Winsorize the dependent series first so the y-tails can't dominate the F-test.
+        // When WinsorizePercentile is 0, the call is a no-op.
+        Winsorize(realisedReturns, settings.WinsorizePercentile);
+
         // Compute per-feature F-stat and raw p-value; defer the IsCausal decision until
-        // after Benjamini-Hochberg correction across the full feature set.
+        // after multiple-comparison correction across the full feature set.
         var perFeature = new (double FStat, double PValue, int Lag)[auditedFeatureCount];
         for (int featureIndex = 0; featureIndex < auditedFeatureCount; featureIndex++)
         {
@@ -783,14 +829,16 @@ public sealed class MLCausalFeatureWorker : BackgroundService
             double[] featureSeries = new double[parsed.Observations.Count];
             for (int row = 0; row < parsed.Observations.Count; row++)
                 featureSeries[row] = parsed.Observations[row].Features[featureIndex];
+            Winsorize(featureSeries, settings.WinsorizePercentile);
 
-            int bestLag = SelectLagByAic(realisedReturns, featureSeries, settings.MaxLag);
+            int bestLag = SelectLagByInformationCriterion(
+                realisedReturns, featureSeries, settings.MaxLag, settings.InformationCriterion);
             var (fStat, pValue) = GrangerFTest(realisedReturns, featureSeries, bestLag);
             perFeature[featureIndex] = (fStat, pValue, bestLag);
         }
 
-        bool[] isCausal = ApplyBenjaminiHochberg(
-            perFeature.Select(x => x.PValue).ToArray(), settings.FdrAlpha);
+        var (isCausal, qValues) = ApplyFdrCorrection(
+            perFeature.Select(x => x.PValue).ToArray(), settings.FdrAlpha, settings.FdrProcedure);
 
         // Existing audits keyed by (MLModelId, FeatureIndex). Tracked because we'll mutate
         // them in place.
@@ -807,6 +855,7 @@ public sealed class MLCausalFeatureWorker : BackgroundService
         {
             var (fStat, pValue, bestLag) = perFeature[featureIndex];
             bool causal = isCausal[featureIndex];
+            double qValue = qValues[featureIndex];
             if (causal) causalCount++;
 
             if (existingByIndex.TryGetValue(featureIndex, out var existing))
@@ -816,7 +865,8 @@ public sealed class MLCausalFeatureWorker : BackgroundService
 
                 existing.FeatureName = featureNames[featureIndex];
                 existing.GrangerFStat = (decimal)fStat;
-                existing.GrangerPValue = (decimal)pValue;
+                existing.GrangerPValue = pValue;
+                existing.GrangerQValue = qValue;
                 existing.LagOrder = bestLag;
                 existing.IsCausal = causal;
                 existing.ComputedAt = nowUtc;
@@ -833,7 +883,8 @@ public sealed class MLCausalFeatureWorker : BackgroundService
                     FeatureIndex = featureIndex,
                     FeatureName = featureNames[featureIndex],
                     GrangerFStat = (decimal)fStat,
-                    GrangerPValue = (decimal)pValue,
+                    GrangerPValue = pValue,
+                    GrangerQValue = qValue,
                     LagOrder = bestLag,
                     IsCausal = causal,
                     IsMaskedForTraining = false,
@@ -1316,36 +1367,61 @@ public sealed class MLCausalFeatureWorker : BackgroundService
 
     /// <summary>
     /// Benjamini-Hochberg step-up procedure controlling the false-discovery rate at
-    /// <paramref name="alpha"/>. Returns a parallel array marking which p-values are
-    /// significant after correction. With <c>m</c> features and target FDR <c>alpha</c>,
-    /// the largest k such that <c>p_(k) ≤ k·alpha/m</c> (sorted ascending) determines the
-    /// rejection threshold; all p-values ≤ <c>p_(k)</c> are flagged significant.
+    /// <paramref name="alpha"/>. Equivalent to <see cref="ApplyFdrCorrection"/> with
+    /// <see cref="FdrProcedure.BenjaminiHochberg"/>; retained for backwards-compatibility
+    /// of unit tests.
     /// </summary>
     internal static bool[] ApplyBenjaminiHochberg(double[] pValues, double alpha)
+        => ApplyFdrCorrection(pValues, alpha, FdrProcedure.BenjaminiHochberg).IsCausal;
+
+    /// <summary>
+    /// FDR-controlling step-up procedure. Returns both per-feature rejection flags and
+    /// adjusted q-values (monotone min-from-the-right of <c>m·c·p_(j)/j</c> on the sorted
+    /// p-values, then unsorted back to input order). The constant <c>c</c> is 1 for
+    /// Benjamini-Hochberg (independence / PRDS) and <c>Σ_{i=1}^m 1/i</c> for
+    /// Benjamini-Yekutieli (arbitrary dependence). A feature is rejected iff its q-value
+    /// is at most <paramref name="alpha"/>.
+    /// </summary>
+    internal static (bool[] IsCausal, double[] QValues) ApplyFdrCorrection(
+        double[] pValues, double alpha, FdrProcedure procedure)
     {
         int m = pValues.Length;
-        var result = new bool[m];
-        if (m == 0) return result;
+        var isCausal = new bool[m];
+        var qValues = new double[m];
+        if (m == 0) return (isCausal, qValues);
+
+        // BY scale factor c(m) = 1 + 1/2 + ... + 1/m. BH uses c=1.
+        double scale = 1.0;
+        if (procedure == FdrProcedure.BenjaminiYekutieli)
+        {
+            double harmonic = 0.0;
+            for (int i = 1; i <= m; i++) harmonic += 1.0 / i;
+            scale = harmonic;
+        }
 
         var indexed = new (int Index, double PValue)[m];
         for (int i = 0; i < m; i++)
             indexed[i] = (i, double.IsFinite(pValues[i]) ? pValues[i] : 1.0);
-
         Array.Sort(indexed, static (a, b) => a.PValue.CompareTo(b.PValue));
 
-        int largestRejected = -1;
-        for (int rank = 0; rank < m; rank++)
+        // Adjusted q-values via monotone min-from-the-right pass on m·c·p_(j)/j.
+        var sortedQ = new double[m];
+        double runningMin = 1.0;
+        for (int rank = m - 1; rank >= 0; rank--)
         {
-            double threshold = (rank + 1) * alpha / m;
-            if (indexed[rank].PValue <= threshold)
-                largestRejected = rank;
+            double raw = indexed[rank].PValue * m * scale / (rank + 1);
+            if (raw < runningMin) runningMin = raw;
+            sortedQ[rank] = Math.Clamp(runningMin, 0.0, 1.0);
         }
 
-        if (largestRejected < 0) return result;
+        for (int rank = 0; rank < m; rank++)
+        {
+            int originalIndex = indexed[rank].Index;
+            qValues[originalIndex] = sortedQ[rank];
+            isCausal[originalIndex] = sortedQ[rank] <= alpha;
+        }
 
-        for (int rank = 0; rank <= largestRejected; rank++)
-            result[indexed[rank].Index] = true;
-        return result;
+        return (isCausal, qValues);
     }
 
     internal static (double fStat, double pValue) GrangerFTest(double[] y, double[] x, int lag)
@@ -1369,10 +1445,30 @@ public sealed class MLCausalFeatureWorker : BackgroundService
         return (fStat, Math.Clamp(pValue, 0.0, 1.0));
     }
 
+    /// <summary>
+    /// AIC-based lag selection. Equivalent to <see cref="SelectLagByInformationCriterion"/>
+    /// with <see cref="InformationCriterion.Aic"/>; retained for backwards-compatibility
+    /// of unit tests.
+    /// </summary>
     internal static int SelectLagByAic(double[] y, double[] x, int maxLag)
+        => SelectLagByInformationCriterion(y, x, maxLag, InformationCriterion.Aic);
+
+    /// <summary>
+    /// Picks the lag (1..<paramref name="maxLag"/>) that minimises the chosen
+    /// information criterion on the unrestricted regression. AIC is light-handed and
+    /// good with small samples; BIC penalises complexity more (better for heavy-tailed
+    /// residuals); HQIC sits between the two.
+    /// <list type="bullet">
+    ///   <item><c>AIC = n·log(rss/n) + 2·k</c></item>
+    ///   <item><c>BIC = n·log(rss/n) + k·log(n)</c></item>
+    ///   <item><c>HQIC = n·log(rss/n) + 2·k·log(log(n))</c></item>
+    /// </list>
+    /// </summary>
+    internal static int SelectLagByInformationCriterion(
+        double[] y, double[] x, int maxLag, InformationCriterion criterion)
     {
         int bestLag = 1;
-        double bestAic = double.PositiveInfinity;
+        double bestScore = double.PositiveInfinity;
 
         for (int lag = 1; lag <= maxLag; lag++)
         {
@@ -1385,15 +1481,71 @@ public sealed class MLCausalFeatureWorker : BackgroundService
                 continue;
 
             int parameterCount = 1 + (2 * lag);
-            double aic = n * Math.Log(rss / n) + (2.0 * parameterCount);
-            if (aic < bestAic)
+            double score = ScoreInformationCriterion(criterion, n, rss, parameterCount);
+            if (score < bestScore)
             {
-                bestAic = aic;
+                bestScore = score;
                 bestLag = lag;
             }
         }
 
         return bestLag;
+    }
+
+    private static double ScoreInformationCriterion(
+        InformationCriterion criterion, int n, double rss, int parameterCount)
+    {
+        double logLikelihoodTerm = n * Math.Log(rss / n);
+        return criterion switch
+        {
+            InformationCriterion.Bic =>
+                logLikelihoodTerm + parameterCount * Math.Log(n),
+            // log(log(n)) is undefined for n<=1; clamp via Max so HQIC stays finite at the
+            // edge of the supported sample range.
+            InformationCriterion.Hqic =>
+                logLikelihoodTerm + 2.0 * parameterCount * Math.Log(Math.Max(2.0, Math.Log(n))),
+            _ /* AIC */ =>
+                logLikelihoodTerm + 2.0 * parameterCount,
+        };
+    }
+
+    /// <summary>
+    /// In-place winsorization: clips values outside the
+    /// [<paramref name="percentile"/>, 1 − <paramref name="percentile"/>] quantile range
+    /// to the boundary values. A no-op when <paramref name="percentile"/> ≤ 0. Used to
+    /// damp the influence of return-tail outliers (whale losses, gap fills) on the F-test
+    /// without changing the underlying mean-edge contract that the offline trainer
+    /// optimizes against.
+    /// </summary>
+    internal static void Winsorize(double[] series, double percentile)
+    {
+        if (percentile <= 0.0 || series.Length == 0) return;
+        if (percentile >= 0.5) percentile = 0.49;
+
+        // Borrow a sorting buffer from the shared pool. ArrayPool may hand back a
+        // larger array than requested, so the sort and quantile lookup must use only
+        // the first series.Length slots.
+        double[] sorted = ArrayPool<double>.Shared.Rent(series.Length);
+        try
+        {
+            Array.Copy(series, sorted, series.Length);
+            Array.Sort(sorted, 0, series.Length);
+
+            int lowerIndex = (int)Math.Floor(percentile * (series.Length - 1));
+            int upperIndex = (int)Math.Ceiling((1.0 - percentile) * (series.Length - 1));
+            double lower = sorted[lowerIndex];
+            double upper = sorted[upperIndex];
+
+            for (int i = 0; i < series.Length; i++)
+            {
+                if (series[i] < lower) series[i] = lower;
+                else if (series[i] > upper) series[i] = upper;
+            }
+        }
+        finally
+        {
+            ArrayPool<double>.Shared.Return(sorted);
+        }
     }
 
     private static double ComputeRss(double[] y, double[] x, int lag, bool includeX)
@@ -1637,6 +1789,9 @@ public sealed class MLCausalFeatureWorker : BackgroundService
             CK_PValueThreshold,
             CK_LockTimeoutSeconds,
             CK_FdrAlpha,
+            CK_FdrProcedure,
+            CK_InformationCriterion,
+            CK_WinsorizePercentile,
             CK_ConsecutiveSkipAlertThreshold,
             CK_RegressionThreshold,
             CK_MinPriorCausalForRegression,
@@ -1683,6 +1838,11 @@ public sealed class MLCausalFeatureWorker : BackgroundService
             FdrAlpha: ClampDouble(
                 GetDouble(values, CK_FdrAlpha, DefaultFdrAlpha),
                 DefaultFdrAlpha, MinFdrAlpha, MaxFdrAlpha),
+            FdrProcedure: ParseEnum(values, CK_FdrProcedure, DefaultFdrProcedure),
+            InformationCriterion: ParseEnum(values, CK_InformationCriterion, DefaultInformationCriterion),
+            WinsorizePercentile: ClampDoubleAllowingZero(
+                GetDouble(values, CK_WinsorizePercentile, DefaultWinsorizePercentile),
+                DefaultWinsorizePercentile, MinWinsorizePercentile, MaxWinsorizePercentile),
             ConsecutiveSkipAlertThreshold: ClampInt(
                 GetInt(values, CK_ConsecutiveSkipAlertThreshold, DefaultConsecutiveSkipAlertThreshold),
                 DefaultConsecutiveSkipAlertThreshold,
@@ -1807,6 +1967,13 @@ public sealed class MLCausalFeatureWorker : BackgroundService
             : defaultValue;
     }
 
+    private static T ParseEnum<T>(IReadOnlyDictionary<string, string> values, string key, T defaultValue) where T : struct, Enum
+    {
+        if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+        return Enum.TryParse<T>(raw, ignoreCase: true, out var parsed) ? parsed : defaultValue;
+    }
+
     private static int ClampInt(int value, int fallback, int min, int max)
     {
         if (value <= 0)
@@ -1840,6 +2007,44 @@ public sealed class MLCausalFeatureWorker : BackgroundService
     }
 }
 
+internal enum FdrProcedure
+{
+    /// <summary>
+    /// Benjamini-Hochberg step-up. Controls the false-discovery rate at α under
+    /// independence or positive regression dependence (PRDS). Standard practical default.
+    /// </summary>
+    BenjaminiHochberg = 0,
+
+    /// <summary>
+    /// Benjamini-Yekutieli step-up. Controls the false-discovery rate at α under
+    /// arbitrary dependence between test statistics, at the cost of being roughly
+    /// <c>Σ(1/i)</c>-times more conservative than BH (~5× for 73 features).
+    /// </summary>
+    BenjaminiYekutieli = 1,
+}
+
+internal enum InformationCriterion
+{
+    /// <summary>
+    /// Akaike Information Criterion: <c>n·log(rss/n) + 2·k</c>. Light penalty;
+    /// assumes Gaussian residuals. Good with smaller samples.
+    /// </summary>
+    Aic = 0,
+
+    /// <summary>
+    /// Bayesian Information Criterion: <c>n·log(rss/n) + k·log(n)</c>. Stronger
+    /// complexity penalty; consistent (picks the true model in the limit) and tends
+    /// to pick smaller lags than AIC, useful when residuals are heavy-tailed.
+    /// </summary>
+    Bic = 1,
+
+    /// <summary>
+    /// Hannan-Quinn IC: <c>n·log(rss/n) + 2·k·log(log(n))</c>. Penalty between AIC
+    /// and BIC. Often preferred for time-series lag selection on financial data.
+    /// </summary>
+    Hqic = 2,
+}
+
 internal sealed record MLCausalFeatureWorkerSettings(
     bool Enabled,
     TimeSpan PollInterval,
@@ -1851,6 +2056,9 @@ internal sealed record MLCausalFeatureWorkerSettings(
     double PValueThreshold,
     int LockTimeoutSeconds,
     double FdrAlpha,
+    FdrProcedure FdrProcedure,
+    InformationCriterion InformationCriterion,
+    double WinsorizePercentile,
     int ConsecutiveSkipAlertThreshold,
     double RegressionThreshold,
     int MinPriorCausalForRegression,

@@ -69,6 +69,7 @@ public static class WorkerGroupFilter
         typeof(MLAverageWeightInitWorker),
         typeof(MLOnlineLearningWorker),
         typeof(MLPredictionLogPruningWorker),
+        typeof(MLDeadLetterWorker),
         typeof(CpcPretrainerWorker),
     ];
 

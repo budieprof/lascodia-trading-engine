@@ -635,6 +635,30 @@ public sealed class MLCalibrationMonitorWorkerTest
         Assert.Equal("insufficient_resolved_samples", audits[0].Reason);
     }
 
+    [Fact]
+    public async Task RunCycleAsync_ConsecutiveStaleSkips_DispatchStalenessAlert()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:StaleSkipAlertThreshold", "2");
+                SeedActiveModel(db, modelId: 50, symbol: "USDCHF", timeframe: Timeframe.H1, baselineEce: 0.04);
+                // No prediction logs at all — every cycle the model is skipped with
+                // "no_recent_resolved_predictions". After 2 cycles the staleness alert fires.
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var alerts = await harness.LoadAlertsAsync();
+
+        Assert.Contains(alerts, alert =>
+            alert.AlertType == AlertType.DataQualityIssue &&
+            alert.DeduplicationKey == "ml-calibration-monitor-stale:50");
+    }
+
     private static WorkerHarness CreateHarness(
         Action<MLCalibrationMonitorWorkerTestContext> seed,
         TimeProvider? timeProvider = null,

@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260425125717_AddMLCausalFeatureAuditQValue")]
+    partial class AddMLCausalFeatureAuditQValue
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -1830,11 +1833,13 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasPrecision(10, 4)
                         .HasColumnType("numeric(10,4)");
 
-                    b.Property<double>("GrangerPValue")
-                        .HasColumnType("double precision");
+                    b.Property<decimal>("GrangerPValue")
+                        .HasPrecision(10, 8)
+                        .HasColumnType("numeric(10,8)");
 
-                    b.Property<double>("GrangerQValue")
-                        .HasColumnType("double precision");
+                    b.Property<decimal>("GrangerQValue")
+                        .HasPrecision(10, 8)
+                        .HasColumnType("numeric(10,8)");
 
                     b.Property<bool>("IsCausal")
                         .HasColumnType("boolean");

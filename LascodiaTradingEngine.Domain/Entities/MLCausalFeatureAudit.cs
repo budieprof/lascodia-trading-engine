@@ -40,11 +40,23 @@ public class MLCausalFeatureAudit : Entity<long>
     public decimal   GrangerFStat       { get; set; }
 
     /// <summary>
-    /// P-value of the Granger F-test.
-    /// Values &lt; 0.05 indicate the feature Granger-causes the return series.
-    /// Values ≥ 0.05 are candidates for masking.
+    /// P-value of the Granger F-test. Stored as <see cref="double"/> so values that span
+    /// many orders of magnitude (e.g. <c>1e-15</c> for very strong signals up to <c>1.0</c>
+    /// for null) round-trip without underflow. Values &lt; <c>MLCausal:FdrAlpha</c> on the
+    /// post-correction q-value are flagged via <see cref="IsCausal"/>; the raw p-value here
+    /// is the un-corrected per-feature F-test result.
     /// </summary>
-    public decimal   GrangerPValue      { get; set; }
+    public double    GrangerPValue      { get; set; }
+
+    /// <summary>
+    /// Multiple-comparison-corrected q-value (BH-FDR by default; Benjamini-Yekutieli when
+    /// <c>MLCausal:FdrProcedure</c> is set to <c>BenjaminiYekutieli</c>). Comparable across
+    /// features within the same model — a feature with raw <c>GrangerPValue=0.04</c> may have
+    /// <c>GrangerQValue=0.18</c> after correction across many features. <see cref="IsCausal"/>
+    /// reflects the q-value comparison, not the raw p-value. Stored as <see cref="double"/>
+    /// for the same precision reasons as <see cref="GrangerPValue"/>.
+    /// </summary>
+    public double    GrangerQValue      { get; set; }
 
     /// <summary>
     /// Lag order (number of lags) used in the unrestricted VAR model.

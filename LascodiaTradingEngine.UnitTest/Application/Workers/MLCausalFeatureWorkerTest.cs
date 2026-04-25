@@ -42,8 +42,13 @@ public sealed class MLCausalFeatureWorkerTest
         Assert.Equal(0, result.SkippedModelCount);
         Assert.Equal(3, result.AuditsWrittenCount);
         Assert.True(feature0.IsCausal);
-        Assert.True(feature0.GrangerPValue < 0.05m);
+        Assert.True(feature0.GrangerPValue < 0.05);
+        // p and q stored as double-precision floating point; underflow no longer rounds the
+        // strongest signals to zero. Assert non-negativity plus the BH ordering relation on
+        // the non-causal feature where p is substantively non-zero.
+        Assert.True(feature0.GrangerQValue >= 0.0);
         Assert.False(feature2.IsCausal);
+        Assert.True(feature2.GrangerQValue >= feature2.GrangerPValue);
         Assert.Equal("LagSignal", feature0.FeatureName);
     }
 
@@ -69,7 +74,7 @@ public sealed class MLCausalFeatureWorkerTest
                     FeatureIndex = 1,
                     FeatureName = "Noise",
                     GrangerFStat = 0.1m,
-                    GrangerPValue = 0.9m,
+                    GrangerPValue = 0.9,
                     LagOrder = 1,
                     IsCausal = false,
                     IsMaskedForTraining = true,
@@ -170,6 +175,122 @@ public sealed class MLCausalFeatureWorkerTest
         Assert.Equal(0.5, result.Settings.RegressionThreshold, 6);
         Assert.Equal(5, result.Settings.MinPriorCausalForRegression);
         Assert.Equal(10, result.Settings.MaxAlertsPerCycle);
+        Assert.Equal(FdrProcedure.BenjaminiHochberg, result.Settings.FdrProcedure);
+        Assert.Equal(InformationCriterion.Aic, result.Settings.InformationCriterion);
+        Assert.Equal(0.0, result.Settings.WinsorizePercentile, 6);
+    }
+
+    [Fact]
+    public void ApplyFdrCorrection_BenjaminiHochberg_QValuesAreMonotone()
+    {
+        var pValues = new[] { 0.001, 0.005, 0.012, 0.030, 0.040, 0.050, 0.100, 0.200, 0.500, 0.900 };
+        var (isCausal, qValues) = MLCausalFeatureWorker.ApplyFdrCorrection(
+            pValues, alpha: 0.05, FdrProcedure.BenjaminiHochberg);
+
+        // q-values should be non-decreasing in p-value order.
+        var sortedByP = pValues
+            .Select((p, i) => (p, q: qValues[i]))
+            .OrderBy(x => x.p)
+            .ToArray();
+        for (int i = 1; i < sortedByP.Length; i++)
+            Assert.True(sortedByP[i].q >= sortedByP[i - 1].q - 1e-12);
+
+        // Same rejection set as the BH boolean helper.
+        var bhBool = MLCausalFeatureWorker.ApplyBenjaminiHochberg(pValues, alpha: 0.05);
+        Assert.Equal(bhBool, isCausal);
+
+        // q-value for the smallest p (0.001 with m=10) is 0.001 * 10 / 1 = 0.01.
+        int idxMin = Array.IndexOf(pValues, 0.001);
+        Assert.Equal(0.01, qValues[idxMin], 6);
+    }
+
+    [Fact]
+    public void ApplyFdrCorrection_BenjaminiYekutieli_IsStrictlyMoreConservativeThanBH()
+    {
+        var pValues = new[] { 0.001, 0.005, 0.012, 0.030, 0.040, 0.050, 0.100, 0.200, 0.500, 0.900 };
+        var (bhCausal, bhQ) = MLCausalFeatureWorker.ApplyFdrCorrection(
+            pValues, alpha: 0.05, FdrProcedure.BenjaminiHochberg);
+        var (byCausal, byQ) = MLCausalFeatureWorker.ApplyFdrCorrection(
+            pValues, alpha: 0.05, FdrProcedure.BenjaminiYekutieli);
+
+        // BY q-values are scaled up by Σ(1/i) for i=1..10 ≈ 2.929; never smaller than BH.
+        for (int i = 0; i < pValues.Length; i++)
+            Assert.True(byQ[i] >= bhQ[i] - 1e-12);
+
+        // BY rejects at most as many as BH.
+        Assert.True(byCausal.Count(x => x) <= bhCausal.Count(x => x));
+    }
+
+    [Fact]
+    public void ScoreInformationCriterion_DifferentCriteriaAgreeOnOrderingForLightSamples()
+    {
+        // For a fixed (n, rss), AIC < HQIC < BIC at large n because BIC's penalty term
+        // log(n) > 2*log(log(n)) > 2 once n is large enough (n >= ~5 for log(n)>2).
+        int n = 200;
+        double rssSmall = 100.0;
+        double rssLarge = 110.0;
+        int kSmall = 3;
+        int kLarge = 5;
+
+        // We can't call the private scorer directly, but SelectLagByInformationCriterion
+        // exercises it. Build a tiny series where BIC prefers a smaller lag than AIC.
+        var rng = new Random(1234);
+        int len = 200;
+        var y = new double[len];
+        var x = new double[len];
+        for (int i = 0; i < len; i++)
+        {
+            x[i] = rng.NextDouble();
+            // Strong lag-1 dependence + tiny lag-3 noise. AIC may pick lag-3; BIC penalises
+            // the extra parameters and should stick with lag-1.
+            y[i] = i >= 3
+                ? 0.7 * y[i - 1] + 0.5 * x[i - 1] + 0.001 * x[i - 3] + (rng.NextDouble() - 0.5) * 0.1
+                : rng.NextDouble();
+        }
+
+        int aicLag = MLCausalFeatureWorker.SelectLagByInformationCriterion(y, x, maxLag: 5, InformationCriterion.Aic);
+        int bicLag = MLCausalFeatureWorker.SelectLagByInformationCriterion(y, x, maxLag: 5, InformationCriterion.Bic);
+        int hqicLag = MLCausalFeatureWorker.SelectLagByInformationCriterion(y, x, maxLag: 5, InformationCriterion.Hqic);
+
+        // All three should pick a valid lag in [1, 5]. BIC's lag is at most AIC's at large n.
+        Assert.InRange(aicLag, 1, 5);
+        Assert.InRange(bicLag, 1, 5);
+        Assert.InRange(hqicLag, 1, 5);
+        Assert.True(bicLag <= aicLag);
+        Assert.True(hqicLag <= aicLag);
+
+        // Quiet unused warnings on the local constants.
+        Assert.True(rssSmall < rssLarge && kSmall < kLarge && n > 0);
+    }
+
+    [Fact]
+    public void Winsorize_ZeroPercentile_IsNoOp()
+    {
+        var series = new[] { -1000.0, -1.0, 0.0, 1.0, 1000.0 };
+        var snapshot = (double[])series.Clone();
+        MLCausalFeatureWorker.Winsorize(series, percentile: 0.0);
+        Assert.Equal(snapshot, series);
+    }
+
+    [Fact]
+    public void Winsorize_ClipsTailsToQuantileBoundaries()
+    {
+        var series = new double[] { -1000, -1, 0, 1, 1000 };
+        // 20% percentile on length 5 → lower index = floor(0.2 * 4) = 0, upper index = ceil(0.8 * 4) = 4 (no clipping at the actual ends).
+        // Use 25% on length 9 instead to get clear inner clipping.
+        var s9 = new double[] { -100, -2, -1, 0, 0, 0, 1, 2, 100 };
+        MLCausalFeatureWorker.Winsorize(s9, percentile: 0.25);
+
+        // sorted s9: [-100, -2, -1, 0, 0, 0, 1, 2, 100]
+        // lowerIndex = floor(0.25 * 8) = 2 → -1
+        // upperIndex = ceil(0.75 * 8) = 6 → 1
+        // Values < -1 clipped to -1; > 1 clipped to 1.
+        Assert.Equal(-1, s9[0]);
+        Assert.Equal(1, s9[s9.Length - 1]);
+        Assert.DoesNotContain(s9, v => v < -1 || v > 1);
+
+        // Quiet unused warning on series.
+        Assert.NotEmpty(series);
     }
 
     [Fact]

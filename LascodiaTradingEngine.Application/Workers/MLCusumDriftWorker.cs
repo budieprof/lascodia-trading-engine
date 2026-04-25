@@ -4,6 +4,7 @@ using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -543,7 +544,7 @@ public sealed class MLCusumDriftWorker : BackgroundService
                 new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
             return true;
         }
-        catch (DbUpdateException ex) when (IsUniqueViolation(ex))
+        catch (DbUpdateException ex) when (DbExceptions.IsUniqueViolation(ex))
         {
             writeCtx.ChangeTracker.Clear();
             _logger.LogInformation(
@@ -553,18 +554,6 @@ public sealed class MLCusumDriftWorker : BackgroundService
         }
     }
 
-    private static bool IsUniqueViolation(DbUpdateException ex)
-    {
-        for (Exception? cur = ex; cur is not null; cur = cur.InnerException)
-        {
-            var sqlStateProp = cur.GetType().GetProperty("SqlState");
-            if (sqlStateProp?.GetValue(cur) is string sqlState && sqlState == "23505") return true;
-            if (cur.Message.Contains("unique constraint", StringComparison.OrdinalIgnoreCase) ||
-                cur.Message.Contains("UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
 
     private async Task DispatchDriftAlertAsync(
         ActiveModelCandidate model,

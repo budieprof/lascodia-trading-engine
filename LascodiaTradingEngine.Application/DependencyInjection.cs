@@ -117,6 +117,27 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLCorrelatedSignalConflictOptions>>().Value);
 
+        services.RemoveAll<MLCovariateShiftOptions>();
+        services.AddSingleton<IValidateOptions<MLCovariateShiftOptions>, MLCovariateShiftOptionsValidator>();
+        services.AddOptions<MLCovariateShiftOptions>()
+            .Bind(configuration.GetSection(nameof(MLCovariateShiftOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLCovariateShiftOptions>>().Value);
+
+        services.RemoveAll<MLDataQualityOptions>();
+        services.AddSingleton<IValidateOptions<MLDataQualityOptions>, MLDataQualityOptionsValidator>();
+        services.AddOptions<MLDataQualityOptions>()
+            .Bind(configuration.GetSection(nameof(MLDataQualityOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDataQualityOptions>>().Value);
+
+        services.RemoveAll<MLDeadLetterOptions>();
+        services.AddSingleton<IValidateOptions<MLDeadLetterOptions>, MLDeadLetterOptionsValidator>();
+        services.AddOptions<MLDeadLetterOptions>()
+            .Bind(configuration.GetSection(nameof(MLDeadLetterOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLDeadLetterOptions>>().Value);
+
         services.RemoveAll<MLErgodicityOptions>();
         services.AddSingleton<IValidateOptions<MLErgodicityOptions>, MLErgodicityOptionsValidator>();
         services.AddOptions<MLErgodicityOptions>()
