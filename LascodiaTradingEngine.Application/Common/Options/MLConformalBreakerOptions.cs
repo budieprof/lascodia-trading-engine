@@ -85,4 +85,103 @@ public class MLConformalBreakerOptions : ConfigurationOption<MLConformalBreakerO
     /// model-retirement workflow rather than letting the breaker re-trip indefinitely.
     /// </summary>
     public int ChronicTripThreshold { get; set; } = 4;
+
+    /// <summary>
+    /// <see cref="LascodiaTradingEngine.Domain.Entities.Alert.CooldownSeconds"/> applied to
+    /// chronic-trip escalation alerts. Used by the alert dispatcher to suppress duplicate
+    /// notifications while the chronic condition persists. One hour matches the typical
+    /// breaker re-evaluation cadence; deployments with longer poll intervals can raise this
+    /// without affecting other alarms.
+    /// </summary>
+    public int ChronicTripAlertCooldownSeconds { get; set; } = 3600;
+
+    /// <summary>
+    /// Half-life (in days) of the exponential time-decay weight applied to each prediction
+    /// log when computing empirical coverage. <c>0</c> disables time-decay (all in-window
+    /// observations weighted equally). Default 7 days lets recent failures dominate while
+    /// keeping older context for trend detection.
+    /// </summary>
+    public int TimeDecayHalfLifeDays { get; set; } = 7;
+
+    /// <summary>
+    /// Number of bootstrap resamples used to estimate the standard error of empirical
+    /// coverage. Bootstrap is enabled when this is &gt; 0 and disabled when 0. The stderr
+    /// is then used by <see cref="RegressionGuardK"/> for K-sigma trend gating.
+    /// </summary>
+    public int BootstrapResamples { get; set; } = 200;
+
+    /// <summary>
+    /// Multiplier on the bootstrapped coverage stderr. The breaker only trips on the
+    /// sustained-low-coverage path when <c>(empirical - target) &lt; -tolerance - K*stderr</c>.
+    /// Higher K = more conservative (waits for stronger statistical evidence before
+    /// tripping). Set to <c>0</c> to disable stderr gating and revert to plain
+    /// empirical-vs-tolerance comparison.
+    /// </summary>
+    public double RegressionGuardK { get; set; } = 1.0;
+
+    /// <summary>
+    /// Number of distinct models that must be in trip-or-refresh state in a single cycle
+    /// before the worker raises a fleet-wide <c>SystemicMLDegradation</c> alert. Below this
+    /// threshold, individual trip alerts cover the situation; above it, the fleet alert
+    /// signals an upstream issue (broken data feed, calibration pipeline regression, etc.).
+    /// </summary>
+    public int FleetSystemicMinTrippedModels { get; set; } = 5;
+
+    /// <summary>
+    /// Fraction of evaluated models that must be in trip-or-refresh state for the fleet-wide
+    /// <c>SystemicMLDegradation</c> alert to fire. Combined with
+    /// <see cref="FleetSystemicMinTrippedModels"/> via AND.
+    /// </summary>
+    public double FleetSystemicTripRatioThreshold { get; set; } = 0.25;
+
+    /// <summary>
+    /// Hours since the most recent resolved outcome before a model is considered
+    /// "stale" (no fresh predictions reaching the worker). A staleness alert fires once
+    /// past this threshold; the alert auto-resolves when fresh outcomes arrive. Distinct
+    /// from chronic-trip (which is repeated *trips*, not absent data).
+    /// </summary>
+    public int StalenessHours { get; set; } = 48;
+
+    /// <summary>
+    /// When <c>true</c>, the worker reads per-context override keys from <c>EngineConfig</c>
+    /// before evaluating each model and uses them in place of the global defaults. The
+    /// override hierarchy is checked in this order (first hit wins):
+    /// <list type="number">
+    ///   <item><c>MLConformal:Override:Model:{id}:{Knob}</c></item>
+    ///   <item><c>MLConformal:Override:Symbol:{symbol}:Timeframe:{timeframe}:{Knob}</c></item>
+    ///   <item><c>MLConformal:Override:Symbol:{symbol}:{Knob}</c></item>
+    ///   <item><c>MLConformal:Override:Timeframe:{timeframe}:{Knob}</c></item>
+    /// </list>
+    /// Knobs supported: <c>MaxLogs</c>, <c>MinLogs</c>, <c>CoverageTolerance</c>,
+    /// <c>ConsecutiveUncoveredTrigger</c>, <c>RegressionGuardK</c>.
+    /// </summary>
+    public bool OverridesEnabled { get; set; } = true;
+
+    /// <summary>
+    /// When <c>true</c>, the audit log entries (per-model breaker state changes) include
+    /// a verbose diagnostics JSON blob with per-cycle metadata: time-decay weights,
+    /// bootstrap stderr, override-resolved knobs, and overall sample distribution. Useful
+    /// in development; can be disabled in production to reduce row size.
+    /// </summary>
+    public bool VerboseAuditDiagnostics { get; set; } = true;
+
+    /// <summary>
+    /// When <c>true</c>, the worker resolves the active <c>MarketRegime</c> for each
+    /// prediction-log outcome (by joining with the most recent <c>MarketRegimeSnapshot</c>
+    /// before the outcome timestamp) and the evaluator computes per-regime coverage
+    /// breakdowns. Diagnostic-only — does not change trip semantics. The worst-regime
+    /// information is surfaced in trip alert payloads so operators can immediately see
+    /// which regime is driving a coverage failure. Adds one indexed query per cycle
+    /// covering all evaluated (symbol, timeframe) tuples.
+    /// </summary>
+    public bool EnablePerRegimeDecomposition { get; set; } = false;
+
+    /// <summary>
+    /// Maximum degree of parallelism used inside each model batch's in-memory evaluation
+    /// phase. The evaluation phase is purely CPU-bound (Wilson + p-value + bootstrap
+    /// math), so fan-out scales with cores. Set to <c>1</c> for fully sequential
+    /// evaluation. Default <c>0</c> resolves to <c>Environment.ProcessorCount</c> at
+    /// startup. Clamped to <c>[1, 32]</c>.
+    /// </summary>
+    public int EvaluationParallelism { get; set; } = 0;
 }

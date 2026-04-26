@@ -1257,6 +1257,62 @@ public sealed class MLCalibrationMonitorWorkerTest
     }
 
     [Fact]
+    public async Task ResolveMaxEceAsync_ModelTier_WinsOverContextTiers()
+    {
+        // Per-model pin (`Model:{id}:{knob}`) is the most-specific tier and beats any
+        // (Symbol, Timeframe)-derived row regardless of how specific that row is.
+        const long modelId = 7777;
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, $"MLCalibration:Override:Model:{modelId}:MaxEce", "0.005");
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:MaxEce", "0.20"); // most-specific context, but Model tier still wins
+                AddConfig(db, "MLCalibration:Override:*:*:MaxEce", "0.40");
+            });
+
+        await harness.WithDbContextAsync(async db =>
+        {
+            // Pinned model — Model tier wins.
+            double pinned = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None,
+                modelId: modelId);
+            Assert.Equal(0.005, pinned, 6);
+
+            // Different model on the same context → no Model row → falls to context tier.
+            double otherModel = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None,
+                modelId: 9999);
+            Assert.Equal(0.20, otherModel, 6);
+
+            // Without modelId → context tier path only.
+            double noModelId = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None);
+            Assert.Equal(0.20, noModelId, 6);
+        });
+    }
+
+    [Fact]
+    public async Task ResolveMaxEceAsync_ModelTierInvalid_FallsThroughToContextTier()
+    {
+        // Out-of-range Model tier value rejected; resolver walks down to the next tier.
+        const long modelId = 7778;
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, $"MLCalibration:Override:Model:{modelId}:MaxEce", "9.99"); // out of range
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:MaxEce", "0.18");
+            });
+
+        await harness.WithDbContextAsync(async db =>
+        {
+            double v = await MLCalibrationMonitorWorker.ResolveMaxEceAsync(
+                db, "EURUSD", Timeframe.H1, globalDefault: 0.5, ct: CancellationToken.None,
+                modelId: modelId);
+            Assert.Equal(0.18, v, 6);
+        });
+    }
+
+    [Fact]
     public async Task ResolveMaxEceAsync_RegimeTierInvalid_FallsThroughToRegimeAgnostic()
     {
         // Regime-scoped row exists but is out of range. Resolver rejects it, walks down
@@ -1360,12 +1416,12 @@ public sealed class MLCalibrationMonitorWorkerTest
             .Select(entry => entry.Message)
             .ToList();
         Assert.Contains(warnings, msg =>
-            msg.Contains("regime name that doesn't match", StringComparison.OrdinalIgnoreCase) &&
+            msg.Contains("don't match any known regime name or knob", StringComparison.OrdinalIgnoreCase) &&
             msg.Contains("HighVol", StringComparison.OrdinalIgnoreCase));
         // Valid entry should NOT be flagged.
         Assert.DoesNotContain(warnings, msg =>
             msg.Contains("HighVolatility:MaxEce", StringComparison.Ordinal) &&
-            msg.Contains("regime name that doesn't match", StringComparison.OrdinalIgnoreCase));
+            msg.Contains("don't match any known regime name or knob", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1391,7 +1447,414 @@ public sealed class MLCalibrationMonitorWorkerTest
 
         Assert.DoesNotContain(capturingLogger.Entries, entry =>
             entry.Level == LogLevel.Warning &&
-            entry.Message.Contains("regime name that doesn't match", StringComparison.OrdinalIgnoreCase));
+            entry.Message.Contains("don't match any known regime name or knob", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideRegimeTypoAcrossCycles_DedupsLogs()
+    {
+        // Same typo present across 3 cycles: only one Warning should be logged. Then
+        // when the typo is corrected (key removed), the next cycle should emit a
+        // single Information log noting recovery — not silently leave operators
+        // wondering whether the prior Warning is still active.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:Regime:HighVol:MaxEce", "0.05"); // typo
+                SeedActiveModel(db, modelId: 720, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        // Cycle 1 + 2 + 3: same typo present.
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var typoWarnings = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning &&
+                            entry.Message.Contains("don't match any known regime name or knob", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Single(typoWarnings);
+
+        // Operator corrects the typo (removes the bad row, adds a valid one).
+        await harness.WithDbContextAsync(async db =>
+        {
+            var bad = await db.Set<EngineConfig>()
+                .FirstAsync(c => c.Key == "MLCalibration:Override:EURUSD:H1:Regime:HighVol:MaxEce");
+            db.Remove(bad);
+            await db.SaveChangesAsync();
+        });
+
+        // Cycle 4: validator should observe the recovery and log Information once.
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var recoveryInfos = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Information &&
+                            entry.Message.Contains("override key tokens now resolve cleanly", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Single(recoveryInfos);
+
+        // Cycle 5 with the same clean state: no further log entries about regime names.
+        int infosBeforeCycle5 = capturingLogger.Entries
+            .Count(e => e.Message.Contains("regime", StringComparison.OrdinalIgnoreCase));
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        int infosAfterCycle5 = capturingLogger.Entries
+            .Count(e => e.Message.Contains("regime", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(infosBeforeCycle5, infosAfterCycle5);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideRegimeTypoChangesAcrossCycles_RelogsNewState()
+    {
+        // Different typos across cycles ⇒ each new state re-logs (set transition).
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:Regime:HighVol:MaxEce", "0.05");
+                SeedActiveModel(db, modelId: 730, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        // Add a SECOND typo. Set transitions: {HighVol} → {HighVol, Trendng}.
+        await harness.WithDbContextAsync(async db =>
+        {
+            db.Add(new EngineConfig
+            {
+                Key = "MLCalibration:Override:GBPUSD:H4:Regime:Trendng:MaxEce",
+                Value = "0.07",
+                DataType = ConfigDataType.Decimal,
+                IsHotReloadable = true,
+                LastUpdatedAt = DateTime.UtcNow,
+                IsDeleted = false,
+            });
+            await db.SaveChangesAsync();
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var typoWarnings = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning &&
+                            entry.Message.Contains("don't match any known regime name or knob", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        // Two distinct unmatched-set states ⇒ two warning logs.
+        Assert.Equal(2, typoWarnings.Count);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideKnobTypo_LogsWarning()
+    {
+        // A typo in the knob segment (MaxEcce instead of MaxEce) lands on no override
+        // tier, so the row would otherwise be a no-op silent footgun. The validator
+        // should flag it as a [knob] issue.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:Override:EURUSD:H1:MaxEcce", "0.05"); // typo
+                AddConfig(db, "MLCalibration:Override:GBPUSD:H4:DegradationDelta", "0.03"); // valid
+                SeedActiveModel(db, modelId: 740, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var warnings = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning)
+            .Select(entry => entry.Message)
+            .ToList();
+        Assert.Contains(warnings, msg =>
+            msg.Contains("don't match any known regime name or knob", StringComparison.OrdinalIgnoreCase) &&
+            msg.Contains("[knob]", StringComparison.Ordinal) &&
+            msg.Contains("MaxEcce", StringComparison.Ordinal));
+        // Valid knob is NOT flagged.
+        Assert.DoesNotContain(warnings, msg =>
+            msg.Contains("[knob]", StringComparison.Ordinal) &&
+            msg.Contains("DegradationDelta", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_AuditFlushMode_TypoFixedThenReintroduced_RelogsWarning()
+    {
+        // Operator typos → fixes → re-introduces the same typo. Recovery resets the
+        // dedup signature so the second occurrence re-logs (not silently swallowed
+        // because "we already saw this string"). Symmetric with override-token validator.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:AuditFlushMode", "Cycel"); // typo
+                SeedActiveModel(db, modelId: 960, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        // Cycle 1: typo present.
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        // Operator fixes the typo to a recognized alias.
+        await harness.WithDbContextAsync(async db =>
+        {
+            var row = await db.Set<EngineConfig>().FirstAsync(c => c.Key == "MLCalibration:AuditFlushMode");
+            row.Value = "cycle";
+            await db.SaveChangesAsync();
+        });
+
+        // Cycle 2: recognized — should reset dedup state and emit recovery Information.
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        // Operator re-introduces the same typo.
+        await harness.WithDbContextAsync(async db =>
+        {
+            var row = await db.Set<EngineConfig>().FirstAsync(c => c.Key == "MLCalibration:AuditFlushMode");
+            row.Value = "Cycel";
+            await db.SaveChangesAsync();
+        });
+
+        // Cycle 3: typo present again — should re-log Warning (not silently swallow).
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var typoWarnings = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning &&
+                            entry.Message.Contains("AuditFlushMode value 'Cycel' is not recognized", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        // Two warnings: one on cycle 1, one on cycle 3 (after recovery reset).
+        Assert.Equal(2, typoWarnings.Count);
+
+        var recoveryInfos = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Information &&
+                            entry.Message.Contains("AuditFlushMode value now resolves to a recognized alias", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        // One Information on cycle 2 when the typo was first cleared.
+        Assert.Single(recoveryInfos);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_AuditFlushMode_UnknownValue_LogsWarningOnceAndFallsBack()
+    {
+        // Operator types "Cycel" instead of "cycle". The parser must:
+        //   (a) fall back to PerModel (default) so the cycle still runs,
+        //   (b) emit a Warning so the misconfiguration is visible,
+        //   (c) not re-warn every cycle while the same typo persists.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var capturingLogger = new CapturingLogger<MLCalibrationMonitorWorker>();
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:AuditFlushMode", "Cycel");
+                SeedActiveModel(db, modelId: 950, symbol: "EURUSD", timeframe: Timeframe.H1, baselineEce: 0.10);
+            },
+            timeProvider: new TestTimeProvider(now),
+            logger: capturingLogger);
+
+        // Cycle 1 + 2 + 3 with same unknown value: exactly one Warning expected.
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var warnings = capturingLogger.Entries
+            .Where(entry => entry.Level == LogLevel.Warning &&
+                            entry.Message.Contains("AuditFlushMode value 'Cycel' is not recognized", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Single(warnings);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_ChronicCritical_DispatchesRetirementAlertAndSuppressesRetrain()
+    {
+        // Same Critical-state model evaluated 4 cycles in a row should:
+        //   - Increment the chronic counter to 4.
+        //   - On the 4th cycle, dispatch a chronic retirement alert (severity Critical).
+        //   - With SuppressRetrainOnChronic = true (default), block further retrain queueing.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var time = new TestTimeProvider(now);
+        const long modelId = 970;
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:MaxEce", "0.05");
+                AddConfig(db, "MLCalibration:DegradationDelta", "0.01");
+                AddConfig(db, "MLCalibration:ChronicCriticalThreshold", "4");
+                // Generous cooldowns so retrain queueing is gated only by the chronic guard.
+                AddConfig(db, "MLCalibration:MinTimeBetweenRetrainsHours", "0");
+                SeedActiveModel(db, modelId: modelId, symbol: "EURUSD",
+                    timeframe: Timeframe.H1, baselineEce: 0.001);
+                // 12 mostly-wrong logs → ECE far above the 0.05 ceiling → Critical via threshold.
+                for (int i = 0; i < 12; i++)
+                {
+                    SeedConfidenceOnlyLog(
+                        db,
+                        id: modelId * 100 + i,
+                        modelId: modelId,
+                        symbol: "EURUSD",
+                        timeframe: Timeframe.H1,
+                        outcomeRecordedAtUtc: now.AddHours(-(i + 1)).UtcDateTime,
+                        predictedDirection: TradeDirection.Buy,
+                        actualDirection: i < 1 ? TradeDirection.Buy : TradeDirection.Sell,
+                        confidenceScore: 0.95m);
+                }
+            },
+            timeProvider: time);
+
+        // Cycle 1: streak = 1; alert critical, no chronic alert.
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        // Cycle 2: streak = 2.
+        time.SetUtcNow(time.GetUtcNow() + TimeSpan.FromHours(1));
+        await harness.SeedFreshLogAsync(modelId * 100 + 100, modelId, "EURUSD", Timeframe.H1,
+            time.GetUtcNow().UtcDateTime, TradeDirection.Buy, TradeDirection.Sell, 0.95m);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        // Cycle 3: streak = 3.
+        time.SetUtcNow(time.GetUtcNow() + TimeSpan.FromHours(1));
+        await harness.SeedFreshLogAsync(modelId * 100 + 101, modelId, "EURUSD", Timeframe.H1,
+            time.GetUtcNow().UtcDateTime, TradeDirection.Buy, TradeDirection.Sell, 0.95m);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        // Cycle 4: streak = 4 → chronic alert fires.
+        time.SetUtcNow(time.GetUtcNow() + TimeSpan.FromHours(1));
+        await harness.SeedFreshLogAsync(modelId * 100 + 102, modelId, "EURUSD", Timeframe.H1,
+            time.GetUtcNow().UtcDateTime, TradeDirection.Buy, TradeDirection.Sell, 0.95m);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var chronicAlerts = (await harness.LoadAlertsAsync())
+            .Where(a => a.DeduplicationKey == $"ml-calibration-monitor-chronic:{modelId}")
+            .ToList();
+        Assert.Single(chronicAlerts);
+        Assert.Equal(AlertSeverity.Critical, chronicAlerts[0].Severity);
+        Assert.True(chronicAlerts[0].IsActive);
+
+        // Cycle 5: still chronic — retrain queue should remain empty (SuppressRetrainOnChronic).
+        var trainingRunsBefore = await harness.LoadTrainingRunsAsync();
+        time.SetUtcNow(time.GetUtcNow() + TimeSpan.FromHours(1));
+        await harness.SeedFreshLogAsync(modelId * 100 + 103, modelId, "EURUSD", Timeframe.H1,
+            time.GetUtcNow().UtcDateTime, TradeDirection.Buy, TradeDirection.Sell, 0.95m);
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+        var trainingRunsAfter = await harness.LoadTrainingRunsAsync();
+        Assert.Equal(trainingRunsBefore.Count, trainingRunsAfter.Count);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_AlertBudget_SuppressesNotificationsBeyondCap()
+    {
+        // Three Critical models with MaxAlertsPerCycle=1 should yield exactly one
+        // dispatched notification this cycle. All three Alert rows still get upserted
+        // (so dashboards see the state); only the dispatcher.DispatchAsync call is
+        // gated. The TestAlertDispatcher records its calls via LastTriggeredAt.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:MaxEce", "0.05");
+                AddConfig(db, "MLCalibration:DegradationDelta", "0.01");
+                AddConfig(db, "MLCalibration:MaxAlertsPerCycle", "1");
+                AddConfig(db, "MLCalibration:MaxDegreeOfParallelism", "1"); // deterministic order
+
+                foreach (long mid in new long[] { 980, 981, 982 })
+                {
+                    SeedActiveModel(db, modelId: mid, symbol: "EURUSD",
+                        timeframe: Timeframe.H1, baselineEce: 0.001);
+                    for (int i = 0; i < 12; i++)
+                    {
+                        SeedConfidenceOnlyLog(
+                            db,
+                            id: mid * 100 + i,
+                            modelId: mid,
+                            symbol: "EURUSD",
+                            timeframe: Timeframe.H1,
+                            outcomeRecordedAtUtc: now.AddHours(-(i + 1)).UtcDateTime,
+                            predictedDirection: TradeDirection.Buy,
+                            actualDirection: i < 1 ? TradeDirection.Buy : TradeDirection.Sell,
+                            confidenceScore: 0.95m);
+                    }
+                }
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        // All three are evaluated and Critical.
+        Assert.Equal(3, result.EvaluatedModelCount);
+        Assert.Equal(3, result.CriticalModelCount);
+        // But DispatchedAlertCount caps at the budget (1).
+        Assert.Equal(1, result.DispatchedAlertCount);
+
+        // Three Alert rows persisted (state visible to dashboards even when notification suppressed).
+        var alerts = await harness.LoadAlertsAsync();
+        var modelAlerts = alerts.Where(a =>
+            a.DeduplicationKey == "ml-calibration-monitor:980" ||
+            a.DeduplicationKey == "ml-calibration-monitor:981" ||
+            a.DeduplicationKey == "ml-calibration-monitor:982").ToList();
+        Assert.Equal(3, modelAlerts.Count);
+
+        // Exactly one of them has LastTriggeredAt set (the one whose dispatch fired).
+        Assert.Equal(1, modelAlerts.Count(a => a.LastTriggeredAt.HasValue));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_AuditFlushMode_Cycle_StillProducesAuditRows()
+    {
+        // Switching AuditFlushMode to "cycle" should produce identical audit output
+        // (one row per evaluation) — only the flush path differs (one batched DI scope
+        // at end-of-cycle vs. one per model). Behavioral parity check.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                AddConfig(db, "MLCalibration:MinSamples", "10");
+                AddConfig(db, "MLCalibration:MaxEce", "0.50");
+                AddConfig(db, "MLCalibration:DegradationDelta", "0.50");
+                AddConfig(db, "MLCalibration:AuditFlushMode", "cycle");
+
+                foreach (long modelId in new long[] { 900, 901, 902 })
+                {
+                    SeedActiveModel(db, modelId: modelId, symbol: "AUDCAD",
+                        timeframe: Timeframe.H4, baselineEce: 0.05);
+                    for (int index = 0; index < 12; index++)
+                    {
+                        SeedConfidenceOnlyLog(
+                            db,
+                            id: modelId * 100 + index,
+                            modelId: modelId,
+                            symbol: "AUDCAD",
+                            timeframe: Timeframe.H4,
+                            outcomeRecordedAtUtc: now.AddHours(-(index + 1)).UtcDateTime,
+                            predictedDirection: TradeDirection.Buy,
+                            actualDirection: index % 2 == 0 ? TradeDirection.Buy : TradeDirection.Sell,
+                            confidenceScore: 0.55m);
+                    }
+                }
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+        Assert.Equal(3, result.EvaluatedModelCount);
+
+        // Each model should have at least one global audit row persisted.
+        foreach (long modelId in new long[] { 900, 901, 902 })
+        {
+            var rows = await harness.LoadCalibrationLogsAsync(modelId);
+            Assert.Contains(rows, row => row.Regime == null);
+        }
     }
 
     [Fact]

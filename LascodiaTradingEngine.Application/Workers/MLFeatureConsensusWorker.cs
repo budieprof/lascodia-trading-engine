@@ -9,6 +9,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services.ML;
@@ -25,17 +27,44 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
     private const string WorkerName = nameof(MLFeatureConsensusWorker);
     private const string DistributedLockKey = "ml:feature-consensus:cycle";
 
+    private const string CK_Enabled                  = "MLFeatureConsensus:Enabled";
+    private const string CK_InitialDelaySecs         = "MLFeatureConsensus:InitialDelaySeconds";
     private const string CK_PollSecs                 = "MLFeatureConsensus:PollIntervalSeconds";
     private const string CK_MinModels                = "MLFeatureConsensus:MinModelsForConsensus";
+    private const string CK_MinArchitectures         = "MLFeatureConsensus:MinArchitecturesForConsensus";
     private const string CK_LockTimeoutSecs          = "MLFeatureConsensus:LockTimeoutSeconds";
     private const string CK_MinSnapshotSpacingSecs   = "MLFeatureConsensus:MinSnapshotSpacingSeconds";
     private const string CK_MaxModelsPerPair         = "MLFeatureConsensus:MaxModelsPerPair";
+    private const string CK_MaxPairsPerCycle         = "MLFeatureConsensus:MaxPairsPerCycle";
+    private const string CK_DbCommandTimeoutSecs     = "MLFeatureConsensus:DbCommandTimeoutSeconds";
 
     private const int DefaultPollSeconds = 3600;
     private const int DefaultMinModels = 3;
+    private const int DefaultMinArchitectures = 2;
     private const int DefaultLockTimeoutSeconds = 0;
     private const int DefaultMinSnapshotSpacingSeconds = 300;
     private const int DefaultMaxModelsPerPair = 128;
+    private const int DefaultMaxPairsPerCycle = 1000;
+    private const int DefaultDbCommandTimeoutSeconds = 30;
+    private const double MinImportanceMass = 1.0e-12;
+
+    private static readonly string[] ConfigKeys =
+    [
+        CK_Enabled,
+        CK_InitialDelaySecs,
+        CK_PollSecs,
+        CK_MinModels,
+        CK_MinArchitectures,
+        CK_LockTimeoutSecs,
+        CK_MinSnapshotSpacingSecs,
+        CK_MaxModelsPerPair,
+        CK_MaxPairsPerCycle,
+        CK_DbCommandTimeoutSecs
+    ];
+
+    private static readonly TimeSpan WakeInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(15);
 
     private static readonly JsonSerializerOptions JsonOptions =
         new() { PropertyNameCaseInsensitive = true };
@@ -46,6 +75,15 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly TradingMetrics? _metrics;
     private readonly TimeProvider _timeProvider;
+    private readonly MLFeatureConsensusOptions _options;
+    private int _missingDistributedLockWarningEmitted;
+    private int _consecutiveCycleFailuresField;
+
+    private int ConsecutiveCycleFailures
+    {
+        get => Volatile.Read(ref _consecutiveCycleFailuresField);
+        set => Interlocked.Exchange(ref _consecutiveCycleFailuresField, value);
+    }
 
     public MLFeatureConsensusWorker(
         IServiceScopeFactory scopeFactory,
@@ -53,7 +91,8 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
         IDistributedLock? distributedLock = null,
         IWorkerHealthMonitor? healthMonitor = null,
         TradingMetrics? metrics = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        MLFeatureConsensusOptions? options = null)
     {
         _scopeFactory    = scopeFactory;
         _logger          = logger;
@@ -61,6 +100,7 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
         _healthMonitor   = healthMonitor;
         _metrics         = metrics;
         _timeProvider    = timeProvider ?? TimeProvider.System;
+        _options         = options ?? new MLFeatureConsensusOptions();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -69,45 +109,108 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
         _healthMonitor?.RecordWorkerMetadata(
             WorkerName,
             "Computes schema-aware feature-importance consensus across active ML models.",
-            TimeSpan.FromSeconds(DefaultPollSeconds));
+            TimeSpan.FromSeconds(NormalizePollSeconds(_options.PollIntervalSeconds)));
 
-        while (!stoppingToken.IsCancellationRequested)
+        DateTime lastCycleStartUtc = DateTime.MinValue;
+        DateTime lastSuccessUtc = DateTime.MinValue;
+        TimeSpan currentPollInterval = TimeSpan.FromSeconds(NormalizePollSeconds(_options.PollIntervalSeconds));
+
+        try
         {
-            int pollSecs = DefaultPollSeconds;
-            var cycleStart = Stopwatch.GetTimestamp();
+            var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName)
+                               + TimeSpan.FromSeconds(NormalizeInitialDelaySeconds(_options.InitialDelaySeconds));
+            if (initialDelay > TimeSpan.Zero)
+                await Task.Delay(initialDelay, _timeProvider, stoppingToken);
 
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
-                pollSecs = await RunCycleAsync(stoppingToken);
+                var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                if (lastSuccessUtc != DateTime.MinValue)
+                    _metrics?.MLFeatureConsensusTimeSinceLastSuccessSec.Record((nowUtc - lastSuccessUtc).TotalSeconds);
 
-                long durationMs = (long)Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds;
-                _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
-                _metrics?.WorkerCycleDurationMs.Record(
-                    durationMs,
-                    new KeyValuePair<string, object?>("worker", WorkerName));
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _metrics?.WorkerErrors.Add(
-                    1,
-                    new KeyValuePair<string, object?>("worker", WorkerName));
-                _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
-                _logger.LogError(ex, "MLFeatureConsensusWorker loop error.");
-            }
+                if (nowUtc - lastCycleStartUtc >= currentPollInterval)
+                {
+                    lastCycleStartUtc = nowUtc;
+                    var cycleStart = Stopwatch.GetTimestamp();
 
-            await Task.Delay(TimeSpan.FromSeconds(Math.Clamp(pollSecs, 60, 86_400)), stoppingToken);
+                    try
+                    {
+                        _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                        var result = await RunCycleAsync(stoppingToken);
+                        currentPollInterval = result.Config.PollInterval;
+
+                        long durationMs = (long)Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds;
+                        _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                        _metrics?.WorkerCycleDurationMs.Record(
+                            durationMs,
+                            new KeyValuePair<string, object?>("worker", WorkerName));
+                        _metrics?.MLFeatureConsensusCycleDurationMs.Record(durationMs);
+
+                        if (result.SkippedReason is { Length: > 0 })
+                        {
+                            _logger.LogDebug(
+                                "{Worker}: cycle skipped ({Reason}).",
+                                WorkerName,
+                                result.SkippedReason);
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "{Worker}: pairs={Pairs}, written={Written}, skipped={Skipped}, rejectedModels={Rejected}.",
+                                WorkerName,
+                                result.CandidatePairCount,
+                                result.SnapshotsWritten,
+                                result.PairsSkipped,
+                                result.ModelRejects);
+                        }
+
+                        var previousFailures = ConsecutiveCycleFailures;
+                        if (previousFailures > 0)
+                        {
+                            _healthMonitor?.RecordRecovery(WorkerName, previousFailures);
+                            _logger.LogInformation(
+                                "{Worker}: recovered after {Failures} consecutive failure(s).",
+                                WorkerName,
+                                previousFailures);
+                        }
+
+                        ConsecutiveCycleFailures = 0;
+                        lastSuccessUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref _consecutiveCycleFailuresField);
+                        _metrics?.WorkerErrors.Add(
+                            1,
+                            new KeyValuePair<string, object?>("worker", WorkerName),
+                            new KeyValuePair<string, object?>("reason", "ml_feature_consensus_cycle"));
+                        _healthMonitor?.RecordRetry(WorkerName);
+                        _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                        _logger.LogError(ex, "MLFeatureConsensusWorker loop error.");
+                    }
+                }
+
+                var delay = ConsecutiveCycleFailures > 0
+                    ? CalculateBackoffDelay(ConsecutiveCycleFailures)
+                    : WakeInterval;
+                await Task.Delay(delay, _timeProvider, stoppingToken);
+            }
         }
-
-        _healthMonitor?.RecordWorkerStopped(WorkerName);
-        _logger.LogInformation("MLFeatureConsensusWorker stopping.");
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("MLFeatureConsensusWorker stopping.");
+        }
     }
 
-    internal async Task<int> RunCycleAsync(CancellationToken ct)
+    internal async Task<FeatureConsensusCycleResult> RunCycleAsync(CancellationToken ct)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
@@ -115,7 +218,15 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
         var readCtx = readDb.GetDbContext();
         var writeCtx = writeDb.GetDbContext();
 
-        var config = await LoadConfigAsync(readCtx, ct);
+        var config = await LoadConfigAsync(readCtx, _options, ct);
+        ApplyCommandTimeout(readCtx, config.DbCommandTimeoutSeconds);
+        ApplyCommandTimeout(writeCtx, config.DbCommandTimeoutSeconds);
+
+        if (!config.Enabled)
+        {
+            RecordCycleSkipped("disabled");
+            return FeatureConsensusCycleResult.Skipped(config, "disabled");
+        }
 
         IAsyncDisposable? cycleLock = null;
         if (_distributedLock is null)
@@ -123,8 +234,11 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             _metrics?.MLFeatureConsensusLockAttempts.Add(
                 1,
                 new KeyValuePair<string, object?>("outcome", "unavailable"));
-            _logger.LogWarning(
-                "MLFeatureConsensusWorker running without IDistributedLock; duplicate snapshots are possible in multi-instance deployments.");
+            if (Interlocked.Exchange(ref _missingDistributedLockWarningEmitted, 1) == 0)
+            {
+                _logger.LogWarning(
+                    "MLFeatureConsensusWorker running without IDistributedLock; duplicate snapshots are possible in multi-instance deployments.");
+            }
         }
         else
         {
@@ -138,8 +252,9 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
                 _metrics?.MLFeatureConsensusLockAttempts.Add(
                     1,
                     new KeyValuePair<string, object?>("outcome", "busy"));
+                RecordCycleSkipped("lock_busy");
                 _logger.LogDebug("MLFeatureConsensusWorker: cycle skipped because distributed lock is held elsewhere.");
-                return config.PollSeconds;
+                return FeatureConsensusCycleResult.Skipped(config, "lock_busy");
             }
 
             _metrics?.MLFeatureConsensusLockAttempts.Add(
@@ -152,60 +267,130 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
             try
             {
-                await RunCycleCoreAsync(readCtx, writeCtx, config, ct);
+                return await RunCycleCoreAsync(readCtx, writeCtx, config, ct);
             }
             finally
             {
                 WorkerBulkhead.MLMonitoring.Release();
             }
         }
-
-        return config.PollSeconds;
     }
 
-    private async Task RunCycleCoreAsync(
+    internal async Task<FeatureConsensusCycleResult> RunConsensusAsync(
+        DbContext readCtx,
+        DbContext writeCtx,
+        CancellationToken ct)
+    {
+        var config = await LoadConfigAsync(readCtx, _options, ct);
+        ApplyCommandTimeout(readCtx, config.DbCommandTimeoutSeconds);
+        ApplyCommandTimeout(writeCtx, config.DbCommandTimeoutSeconds);
+
+        if (!config.Enabled)
+            return FeatureConsensusCycleResult.Skipped(config, "disabled");
+
+        return await RunCycleCoreAsync(readCtx, writeCtx, config, ct);
+    }
+
+    private async Task<FeatureConsensusCycleResult> RunCycleCoreAsync(
         DbContext readCtx,
         DbContext writeCtx,
         FeatureConsensusConfig config,
         CancellationToken ct)
     {
-        var pairs = await readCtx.Set<MLModel>()
+        var activeModelQuery = readCtx.Set<MLModel>()
             .AsNoTracking()
-            .Where(m => m.IsActive && !m.IsDeleted && m.ModelBytes != null)
+            .Where(m => m.IsActive
+                        && !m.IsDeleted
+                        && (m.Status == MLModelStatus.Active || m.IsFallbackChampion)
+                        && !m.IsSuppressed
+                        && !m.IsMetaLearner
+                        && !m.IsMamlInitializer
+                        && m.ModelBytes != null);
+
+        var pairQuery = activeModelQuery
             .Select(m => new { m.Symbol, m.Timeframe })
-            .Distinct()
+            .Distinct();
+
+        var pairs = await pairQuery
             .OrderBy(p => p.Symbol)
             .ThenBy(p => p.Timeframe)
+            .Take(config.MaxPairsPerCycle + 1)
             .ToListAsync(ct);
 
-        _healthMonitor?.RecordBacklogDepth(WorkerName, pairs.Count);
+        var truncated = pairs.Count > config.MaxPairsPerCycle;
+        var skippedByLimit = 0;
+        if (truncated)
+        {
+            pairs.RemoveAt(pairs.Count - 1);
+            var totalPairs = await pairQuery.CountAsync(ct);
+            skippedByLimit = Math.Max(0, totalPairs - config.MaxPairsPerCycle);
+            if (skippedByLimit > 0)
+                RecordPairSkip("cycle_limit", skippedByLimit);
+        }
+
+        _healthMonitor?.RecordBacklogDepth(WorkerName, pairs.Count + skippedByLimit);
         _logger.LogDebug(
             "Feature consensus cycle: {PairCount} active pair(s), minModels={MinModels}.",
-            pairs.Count, config.MinModels);
+            pairs.Count + skippedByLimit, config.MinModels);
 
-        int written = 0, skipped = 0;
+        int written = 0, skipped = skippedByLimit, failed = 0, rejectedModels = 0, contributors = 0;
         foreach (var pair in pairs)
         {
             ct.ThrowIfCancellationRequested();
 
-            bool didWrite = await ProcessPairAsync(
-                readCtx,
-                writeCtx,
-                pair.Symbol,
-                pair.Timeframe,
-                config,
-                ct);
+            FeatureConsensusPairResult pairResult;
+            try
+            {
+                pairResult = await ProcessPairAsync(
+                    readCtx,
+                    writeCtx,
+                    pair.Symbol,
+                    pair.Timeframe,
+                    config,
+                    ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                skipped++;
+                RecordPairSkip("pair_error", pair.Symbol, pair.Timeframe);
+                _logger.LogWarning(
+                    ex,
+                    "MLFeatureConsensusWorker: failed pair {Symbol}/{Timeframe}; continuing.",
+                    pair.Symbol,
+                    pair.Timeframe);
+                continue;
+            }
 
-            if (didWrite) written++;
-            else skipped++;
+            rejectedModels += pairResult.ModelRejects;
+            contributors += pairResult.Contributors;
+
+            if (pairResult.Written)
+                written++;
+            else
+                skipped++;
         }
 
         _logger.LogInformation(
-            "MLFeatureConsensusWorker cycle complete: snapshotsWritten={Written}, pairsSkipped={Skipped}, pairsTotal={Total}.",
-            written, skipped, pairs.Count);
+            "MLFeatureConsensusWorker cycle complete: snapshotsWritten={Written}, pairsSkipped={Skipped}, pairsFailed={Failed}, pairsTotal={Total}.",
+            written, skipped, failed, pairs.Count + skippedByLimit);
+
+        return new FeatureConsensusCycleResult(
+            config,
+            CandidatePairCount: pairs.Count + skippedByLimit,
+            SnapshotsWritten: written,
+            PairsSkipped: skipped,
+            PairFailures: failed,
+            ModelRejects: rejectedModels,
+            Contributors: contributors,
+            SkippedReason: null);
     }
 
-    private async Task<bool> ProcessPairAsync(
+    private async Task<FeatureConsensusPairResult> ProcessPairAsync(
         DbContext readCtx,
         DbContext writeCtx,
         string symbol,
@@ -215,23 +400,22 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
     {
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
         var freshnessCutoff = nowUtc.AddSeconds(-config.MinSnapshotSpacingSeconds);
-        bool hasFreshSnapshot = await readCtx.Set<MLFeatureConsensusSnapshot>()
-            .AsNoTracking()
-            .AnyAsync(s => s.Symbol == symbol
-                           && s.Timeframe == timeframe
-                           && s.DetectedAt >= freshnessCutoff,
-                ct);
+        bool hasFreshSnapshot = await HasFreshSnapshotAsync(readCtx, symbol, timeframe, freshnessCutoff, ct);
 
         if (hasFreshSnapshot)
         {
             RecordPairSkip("fresh_snapshot", symbol, timeframe);
-            return false;
+            return FeatureConsensusPairResult.Skipped("fresh_snapshot");
         }
 
         var models = await readCtx.Set<MLModel>()
             .AsNoTracking()
             .Where(m => m.IsActive
                      && !m.IsDeleted
+                     && (m.Status == MLModelStatus.Active || m.IsFallbackChampion)
+                     && !m.IsSuppressed
+                     && !m.IsMetaLearner
+                     && !m.IsMamlInitializer
                      && m.ModelBytes != null
                      && m.Symbol == symbol
                      && m.Timeframe == timeframe)
@@ -246,15 +430,22 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             _logger.LogDebug(
                 "Pair {Symbol}/{Timeframe}: only {ModelCount} active model(s), need {MinModels}; skipping consensus.",
                 symbol, timeframe, models.Count, config.MinModels);
-            return false;
+            return FeatureConsensusPairResult.Skipped("insufficient_models");
         }
 
         var contributors = new List<ConsensusContributor>(models.Count);
+        var rejectedModels = 0;
         foreach (var model in models)
         {
             var contributor = TryBuildContributor(model, symbol, timeframe);
             if (contributor is not null)
+            {
                 contributors.Add(contributor);
+            }
+            else
+            {
+                rejectedModels++;
+            }
         }
 
         if (contributors.Count < config.MinModels)
@@ -263,34 +454,61 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             _logger.LogDebug(
                 "Pair {Symbol}/{Timeframe}: only {ContributorCount} valid importance contributor(s), need {MinModels}; skipping consensus.",
                 symbol, timeframe, contributors.Count, config.MinModels);
-            return false;
+            return FeatureConsensusPairResult.Skipped("insufficient_valid_importance", rejectedModels);
         }
 
-        var schemaGroup = contributors
+        var schemaGroups = contributors
             .GroupBy(c => c.SchemaKey)
-            .OrderByDescending(g => g.Count())
-            .ThenByDescending(g => g.Max(c => c.TrainedOn))
-            .First();
+            .Select(g => new
+            {
+                SchemaKey = g.Key,
+                Contributors = g.ToList(),
+                ArchitectureCount = g.Select(c => c.Architecture).Distinct(StringComparer.Ordinal).Count(),
+                LatestTrainedOn = g.Max(c => c.TrainedOn),
+            })
+            .OrderByDescending(g => g.Contributors.Count)
+            .ThenByDescending(g => g.ArchitectureCount)
+            .ThenByDescending(g => g.LatestTrainedOn)
+            .ToList();
 
-        if (schemaGroup.Count() < config.MinModels)
+        var schemaGroup = schemaGroups
+            .Where(g => g.Contributors.Count >= config.MinModels
+                        && g.ArchitectureCount >= config.MinArchitectures)
+            .OrderByDescending(g => g.ArchitectureCount)
+            .ThenByDescending(g => g.Contributors.Count)
+            .ThenByDescending(g => g.LatestTrainedOn)
+            .FirstOrDefault();
+
+        if (schemaGroup is null)
         {
-            RecordPairSkip("schema_fragmented", symbol, timeframe);
+            var largestGroup = schemaGroups.First();
+            var reason = largestGroup.Contributors.Count < config.MinModels
+                ? "schema_fragmented"
+                : "insufficient_architecture_diversity";
+            RecordPairSkip(reason, symbol, timeframe);
             _logger.LogWarning(
-                "Pair {Symbol}/{Timeframe}: no compatible feature schema group has enough contributors. valid={Valid}, largestGroup={Largest}, min={Min}.",
-                symbol, timeframe, contributors.Count, schemaGroup.Count(), config.MinModels);
-            return false;
+                "Pair {Symbol}/{Timeframe}: no compatible feature-schema group met consensus requirements. valid={Valid}, largestGroup={Largest}, largestArchitectures={Architectures}, minModels={MinModels}, minArchitectures={MinArchitectures}.",
+                symbol,
+                timeframe,
+                contributors.Count,
+                largestGroup.Contributors.Count,
+                largestGroup.ArchitectureCount,
+                config.MinModels,
+                config.MinArchitectures);
+            return FeatureConsensusPairResult.Skipped(reason, rejectedModels);
         }
 
-        int rejectedSchemaMismatch = contributors.Count - schemaGroup.Count();
+        int rejectedSchemaMismatch = contributors.Count - schemaGroup.Contributors.Count;
         if (rejectedSchemaMismatch > 0)
         {
             RecordModelReject("schema_mismatch", rejectedSchemaMismatch, symbol, timeframe);
+            rejectedModels += rejectedSchemaMismatch;
             _logger.LogInformation(
                 "Pair {Symbol}/{Timeframe}: selected schema {SchemaKey} with {Selected}/{Total} contributor(s); ignored {Ignored} incompatible contributor(s).",
-                symbol, timeframe, schemaGroup.Key, schemaGroup.Count(), contributors.Count, rejectedSchemaMismatch);
+                symbol, timeframe, schemaGroup.SchemaKey, schemaGroup.Contributors.Count, contributors.Count, rejectedSchemaMismatch);
         }
 
-        var selectedContributors = schemaGroup
+        var selectedContributors = schemaGroup.Contributors
             .OrderBy(c => c.ModelId)
             .ToList();
 
@@ -303,7 +521,7 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
         if (featureNames.Length == 0)
         {
             RecordPairSkip("no_common_features", symbol, timeframe);
-            return false;
+            return FeatureConsensusPairResult.Skipped("no_common_features", rejectedModels);
         }
 
         var consensusEntries = BuildConsensusEntries(selectedContributors, featureNames);
@@ -324,7 +542,7 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             Symbol                 = symbol,
             Timeframe              = timeframe,
             FeatureConsensusJson   = consensusJson,
-            SchemaKey              = schemaGroup.Key,
+            SchemaKey              = schemaGroup.SchemaKey,
             FeatureCount           = featureNames.Length,
             ImportanceSourceSummaryJson = sourceSummaryJson,
             ContributorModelIdsJson = contributorIdsJson,
@@ -332,6 +550,13 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             MeanKendallTau         = Math.Round(meanKendallTau, 6),
             DetectedAt             = nowUtc,
         };
+
+        var latestCutoff = _timeProvider.GetUtcNow().UtcDateTime.AddSeconds(-config.MinSnapshotSpacingSeconds);
+        if (await HasFreshSnapshotAsync(writeCtx, symbol, timeframe, latestCutoff, ct))
+        {
+            RecordPairSkip("fresh_snapshot_race", symbol, timeframe);
+            return FeatureConsensusPairResult.Skipped("fresh_snapshot_race", rejectedModels);
+        }
 
         writeCtx.Set<MLFeatureConsensusSnapshot>().Add(snapshot);
         await writeCtx.SaveChangesAsync(ct);
@@ -351,9 +576,9 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
 
         _logger.LogInformation(
             "Feature consensus computed for {Symbol}/{Timeframe}: contributors={ContributorCount}, features={FeatureCount}, meanKendallTau={Tau:F4}, schema={SchemaKey}.",
-            symbol, timeframe, selectedContributors.Count, featureNames.Length, meanKendallTau, schemaGroup.Key);
+            symbol, timeframe, selectedContributors.Count, featureNames.Length, meanKendallTau, schemaGroup.SchemaKey);
 
-        return true;
+        return FeatureConsensusPairResult.Wrote(selectedContributors.Count, rejectedModels);
     }
 
     private ConsensusContributor? TryBuildContributor(MLModel model, string symbol, Timeframe timeframe)
@@ -394,7 +619,14 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             return null;
         }
 
-        string schemaKey = ResolveSchemaKey(snapshot, extraction.Importance.Keys);
+        var normalizedImportance = NormalizeImportance(extraction.Importance);
+        if (normalizedImportance.Count == 0)
+        {
+            RecordModelReject("zero_importance", 1, symbol, timeframe);
+            return null;
+        }
+
+        string schemaKey = ResolveSchemaKey(snapshot, normalizedImportance.Keys);
         return new ConsensusContributor(
             model.Id,
             model.LearnerArchitecture.ToString(),
@@ -402,7 +634,35 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             schemaKey,
             extraction.Source,
             snapshot.TrainedOn,
-            extraction.Importance);
+            normalizedImportance);
+    }
+
+    private static IReadOnlyDictionary<string, double> NormalizeImportance(
+        IReadOnlyDictionary<string, double> importance)
+    {
+        var cleaned = new Dictionary<string, double>(StringComparer.Ordinal);
+        double total = 0.0;
+
+        foreach (var (feature, rawValue) in importance)
+        {
+            if (string.IsNullOrWhiteSpace(feature) || !double.IsFinite(rawValue))
+                continue;
+
+            var value = Math.Abs(rawValue);
+            if (value <= 0.0)
+                continue;
+
+            cleaned[feature] = value;
+            total += value;
+        }
+
+        if (total <= MinImportanceMass)
+            return new Dictionary<string, double>(StringComparer.Ordinal);
+
+        foreach (var feature in cleaned.Keys.ToArray())
+            cleaned[feature] /= total;
+
+        return cleaned;
     }
 
     private static List<FeatureConsensusEntry> BuildConsensusEntries(
@@ -544,58 +804,155 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
         return $"schema-v{snapshot.ResolveFeatureSchemaVersion()}:importance:{names.Length}:{hash[..16]}";
     }
 
-    private async Task<FeatureConsensusConfig> LoadConfigAsync(DbContext ctx, CancellationToken ct)
-    {
-        int pollSeconds = Math.Clamp(
-            await GetConfigAsync(ctx, CK_PollSecs, DefaultPollSeconds, ct),
-            60,
-            86_400);
-        int minModels = Math.Clamp(
-            await GetConfigAsync(ctx, CK_MinModels, DefaultMinModels, ct),
-            2,
-            1000);
-        int lockTimeoutSeconds = Math.Clamp(
-            await GetConfigAsync(ctx, CK_LockTimeoutSecs, DefaultLockTimeoutSeconds, ct),
-            0,
-            300);
-        int minSnapshotSpacingSeconds = Math.Clamp(
-            await GetConfigAsync(ctx, CK_MinSnapshotSpacingSecs, DefaultMinSnapshotSpacingSeconds, ct),
-            0,
-            pollSeconds);
-        int maxModelsPerPair = Math.Clamp(
-            await GetConfigAsync(ctx, CK_MaxModelsPerPair, DefaultMaxModelsPerPair, ct),
-            minModels,
-            5000);
-
-        return new FeatureConsensusConfig(
-            pollSeconds,
-            minModels,
-            lockTimeoutSeconds,
-            minSnapshotSpacingSeconds,
-            maxModelsPerPair);
-    }
-
-    private static async Task<T> GetConfigAsync<T>(
+    internal static async Task<FeatureConsensusConfig> LoadConfigAsync(
         DbContext ctx,
-        string key,
-        T defaultValue,
+        MLFeatureConsensusOptions options,
         CancellationToken ct)
     {
-        var entry = await ctx.Set<EngineConfig>()
+        var rows = await ctx.Set<EngineConfig>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => !c.IsDeleted && c.Key == key, ct);
+            .Where(c => ConfigKeys.Contains(c.Key) && !c.IsDeleted)
+            .Select(c => new { c.Id, c.Key, c.Value, c.LastUpdatedAt })
+            .ToListAsync(ct);
 
-        if (entry?.Value is null)
+        var values = rows
+            .Where(c => c.Value is not null)
+            .GroupBy(c => c.Key, StringComparer.Ordinal)
+            .ToDictionary(
+                g => g.Key,
+                g => g
+                    .OrderBy(c => c.LastUpdatedAt)
+                    .ThenBy(c => c.Id)
+                    .Last().Value!,
+                StringComparer.Ordinal);
+
+        int pollSeconds = NormalizePollSeconds(GetConfig(values, CK_PollSecs, options.PollIntervalSeconds));
+        int minModels = NormalizeMinModels(GetConfig(values, CK_MinModels, options.MinModelsForConsensus));
+        int minArchitectures = NormalizeMinArchitectures(
+            GetConfig(values, CK_MinArchitectures, options.MinArchitecturesForConsensus),
+            minModels);
+        int maxModelsPerPair = NormalizeMaxModelsPerPair(
+            GetConfig(values, CK_MaxModelsPerPair, options.MaxModelsPerPair),
+            minModels);
+
+        return new FeatureConsensusConfig(
+            Enabled: GetConfig(values, CK_Enabled, options.Enabled),
+            InitialDelay: TimeSpan.FromSeconds(NormalizeInitialDelaySeconds(
+                GetConfig(values, CK_InitialDelaySecs, options.InitialDelaySeconds))),
+            PollInterval: TimeSpan.FromSeconds(pollSeconds),
+            PollSeconds: pollSeconds,
+            MinModels: minModels,
+            MinArchitectures: minArchitectures,
+            LockTimeoutSeconds: NormalizeLockTimeoutSeconds(
+                GetConfig(values, CK_LockTimeoutSecs, options.LockTimeoutSeconds)),
+            MinSnapshotSpacingSeconds: NormalizeMinSnapshotSpacingSeconds(
+                GetConfig(values, CK_MinSnapshotSpacingSecs, options.MinSnapshotSpacingSeconds),
+                pollSeconds),
+            MaxModelsPerPair: maxModelsPerPair,
+            MaxPairsPerCycle: NormalizeMaxPairsPerCycle(
+                GetConfig(values, CK_MaxPairsPerCycle, options.MaxPairsPerCycle)),
+            DbCommandTimeoutSeconds: NormalizeDbCommandTimeoutSeconds(
+                GetConfig(values, CK_DbCommandTimeoutSecs, options.DbCommandTimeoutSeconds)));
+    }
+
+    private static T GetConfig<T>(
+        IReadOnlyDictionary<string, string> values,
+        string key,
+        T defaultValue)
+    {
+        if (!values.TryGetValue(key, out var raw))
             return defaultValue;
 
-        try
+        return TryConvertConfig(raw, out T parsed)
+            ? parsed
+            : defaultValue;
+    }
+
+    private static bool TryConvertConfig<T>(string value, out T result)
+    {
+        object? parsed = null;
+        var targetType = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
+        var normalized = value.Trim();
+
+        if (targetType == typeof(string))
         {
-            return (T)Convert.ChangeType(entry.Value, typeof(T), CultureInfo.InvariantCulture);
+            parsed = value;
         }
-        catch
+        else if (targetType == typeof(int)
+                 && int.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intValue))
         {
-            return defaultValue;
+            parsed = intValue;
         }
+        else if (targetType == typeof(bool)
+                 && TryParseBool(normalized, out var boolValue))
+        {
+            parsed = boolValue;
+        }
+
+        if (parsed is T typed)
+        {
+            result = typed;
+            return true;
+        }
+
+        result = default!;
+        return false;
+    }
+
+    internal static int NormalizeInitialDelaySeconds(int value)
+        => value is >= 0 and <= 86_400 ? value : 0;
+
+    internal static int NormalizePollSeconds(int value)
+        => value is >= 60 and <= 86_400 ? value : DefaultPollSeconds;
+
+    internal static int NormalizeMinModels(int value)
+        => value is >= 2 and <= 1000 ? value : DefaultMinModels;
+
+    internal static int NormalizeMinArchitectures(int value, int minModels)
+    {
+        if (value < 1 || value > 100)
+            return Math.Min(DefaultMinArchitectures, minModels);
+
+        return Math.Min(value, minModels);
+    }
+
+    internal static int NormalizeLockTimeoutSeconds(int value)
+        => value is >= 0 and <= 300 ? value : DefaultLockTimeoutSeconds;
+
+    internal static int NormalizeMinSnapshotSpacingSeconds(int value, int pollSeconds)
+        => value >= 0 ? Math.Min(value, pollSeconds) : DefaultMinSnapshotSpacingSeconds;
+
+    internal static int NormalizeMaxModelsPerPair(int value, int minModels)
+        => value is >= 2 and <= 5000 ? Math.Max(value, minModels) : Math.Max(DefaultMaxModelsPerPair, minModels);
+
+    internal static int NormalizeMaxPairsPerCycle(int value)
+        => value is >= 1 and <= 100_000 ? value : DefaultMaxPairsPerCycle;
+
+    internal static int NormalizeDbCommandTimeoutSeconds(int value)
+        => value is >= 1 and <= 600 ? value : DefaultDbCommandTimeoutSeconds;
+
+    private static bool TryParseBool(string value, out bool result)
+    {
+        if (bool.TryParse(value, out result))
+            return true;
+
+        if (string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "on", StringComparison.OrdinalIgnoreCase))
+        {
+            result = true;
+            return true;
+        }
+
+        if (string.Equals(value, "0", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "no", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "off", StringComparison.OrdinalIgnoreCase))
+        {
+            result = false;
+            return true;
+        }
+
+        return false;
     }
 
     private void RecordPairSkip(string reason, string symbol, Timeframe timeframe)
@@ -605,6 +962,28 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             new KeyValuePair<string, object?>("reason", reason),
             new KeyValuePair<string, object?>("symbol", symbol),
             new KeyValuePair<string, object?>("timeframe", timeframe.ToString()));
+    }
+
+    private void RecordPairSkip(string reason, string symbol, Timeframe timeframe, int count)
+    {
+        if (count <= 0)
+            return;
+
+        _metrics?.MLFeatureConsensusPairsSkipped.Add(
+            count,
+            new KeyValuePair<string, object?>("reason", reason),
+            new KeyValuePair<string, object?>("symbol", symbol),
+            new KeyValuePair<string, object?>("timeframe", timeframe.ToString()));
+    }
+
+    private void RecordPairSkip(string reason, int count)
+    {
+        if (count <= 0)
+            return;
+
+        _metrics?.MLFeatureConsensusPairsSkipped.Add(
+            count,
+            new KeyValuePair<string, object?>("reason", reason));
     }
 
     private void RecordModelReject(string reason, int count, string symbol, Timeframe timeframe)
@@ -619,12 +998,88 @@ public sealed class MLFeatureConsensusWorker : BackgroundService
             new KeyValuePair<string, object?>("timeframe", timeframe.ToString()));
     }
 
-    private sealed record FeatureConsensusConfig(
+    private void RecordCycleSkipped(string reason)
+        => _metrics?.MLFeatureConsensusCyclesSkipped.Add(
+            1,
+            new KeyValuePair<string, object?>("reason", reason));
+
+    private static async Task<bool> HasFreshSnapshotAsync(
+        DbContext ctx,
+        string symbol,
+        Timeframe timeframe,
+        DateTime freshnessCutoff,
+        CancellationToken ct)
+    {
+        if (freshnessCutoff <= DateTime.MinValue)
+            return false;
+
+        return await ctx.Set<MLFeatureConsensusSnapshot>()
+            .AsNoTracking()
+            .AnyAsync(s => s.Symbol == symbol
+                           && s.Timeframe == timeframe
+                           && s.DetectedAt >= freshnessCutoff,
+                ct);
+    }
+
+    private static TimeSpan CalculateBackoffDelay(int consecutiveFailures)
+    {
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var seconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(seconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private static void ApplyCommandTimeout(DbContext db, int seconds)
+    {
+        try
+        {
+            if (db.Database.IsRelational())
+                db.Database.SetCommandTimeout(TimeSpan.FromSeconds(seconds));
+        }
+        catch (InvalidOperationException)
+        {
+            // Some providers do not expose relational command timeout configuration.
+        }
+    }
+
+    internal sealed record FeatureConsensusConfig(
+        bool Enabled,
+        TimeSpan InitialDelay,
+        TimeSpan PollInterval,
         int PollSeconds,
         int MinModels,
+        int MinArchitectures,
         int LockTimeoutSeconds,
         int MinSnapshotSpacingSeconds,
-        int MaxModelsPerPair);
+        int MaxModelsPerPair,
+        int MaxPairsPerCycle,
+        int DbCommandTimeoutSeconds);
+
+    internal sealed record FeatureConsensusCycleResult(
+        FeatureConsensusConfig Config,
+        int CandidatePairCount,
+        int SnapshotsWritten,
+        int PairsSkipped,
+        int PairFailures,
+        int ModelRejects,
+        int Contributors,
+        string? SkippedReason)
+    {
+        public static FeatureConsensusCycleResult Skipped(FeatureConsensusConfig config, string reason)
+            => new(config, 0, 0, 0, 0, 0, 0, reason);
+    }
+
+    private sealed record FeatureConsensusPairResult(
+        bool Written,
+        int Contributors,
+        int ModelRejects,
+        string? SkipReason)
+    {
+        public static FeatureConsensusPairResult Wrote(int contributors, int modelRejects)
+            => new(true, contributors, modelRejects, null);
+
+        public static FeatureConsensusPairResult Skipped(string reason, int modelRejects = 0)
+            => new(false, 0, modelRejects, reason);
+    }
 
     private sealed record ConsensusContributor(
         long ModelId,

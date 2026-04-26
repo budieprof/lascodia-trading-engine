@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.StrategyGeneration;
 using LascodiaTradingEngine.Domain.Entities;
@@ -28,15 +29,19 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// coexist under the active-strategy uniqueness filter.
 /// </para>
 /// </summary>
-public sealed class EvolutionaryGeneratorWorker : BackgroundService
+public sealed partial class EvolutionaryGeneratorWorker : BackgroundService
 {
     internal const string WorkerName = nameof(EvolutionaryGeneratorWorker);
 
     private const string CK_Enabled = "Evolution:Enabled";
     private const string CK_PollSeconds = "Evolution:PollIntervalSeconds";
     private const string CK_MaxOffspring = "Evolution:MaxOffspringPerCycle";
+    private const string CK_PollJitterSeconds = "Evolution:PollJitterSeconds";
+    private const string CK_LockTimeoutSeconds = "Evolution:LockTimeoutSeconds";
 
     private const string DistributedLockKey = "workers:evolutionary-generator:cycle";
+    internal const string FleetSystemicDedupeKey = "Evolution:FleetSystemic";
+    internal const string StalenessDedupeKey = "Evolution:Staleness";
 
     private const int DefaultPollSecs = 24 * 60 * 60; // daily
     private const int MinPollSecs = 60;
@@ -47,7 +52,6 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
     private const int InitialValidationLookbackDays = 365;
     private const decimal InitialValidationBalance = 10_000m;
 
-    private static readonly TimeSpan DistributedLockTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromHours(1);
 
@@ -57,9 +61,14 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
     private readonly TimeProvider _timeProvider;
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly IDistributedLock? _distributedLock;
+    private readonly IDatabaseExceptionClassifier? _dbExceptionClassifier;
+    private readonly EvolutionaryGeneratorOptions _options;
 
     private int _consecutiveFailures;
+    private int _consecutiveZeroInsertCycles;
     private bool _missingDistributedLockWarningEmitted;
+    private bool _fleetSystemicAlertActive;
+    private bool _stalenessAlertActive;
 
     public EvolutionaryGeneratorWorker(
         ILogger<EvolutionaryGeneratorWorker> logger,
@@ -67,7 +76,9 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         TradingMetrics? metrics = null,
         TimeProvider? timeProvider = null,
         IWorkerHealthMonitor? healthMonitor = null,
-        IDistributedLock? distributedLock = null)
+        IDistributedLock? distributedLock = null,
+        IDatabaseExceptionClassifier? dbExceptionClassifier = null,
+        EvolutionaryGeneratorOptions? options = null)
     {
         _logger = logger;
         _scopeFactory = scopeFactory;
@@ -75,6 +86,8 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         _timeProvider = timeProvider ?? TimeProvider.System;
         _healthMonitor = healthMonitor;
         _distributedLock = distributedLock;
+        _dbExceptionClassifier = dbExceptionClassifier;
+        _options = options ?? new EvolutionaryGeneratorOptions();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -172,13 +185,18 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
                         1,
                         new KeyValuePair<string, object?>("worker", WorkerName),
                         new KeyValuePair<string, object?>("reason", "evolutionary_generator_cycle"));
+                    _metrics?.EvolutionaryConsecutiveCycleFailures.Add(_consecutiveFailures);
                     _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
                 }
 
                 try
                 {
+                    // Anti-lockstep: jitter the delay so two replicas started together
+                    // don't race on the cycle-level distributed lock at the same instant.
                     await Task.Delay(
-                        CalculateDelay(currentPollInterval, _consecutiveFailures),
+                        ApplyJitter(
+                            CalculateDelay(currentPollInterval, _consecutiveFailures),
+                            _options.PollJitterSeconds),
                         _timeProvider,
                         stoppingToken);
                 }
@@ -207,6 +225,8 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
 
         if (_distributedLock is null)
         {
+            _metrics?.EvolutionaryLockAttempts.Add(
+                1, new KeyValuePair<string, object?>("outcome", "unavailable"));
             if (!_missingDistributedLockWarningEmitted)
             {
                 _logger.LogWarning(
@@ -217,13 +237,18 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         }
         else
         {
-            var cycleLock = await _distributedLock.TryAcquireAsync(DistributedLockKey, DistributedLockTimeout, ct);
+            var lockTimeout = TimeSpan.FromSeconds(settings.LockTimeoutSeconds);
+            var cycleLock = await _distributedLock.TryAcquireAsync(DistributedLockKey, lockTimeout, ct);
             if (cycleLock is null)
             {
+                _metrics?.EvolutionaryLockAttempts.Add(
+                    1, new KeyValuePair<string, object?>("outcome", "busy"));
                 int busyBacklog = await CountPendingValidationBacklogAsync(db, ct);
                 return EvolutionaryGeneratorCycleResult.Skipped(settings, busyBacklog, "lock_busy");
             }
 
+            _metrics?.EvolutionaryLockAttempts.Add(
+                1, new KeyValuePair<string, object?>("outcome", "acquired"));
             await using (cycleLock)
             {
                 return await RunCycleCoreAsync(db, writeContext, generator, validationRunFactory, settings, ct);
@@ -258,11 +283,19 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
         string cycleId = BuildCycleId(nowUtc);
 
+        // Phase A: proposal generation.
+        var proposalStart = Stopwatch.GetTimestamp();
         var proposedCandidates = await generator.ProposeOffspringAsync(settings.MaxOffspring, ct);
+        _metrics?.EvolutionaryPhaseProposalMs.Record(Stopwatch.GetElapsedTime(proposalStart).TotalMilliseconds);
         _metrics?.EvolutionaryCandidatesProposed.Add(proposedCandidates.Count);
 
         if (proposedCandidates.Count == 0)
+        {
+            // Even on empty cycles, run the staleness check — a worker that's never
+            // proposing anything for a week needs operator visibility.
+            await UpdateStalenessAlertAsync(db, settings, nowUtc, ct);
             return EvolutionaryGeneratorCycleResult.Empty(settings, backlogBefore, proposedCandidates.Count);
+        }
 
         var eligibleParents = await LoadEligibleParentsAsync(
             db,
@@ -302,6 +335,8 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
             preparedCandidates.Add(prepared);
         }
 
+        // Phase B: dedupe load (existing strategies + active validation-queue keys).
+        var dedupeLoadStart = Stopwatch.GetTimestamp();
         var existingStrategyKeys = await LoadExistingStrategyKeysAsync(db, preparedCandidates, ct);
         var activeValidationQueueKeys = await LoadActiveValidationQueueKeysAsync(
             db,
@@ -310,6 +345,7 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
                 .Distinct(StringComparer.Ordinal)
                 .ToArray(),
             ct);
+        _metrics?.EvolutionaryPhaseDedupeLoadMs.Record(Stopwatch.GetElapsedTime(dedupeLoadStart).TotalMilliseconds);
 
         int existingStrategyCount = 0;
         int activeQueueCount = 0;
@@ -317,6 +353,8 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         int queuedBacktestCount = 0;
         int persistenceFailureCount = 0;
 
+        // Phase C: persistence (per-candidate transactions).
+        var persistenceStart = Stopwatch.GetTimestamp();
         foreach (var candidate in preparedCandidates)
         {
             ct.ThrowIfCancellationRequested();
@@ -345,6 +383,8 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
             activeValidationQueueKeys.Add(candidate.BacktestQueueKey);
         }
 
+        _metrics?.EvolutionaryPhasePersistenceMs.Record(Stopwatch.GetElapsedTime(persistenceStart).TotalMilliseconds);
+
         RecordSkippedCandidateMetrics("parent_ineligible", ineligibleParentCount);
         RecordSkippedCandidateMetrics("invalid_parameters", invalidParameterCount);
         RecordSkippedCandidateMetrics("duplicate_proposal", duplicateProposalCount);
@@ -360,7 +400,7 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
 
         int backlogDepth = await CountPendingValidationBacklogAsync(db, ct);
 
-        return new EvolutionaryGeneratorCycleResult(
+        var result = new EvolutionaryGeneratorCycleResult(
             settings,
             ProposedCandidateCount: proposedCandidates.Count,
             InsertedCandidateCount: insertedCount,
@@ -373,6 +413,14 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
             PersistenceFailureCount: persistenceFailureCount,
             BacklogDepth: backlogDepth,
             SkippedReason: null);
+
+        // Phase D: aggregate signals — fleet-systemic alert when consecutive cycles fail
+        // to insert despite proposing, staleness alert when no draft has landed for too
+        // long. Both auto-resolve.
+        await UpdateFleetSystemicAlertAsync(result, settings, nowUtc, ct);
+        await UpdateStalenessAlertAsync(db, settings, nowUtc, ct);
+
+        return result;
     }
 
     private void RecordSkippedCandidateMetrics(string reason, int count)
@@ -439,6 +487,27 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
             await transaction.CommitAsync(ct);
             return true;
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation must propagate cleanly — the cycle is shutting down. No
+            // rollback attempt (the disposal of the transaction handles it) and no metric
+            // increment, so the cancel doesn't pollute the persistence-failure counter.
+            DetachDirtyEntries(db);
+            throw;
+        }
+        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
+        {
+            // A concurrent worker (or earlier replica) already inserted a row that hits the
+            // unique index — typically the BacktestRun.ValidationQueueKey constraint. The
+            // candidate is already covered downstream, so this is a no-op, not a failure.
+            try { await transaction.RollbackAsync(ct); } catch { /* best effort */ }
+            DetachDirtyEntries(db);
+            _metrics?.EvolutionaryUniqueConstraintRaces.Add(1);
+            _logger.LogInformation(
+                "{Worker}: unique-constraint race for candidate {CandidateId} (parent {ParentStrategyId}); another writer already covered it.",
+                WorkerName, candidate.CandidateId, candidate.ParentStrategyId);
+            return false;
+        }
         catch (Exception ex)
         {
             try
@@ -463,12 +532,16 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
 
     private async Task<EvolutionaryGeneratorSettings> LoadSettingsAsync(DbContext db, CancellationToken ct)
     {
-        bool enabled = await GetBoolAsync(db, CK_Enabled, defaultValue: true, ct);
-        int configuredPollSeconds = await GetIntAsync(db, CK_PollSeconds, DefaultPollSecs, ct);
-        int configuredMaxOffspring = await GetIntAsync(db, CK_MaxOffspring, DefaultMaxOffspring, ct);
+        bool enabled = await GetBoolAsync(db, CK_Enabled, defaultValue: _options.Enabled, ct);
+        int configuredPollSeconds = await GetIntAsync(db, CK_PollSeconds, _options.PollIntervalSeconds, ct);
+        int configuredMaxOffspring = await GetIntAsync(db, CK_MaxOffspring, _options.MaxOffspringPerCycle, ct);
+        int configuredPollJitterSeconds = await GetIntAsync(db, CK_PollJitterSeconds, _options.PollJitterSeconds, ct);
+        int configuredLockTimeoutSeconds = await GetIntAsync(db, CK_LockTimeoutSeconds, _options.LockTimeoutSeconds, ct);
 
         int pollSeconds = Clamp(configuredPollSeconds, MinPollSecs, MaxPollSecs);
         int maxOffspring = Clamp(configuredMaxOffspring, MinMaxOffspring, MaxMaxOffspring);
+        int pollJitterSeconds = Clamp(configuredPollJitterSeconds, 0, 86_400);
+        int lockTimeoutSeconds = Clamp(configuredLockTimeoutSeconds, 0, 300);
 
         if (configuredPollSeconds != pollSeconds)
         {
@@ -491,7 +564,12 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         return new EvolutionaryGeneratorSettings(
             Enabled: enabled,
             PollInterval: TimeSpan.FromSeconds(pollSeconds),
-            MaxOffspring: maxOffspring);
+            MaxOffspring: maxOffspring,
+            PollJitterSeconds: pollJitterSeconds,
+            LockTimeoutSeconds: lockTimeoutSeconds,
+            FailureBackoffCapShift: Clamp(_options.FailureBackoffCapShift, 0, 16),
+            FleetSystemicConsecutiveZeroInsertCycles: Math.Max(1, _options.FleetSystemicConsecutiveZeroInsertCycles),
+            StalenessAlertHours: Math.Max(1, _options.StalenessAlertHours));
     }
 
     private async Task<Dictionary<long, EligibleParentInfo>> LoadEligibleParentsAsync(
@@ -736,7 +814,9 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
             .Select(config => config.Value)
             .FirstOrDefaultAsync(ct);
 
-        return int.TryParse(raw, out var value) ? value : fallback;
+        return int.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? value
+            : fallback;
     }
 
     private static async Task<bool> GetBoolAsync(DbContext db, string key, bool defaultValue, CancellationToken ct)
@@ -753,7 +833,7 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
         if (bool.TryParse(raw, out var boolValue))
             return boolValue;
 
-        if (int.TryParse(raw, out var intValue))
+        if (int.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var intValue))
             return intValue != 0;
 
         return defaultValue;
@@ -793,7 +873,12 @@ public sealed class EvolutionaryGeneratorWorker : BackgroundService
     internal readonly record struct EvolutionaryGeneratorSettings(
         bool Enabled,
         TimeSpan PollInterval,
-        int MaxOffspring);
+        int MaxOffspring,
+        int PollJitterSeconds,
+        int LockTimeoutSeconds,
+        int FailureBackoffCapShift,
+        int FleetSystemicConsecutiveZeroInsertCycles,
+        int StalenessAlertHours);
 
     internal readonly record struct EvolutionaryGeneratorCycleResult(
         EvolutionaryGeneratorSettings Settings,

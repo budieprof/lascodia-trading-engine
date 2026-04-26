@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -7,97 +10,53 @@ using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Integration event handler that reacts to <see cref="MLModelActivatedIntegrationEvent"/>
-/// by writing a structured <see cref="DecisionLog"/> audit entry that captures model
-/// promotion details: which model was activated, its direction accuracy, the training run
-/// that produced it, and which previous model (if any) was superseded.
-///
-/// <para>
-/// <b>When it fires:</b> After <c>MLTrainingWorker</c> or <c>MLShadowArbiterWorker</c>
-/// promotes a newly trained <c>MLModel</c> to <c>Active</c> status and publishes
-/// <see cref="MLModelActivatedIntegrationEvent"/> onto the event bus.
-/// </para>
-///
-/// <para>
-/// <b>What it does:</b>
-/// <list type="number">
-///   <item>Constructs a human-readable "replaced model" clause when a previous champion
-///         model is being superseded, for inclusion in the audit reason string.</item>
-///   <item>Logs the activation at Information level immediately on arrival.</item>
-///   <item>Performs an idempotency check against <see cref="DecisionLog"/> so that
-///         re-delivered events do not produce duplicate audit rows.</item>
-///   <item>Dispatches a <see cref="LogDecisionCommand"/> via MediatR to persist the
-///         promotion record — symbol, timeframe, training run ID, direction accuracy,
-///         and any replaced model ID.</item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Pipeline position:</b>
-/// <c>MLTrainingWorker trains model → MLShadowArbiterWorker evaluates challenger →
-/// ActivateModelCommand promotes model → MLModelActivatedIntegrationEvent published →
-/// MLModelActivatedEventHandler (audit log) +
-/// MLShadowArbiterWorker (starts shadow evaluation of challenger vs. new champion)</c>
-/// </para>
-///
-/// <para>
-/// <b>Why no cache invalidation:</b> <see cref="Services.MLSignalScorer"/> queries the
-/// active model from the database on every scoring call — it holds no in-process cache.
-/// Therefore this handler does not need to invalidate or refresh any model reference;
-/// the next scoring call will automatically pick up the newly active model from the
-/// read context. This keeps the handler simple and avoids distributed cache consistency
-/// problems.
-/// </para>
-///
-/// <para>
-/// <b>Compliance note:</b> Every model promotion must be traceable for audit and
-/// regulatory purposes. The <see cref="DecisionLog"/> entry written here is the
-/// authoritative record of when a model was put into production, what its accuracy was,
-/// and what it replaced. This is queried by the back-office ML governance UI.
-/// </para>
-///
-/// <para>
-/// <b>Design note — no retry loop:</b> Like <see cref="PositionClosedEventHandler"/>,
-/// this handler relies on the event bus's own re-delivery mechanism for resilience. The
-/// idempotency check makes re-delivery safe. A self-managed retry loop is omitted here
-/// because the audit write is non-critical and the event bus provides at-least-once
-/// delivery guarantees.
-/// </para>
-///
-/// <para>
-/// <b>DI note:</b> Registered as <c>Transient</c> via <c>AutoRegisterEventHandler</c>
-/// and subscribed to the event bus at application startup. A new DI scope is created per
-/// invocation via <see cref="IServiceScopeFactory"/> to safely consume scoped services.
-/// </para>
+/// Writes the governance audit record for <see cref="MLModelActivatedIntegrationEvent"/>.
+/// The handler is deliberately state-aware: it verifies the durable <see cref="MLModel"/>
+/// activation before logging, uses the write context for idempotency so read-replica lag
+/// cannot duplicate audits, and records structured context for post-incident review.
 /// </summary>
 public sealed class MLModelActivatedEventHandler : IIntegrationEventHandler<MLModelActivatedIntegrationEvent>
 {
+    private const string EntityType = "MLModel";
+    private const string DecisionType = "ModelActivated";
+    private const string Outcome = "Active";
+    private const string Source = nameof(MLModelActivatedEventHandler);
+    private static readonly TimeSpan AuditLockTimeout = TimeSpan.FromSeconds(10);
+    private static readonly JsonSerializerOptions AuditJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() }
+    };
+
     // IServiceScopeFactory is used instead of injecting scoped services directly because
     // this handler is Transient but is invoked from the singleton event-bus consumer loop.
     // Creating an explicit scope per Handle call prevents EF Core DbContext sharing across
     // concurrent event deliveries.
     private readonly IServiceScopeFactory                   _scopeFactory;
     private readonly ILogger<MLModelActivatedEventHandler>  _logger;
+    private readonly IDistributedLock?                      _distributedLock;
 
     /// <summary>
     /// Initialises the handler with the scope factory and logger.
     /// </summary>
     /// <param name="scopeFactory">
     /// Used to create a fresh DI scope per event invocation, ensuring scoped services
-    /// such as <see cref="IReadApplicationDbContext"/> and <see cref="IMediator"/> are
+    /// such as <see cref="IWriteApplicationDbContext"/> and <see cref="IMediator"/> are
     /// properly isolated and disposed after each call.
     /// </param>
     /// <param name="logger">Structured logger for diagnostics and duplicate-skip notices.</param>
     public MLModelActivatedEventHandler(
         IServiceScopeFactory                  scopeFactory,
-        ILogger<MLModelActivatedEventHandler> logger)
+        ILogger<MLModelActivatedEventHandler> logger,
+        IDistributedLock?                     distributedLock = null)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _scopeFactory    = scopeFactory;
+        _logger          = logger;
+        _distributedLock = distributedLock;
     }
 
     /// <summary>
@@ -106,8 +65,8 @@ public sealed class MLModelActivatedEventHandler : IIntegrationEventHandler<MLMo
     /// promotion audit entry.
     /// </summary>
     /// <param name="event">
-    /// The integration event published by <c>MLTrainingWorker</c> or
-    /// <c>MLShadowArbiterWorker</c>. Consumed fields:
+    /// The integration event published when an ML model becomes production-serving.
+    /// Consumed fields:
     /// <list type="bullet">
     ///   <item><see cref="MLModelActivatedIntegrationEvent.NewModelId"/> — primary key of
     ///         the newly active <c>MLModel</c>; used as <c>DecisionLog.EntityId</c> and for
@@ -127,58 +86,216 @@ public sealed class MLModelActivatedEventHandler : IIntegrationEventHandler<MLMo
     /// </param>
     public async Task Handle(MLModelActivatedIntegrationEvent @event)
     {
-        // Build the "replaced model" suffix once and reuse it in both the log message
-        // and the DecisionLog reason string. An empty string is used rather than a null
-        // check later to keep the string interpolations clean.
-        string replacedClause = @event.OldModelId.HasValue
-            ? $"; replaced model {@event.OldModelId}"
-            : string.Empty;
+        ArgumentNullException.ThrowIfNull(@event);
 
-        // Log immediately so the activation is visible in structured logs regardless
-        // of whether the subsequent database write succeeds. Useful when debugging
-        // model promotion issues in production.
-        _logger.LogInformation(
-            "MLModelActivatedEventHandler: model {NewModelId} activated for {Symbol}/{Timeframe} " +
-            "(accuracy={Accuracy:P2}, trainingRun={RunId}{Replaced})",
-            @event.NewModelId, @event.Symbol, @event.Timeframe,
-            @event.DirectionAccuracy, @event.TrainingRunId, replacedClause);
+        if (!IsValidEnvelope(@event))
+            return;
 
-        // Create a fresh DI scope to safely resolve scoped services.
-        using var scope = _scopeFactory.CreateScope();
+        await using var activationLock = await TryAcquireActivationLockAsync(@event.NewModelId);
+
+        // Create a fresh async DI scope to safely resolve scoped EF Core services.
+        await using var scope = _scopeFactory.CreateAsyncScope();
         var mediator    = scope.ServiceProvider.GetRequiredService<IMediator>();
-        var readContext = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var writeDb = writeContext.GetDbContext();
 
-        // Idempotency: skip if this activation was already logged.
-        // Uses the triple-key pattern (EntityType + EntityId + DecisionType) consistent
-        // with PositionClosedEventHandler and other handlers in this codebase, ensuring
-        // safe at-least-once re-delivery from RabbitMQ/Kafka without duplicate audit rows.
-        bool alreadyLogged = await readContext.GetDbContext()
-            .Set<DecisionLog>()
-            .AnyAsync(d => d.EntityType == "MLModel" &&
-                           d.EntityId == @event.NewModelId &&
-                           d.DecisionType == "ModelActivated");
-        if (alreadyLogged)
+        var model = await writeDb
+            .Set<MLModel>()
+            .AsNoTracking()
+            .Where(m => m.Id == @event.NewModelId)
+            .Select(m => new ActivatedModelSnapshot(
+                m.Id,
+                m.Symbol,
+                m.Timeframe,
+                m.ModelVersion,
+                m.Status,
+                m.IsActive,
+                m.ActivatedAt,
+                m.DirectionAccuracy,
+                m.TrainingSamples,
+                m.LearnerArchitecture,
+                m.PreviousChampionModelId))
+            .FirstOrDefaultAsync();
+
+        if (model is null)
         {
-            _logger.LogDebug(
-                "MLModelActivatedEventHandler: decision log already exists for model {Id} — skipping duplicate",
-                @event.NewModelId);
+            _logger.LogWarning(
+                "{Handler}: model {ModelId} not found for activation event {EventId}; skipping audit.",
+                Source, @event.NewModelId, @event.Id);
             return;
         }
 
-        // Persist the governance audit entry via MediatR. The Reason string is intentionally
-        // verbose — it is the primary human-readable compliance record of the model promotion.
-        // Outcome="Active" mirrors the MLModelStatus enum value so that the audit trail can
-        // be filtered or aggregated by outcome without parsing the reason string.
+        if (!HasDurableActivation(model))
+        {
+            _logger.LogWarning(
+                "{Handler}: model {ModelId} has status={Status}, isActive={IsActive}, activatedAt={ActivatedAt}; " +
+                "event {EventId} is stale or out of order, skipping audit.",
+                Source, model.Id, model.Status, model.IsActive, model.ActivatedAt, @event.Id);
+            return;
+        }
+
+        if (!EventMatchesModel(@event, model))
+        {
+            _logger.LogWarning(
+                "{Handler}: activation event {EventId} for model {ModelId} has {EventSymbol}/{EventTimeframe}, " +
+                "but durable model row is {ModelSymbol}/{ModelTimeframe}; skipping corrupt audit.",
+                Source, @event.Id, model.Id, @event.Symbol, @event.Timeframe, model.Symbol, model.Timeframe);
+            return;
+        }
+
+        // Idempotency: query the write context rather than a read replica so a recent audit
+        // write is visible to immediately redelivered events.
+        bool alreadyLogged = await writeDb
+            .Set<DecisionLog>()
+            .AnyAsync(d => d.EntityType == EntityType &&
+                           d.EntityId == model.Id &&
+                           d.DecisionType == DecisionType);
+        if (alreadyLogged)
+        {
+            _logger.LogDebug(
+                "{Handler}: decision log already exists for model {ModelId}; skipping duplicate event {EventId}.",
+                Source, model.Id, @event.Id);
+            return;
+        }
+
+        var replacedModelId = @event.OldModelId ?? model.PreviousChampionModelId;
+        if (@event.OldModelId.HasValue &&
+            model.PreviousChampionModelId.HasValue &&
+            @event.OldModelId.Value != model.PreviousChampionModelId.Value)
+        {
+            _logger.LogWarning(
+                "{Handler}: activation event {EventId} says model {ModelId} replaced {EventOldModelId}, " +
+                "but durable PreviousChampionModelId is {ModelOldModelId}; audit will preserve both values.",
+                Source, @event.Id, model.Id, @event.OldModelId.Value, model.PreviousChampionModelId.Value);
+        }
+
+        var auditAccuracy = NormalizeAccuracy(model.DirectionAccuracy ?? @event.DirectionAccuracy);
+        var trainingRunLabel = FormatTrainingRun(@event.TrainingRunId);
+        string replacedClause = replacedModelId.HasValue
+            ? $"; replaced model {replacedModelId.Value}"
+            : string.Empty;
+
+        _logger.LogInformation(
+            "{Handler}: model {ModelId} activated for {Symbol}/{Timeframe} " +
+            "(accuracy={Accuracy:P2}, trainingRun={TrainingRunId}{Replaced})",
+            Source, model.Id, model.Symbol, model.Timeframe, auditAccuracy, @event.TrainingRunId, replacedClause);
+
         await mediator.Send(new LogDecisionCommand
         {
-            EntityType   = "MLModel",
-            EntityId     = @event.NewModelId,
-            DecisionType = "ModelActivated",
-            Outcome      = "Active",
-            Reason       = $"{@event.Symbol}/{@event.Timeframe} model promoted from training run " +
-                           $"{@event.TrainingRunId} (DirectionAccuracy={@event.DirectionAccuracy:P2})" +
+            EntityType   = EntityType,
+            EntityId     = model.Id,
+            DecisionType = DecisionType,
+            Outcome      = Outcome,
+            Reason       = $"{model.Symbol}/{model.Timeframe} model promoted from training run " +
+                           $"{trainingRunLabel} (DirectionAccuracy={FormatPercent(auditAccuracy)})" +
                            replacedClause,
-            Source       = "MLModelActivatedEventHandler"
+            ContextJson  = BuildContextJson(@event, model, auditAccuracy),
+            Source       = Source
         });
     }
+
+    private async Task<IAsyncDisposable?> TryAcquireActivationLockAsync(long modelId)
+    {
+        if (_distributedLock is null)
+            return null;
+
+        var lockKey = $"ml:model-activation-audit:{modelId}";
+        var lockHandle = await _distributedLock.TryAcquireAsync(lockKey, AuditLockTimeout);
+        if (lockHandle is not null)
+            return lockHandle;
+
+        _logger.LogWarning(
+            "{Handler}: could not acquire audit idempotency lock {LockKey} within {TimeoutSeconds}s.",
+            Source, lockKey, AuditLockTimeout.TotalSeconds);
+
+        throw new TimeoutException($"Could not acquire {Source} idempotency lock for model {modelId}.");
+    }
+
+    private bool IsValidEnvelope(MLModelActivatedIntegrationEvent @event)
+    {
+        if (@event.NewModelId <= 0)
+        {
+            _logger.LogWarning(
+                "{Handler}: activation event {EventId} has invalid NewModelId={ModelId}; skipping.",
+                Source, @event.Id, @event.NewModelId);
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(@event.Symbol))
+        {
+            _logger.LogWarning(
+                "{Handler}: activation event {EventId} for model {ModelId} has an empty symbol; skipping.",
+                Source, @event.Id, @event.NewModelId);
+            return false;
+        }
+
+        if (@event.TrainingRunId <= 0)
+        {
+            _logger.LogWarning(
+                "{Handler}: activation event {EventId} for model {ModelId} has invalid TrainingRunId={TrainingRunId}; " +
+                "continuing with an unknown training-run label.",
+                Source, @event.Id, @event.NewModelId, @event.TrainingRunId);
+        }
+
+        return true;
+    }
+
+    private static bool HasDurableActivation(ActivatedModelSnapshot model)
+        => model.ActivatedAt.HasValue &&
+           model.Status is MLModelStatus.Active or MLModelStatus.Superseded;
+
+    private static bool EventMatchesModel(
+        MLModelActivatedIntegrationEvent @event,
+        ActivatedModelSnapshot model)
+        => string.Equals(@event.Symbol.Trim(), model.Symbol.Trim(), StringComparison.OrdinalIgnoreCase) &&
+           @event.Timeframe == model.Timeframe;
+
+    private static decimal NormalizeAccuracy(decimal accuracy)
+        => Math.Clamp(accuracy, 0m, 1m);
+
+    private static string FormatPercent(decimal value)
+        => string.Create(
+            CultureInfo.InvariantCulture,
+            $"{value * 100m:0.00}%");
+
+    private static string FormatTrainingRun(long trainingRunId)
+        => trainingRunId > 0
+            ? trainingRunId.ToString(CultureInfo.InvariantCulture)
+            : "unknown";
+
+    private static string BuildContextJson(
+        MLModelActivatedIntegrationEvent @event,
+        ActivatedModelSnapshot model,
+        decimal auditAccuracy)
+        => JsonSerializer.Serialize(new
+        {
+            EventId = @event.Id,
+            @event.SequenceNumber,
+            EventActivatedAt = @event.ActivatedAt,
+            EventDirectionAccuracy = @event.DirectionAccuracy,
+            EventOldModelId = @event.OldModelId,
+            ModelId = model.Id,
+            model.ModelVersion,
+            ModelStatus = model.Status,
+            model.IsActive,
+            ModelActivatedAt = model.ActivatedAt,
+            ModelDirectionAccuracy = model.DirectionAccuracy,
+            AuditDirectionAccuracy = auditAccuracy,
+            model.TrainingSamples,
+            model.LearnerArchitecture,
+            model.PreviousChampionModelId,
+        }, AuditJsonOptions);
+
+    private sealed record ActivatedModelSnapshot(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        string ModelVersion,
+        MLModelStatus Status,
+        bool IsActive,
+        DateTime? ActivatedAt,
+        decimal? DirectionAccuracy,
+        int TrainingSamples,
+        LearnerArchitecture LearnerArchitecture,
+        long? PreviousChampionModelId);
 }

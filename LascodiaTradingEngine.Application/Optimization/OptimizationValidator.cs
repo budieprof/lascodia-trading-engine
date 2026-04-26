@@ -19,11 +19,14 @@ namespace LascodiaTradingEngine.Application.Optimization;
 internal sealed class OptimizationValidator
 {
     private const decimal DefaultInitialBalance = 10_000m;
+    private const int DefaultMaxCacheEntries = 10_000;
 
     private readonly IBacktestEngine _backtestEngine;
     private readonly TimeProvider _timeProvider;
     private decimal _initialBalance = DefaultInitialBalance;
     private ConcurrentDictionary<string, BacktestResult>? _cache;
+    private ConcurrentQueue<string>? _cacheInsertionOrder;
+    private int _maxCacheEntries = DefaultMaxCacheEntries;
 
     public OptimizationValidator(IBacktestEngine backtestEngine, TimeProvider timeProvider)
     {
@@ -41,12 +44,23 @@ internal sealed class OptimizationValidator
     /// are evaluated multiple times across phases (coarse → seed → fine). The cache prevents
     /// redundant computation. Call <see cref="ClearCache"/> at run end.
     /// </summary>
-    internal void EnableCache() => _cache = new ConcurrentDictionary<string, BacktestResult>();
+    /// <param name="maxEntries">
+    /// Hard cap on cache size. When exceeded, the oldest entries are evicted in FIFO order
+    /// to bound memory under long searches with millions of param combinations. Floor of 100.
+    /// </param>
+    internal void EnableCache(int maxEntries = DefaultMaxCacheEntries)
+    {
+        _maxCacheEntries = Math.Max(100, maxEntries);
+        _cache = new ConcurrentDictionary<string, BacktestResult>();
+        _cacheInsertionOrder = new ConcurrentQueue<string>();
+    }
 
     /// <summary>Clears the backtest result cache. Call at the end of each optimization run.</summary>
     internal void ClearCache()
     {
         _cache = null;
+        _cacheInsertionOrder = null;
+        _maxCacheEntries = DefaultMaxCacheEntries;
         _initialBalance = DefaultInitialBalance;
     }
 
@@ -979,7 +993,23 @@ internal sealed class OptimizationValidator
         var result = await _backtestEngine.RunAsync(candidate, candles, _initialBalance, cts.Token, options);
 
         if (cacheKey is not null && cache is not null)
-            cache.TryAdd(cacheKey, result);
+        {
+            if (cache.TryAdd(cacheKey, result))
+            {
+                var order = _cacheInsertionOrder;
+                if (order is not null)
+                {
+                    order.Enqueue(cacheKey);
+                    // Bound memory: evict oldest entries when over the cap.
+                    // FIFO is sufficient because backtest results are not re-used in
+                    // a recency-biased pattern within a single optimization run.
+                    while (cache.Count > _maxCacheEntries && order.TryDequeue(out var oldest))
+                    {
+                        cache.TryRemove(oldest, out _);
+                    }
+                }
+            }
+        }
 
         return result;
     }

@@ -24,6 +24,11 @@ public sealed class MLCalibratedEdgeWorkerTest
                 AddConfig(db, "MLEdge:MinSamples", "4");
                 AddConfig(db, "MLEdge:WarnEvPips", "0.50");
                 AddConfig(db, "MLTraining:TrainingDataWindowDays", "90");
+                // Disable the K-sigma significance gate so this small-sample test
+                // exercises the EV-only critical-classification path (the gate's job is
+                // to suppress small-sample false positives — covered by a separate test).
+                AddConfig(db, "MLEdge:BootstrapResamples", "0");
+                AddConfig(db, "MLEdge:RegressionGuardK", "0");
 
                 SeedActiveModel(db, modelId: 1, symbol: "EURUSD", timeframe: Timeframe.H1);
 

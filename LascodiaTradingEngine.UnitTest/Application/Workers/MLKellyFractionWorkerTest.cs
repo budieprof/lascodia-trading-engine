@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -237,6 +238,112 @@ public class MLKellyFractionWorkerTest
     }
 
     [Fact]
+    public async Task RunOnceAsync_UsesLatestCaseInsensitiveRuntimeDisable()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLKellyFraction:Enabled", "true", ConfigDataType.String);
+        AddConfig(db, "mlkellyfraction:enabled", "false", ConfigDataType.String);
+        var model = AddModel(db);
+
+        for (int i = 0; i < 30; i++)
+            await AddPredictionAsync(db, model, wasProfitable: i < 20, directionCorrect: i < 20, magnitudePips: 10m);
+
+        var worker = CreateWorker(db);
+
+        var result = await worker.RunOnceAsync();
+
+        Assert.Equal("disabled", result.SkippedReason);
+        Assert.Empty(db.Set<MLKellyFractionLog>());
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_SkipsWhenDistributedLockIsBusy()
+    {
+        await using var db = CreateDbContext();
+        var model = AddModel(db);
+
+        for (int i = 0; i < 30; i++)
+            await AddPredictionAsync(db, model, wasProfitable: i < 20, directionCorrect: i < 20, magnitudePips: 10m);
+
+        var distributedLock = new TestDistributedLock(acquire: false);
+        var worker = CreateWorker(db, distributedLock);
+
+        var result = await worker.RunOnceAsync();
+
+        Assert.Equal("lock_busy", result.SkippedReason);
+        Assert.Equal(1, distributedLock.Attempts);
+        Assert.Empty(db.Set<MLKellyFractionLog>());
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_DoesNotMixRiskMultipleWithFallbackMagnitudePopulation()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLKellyFraction:MaxAbsKelly", "1.0", ConfigDataType.Decimal);
+        AddNoShrinkageConfig(db);
+        AddCurrencyPair(db);
+        var model = AddModel(db);
+
+        for (int i = 0; i < 20; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: true, directionCorrect: true, magnitudePips: 100m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: 1_000m, openLots: 1m);
+        }
+
+        for (int i = 0; i < 10; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: false, directionCorrect: false, magnitudePips: 1m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: -1_000m, openLots: 1m);
+        }
+
+        for (int i = 0; i < 30; i++)
+            await AddPredictionAsync(db, model, wasProfitable: true, directionCorrect: true, magnitudePips: 500m);
+
+        var worker = CreateWorker(db);
+
+        await worker.RunOnceAsync();
+
+        var log = await db.Set<MLKellyFractionLog>().SingleAsync(l => l.MLModelId == model.Id);
+
+        Assert.Equal("RiskMultiple", log.NormalizationMode);
+        Assert.Equal(30, log.UsableSamples);
+        Assert.Equal(60, log.TotalResolvedSamples);
+        Assert.Equal(1.0 / 3.0, log.KellyFraction, precision: 6);
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_UsesWeightedPerLotForPartialPositionFills()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLKellyFraction:MaxAbsKelly", "1.0", ConfigDataType.Decimal);
+        AddNoShrinkageConfig(db);
+        var model = AddModel(db);
+
+        for (int i = 0; i < 20; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: true, directionCorrect: true, magnitudePips: 10m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: 10m, openLots: 1m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: 90m, openLots: 9m);
+        }
+
+        for (int i = 0; i < 10; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: false, directionCorrect: false, magnitudePips: 10m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: -10m, openLots: 1m);
+        }
+
+        var worker = CreateWorker(db);
+
+        await worker.RunOnceAsync();
+
+        var log = await db.Set<MLKellyFractionLog>().SingleAsync(l => l.MLModelId == model.Id);
+
+        Assert.Equal("PnlPerLot", log.NormalizationMode);
+        Assert.Equal(1.0, log.WinLossRatio, precision: 6);
+        Assert.Equal(1.0 / 3.0, log.KellyFraction, precision: 6);
+    }
+
+    [Fact]
     public void ConservativeKellyHelpers_ShrinkAndLowerBoundNoisyEdges()
     {
         var config = new MLKellyFractionWorker.KellyRuntimeConfig(
@@ -270,7 +377,10 @@ public class MLKellyFractionWorkerTest
         return new WriteApplicationDbContext(options, new HttpContextAccessor());
     }
 
-    private static MLKellyFractionWorker CreateWorker(WriteApplicationDbContext db)
+    private static MLKellyFractionWorker CreateWorker(
+        WriteApplicationDbContext db,
+        IDistributedLock? distributedLock = null,
+        MLKellyFractionOptions? options = null)
     {
         var readContext = new Mock<IReadApplicationDbContext>();
         readContext.Setup(c => c.GetDbContext()).Returns(db);
@@ -286,7 +396,9 @@ public class MLKellyFractionWorkerTest
         return new MLKellyFractionWorker(
             provider.GetRequiredService<IServiceScopeFactory>(),
             Mock.Of<ILogger<MLKellyFractionWorker>>(),
-            new TestTimeProvider(Now));
+            new TestTimeProvider(Now),
+            distributedLock,
+            options: options ?? new MLKellyFractionOptions());
     }
 
     private static MLModel AddModel(WriteApplicationDbContext db, bool isSuppressed = false)
@@ -425,5 +537,24 @@ public class MLKellyFractionWorkerTest
     {
         AddConfig(db, "MLKellyFraction:PriorTrades", "0", ConfigDataType.Decimal);
         AddConfig(db, "MLKellyFraction:WinRateLowerBoundZ", "0", ConfigDataType.Decimal);
+    }
+
+    private sealed class TestDistributedLock(bool acquire) : IDistributedLock
+    {
+        public int Attempts { get; private set; }
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+            => TryAcquireAsync(lockKey, TimeSpan.Zero, ct);
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+        {
+            Attempts++;
+            return Task.FromResult<IAsyncDisposable?>(acquire ? new Handle() : null);
+        }
+
+        private sealed class Handle : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 }

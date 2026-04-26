@@ -396,7 +396,8 @@ public class StrategyScreeningEngine
         int walkForwardPassed = 0;
         int walkForwardMask = 0;
         int? walkForwardRequiredForScore = null;
-        if (allCandles.Count >= 200)
+        bool walkForwardBypassed = allCandles.Count < 200;
+        if (!walkForwardBypassed)
         {
             (walkForwardPassed, walkForwardMask) = await RunWalkForwardMiniValidationAsync(
                 tempStrategy, allCandles, screeningOptions, config, thresholds, ct);
@@ -420,7 +421,7 @@ public class StrategyScreeningEngine
             walkForwardMask = (1 << config.WalkForwardWindowCount) - 1; // All bits set
         }
 
-        gateTrace.Add(new("WalkForward", true, gateSw.Elapsed.TotalMilliseconds));
+        gateTrace.Add(new("WalkForward", true, gateSw.Elapsed.TotalMilliseconds) { Bypassed = walkForwardBypassed });
         gateSw.Restart();
 
         // ── Lookahead audit (continuity check) ─────────────────────────────
@@ -429,12 +430,11 @@ public class StrategyScreeningEngine
         // concatenation of the IS and OOS backtests. If the evaluator or
         // backtest engine is silently consuming future candles around the
         // IS→OOS boundary (a common lookahead failure mode), the full-range
-        // run will produce a materially different trade count / PnL. Tolerances
-        // are deliberately generous (50% defaults) because legitimate warmup
-        // differences exist — this gate is tuned to catch gross leakage,
-        // not millimetre precision. Audit failures are unlikely false positives
-        // but easy false negatives, so the generous threshold is by design.
-        if (config.LookaheadAuditEnabled && allCandles.Count >= 200)
+        // run will produce a materially different trade count / PnL. Default
+        // 20% tolerance accommodates legitimate warmup differences while
+        // catching subtle peeking; tightening below ~10% risks false positives.
+        bool lookaheadBypassed = !config.LookaheadAuditEnabled || allCandles.Count < 200;
+        if (!lookaheadBypassed)
         {
             BacktestResult? fullResult = null;
             try
@@ -490,7 +490,7 @@ public class StrategyScreeningEngine
             }
         }
 
-        gateTrace.Add(new("LookaheadAudit", true, gateSw.Elapsed.TotalMilliseconds));
+        gateTrace.Add(new("LookaheadAudit", true, gateSw.Elapsed.TotalMilliseconds) { Bypassed = lookaheadBypassed });
         gateSw.Restart();
 
         // ── Monte Carlo permutation test (#6: variable seed) ──
@@ -891,10 +891,19 @@ public class StrategyScreeningEngine
     }
 
     /// <summary>
-    /// Complementary Monte Carlo test: shuffles trade ordering (Fisher-Yates) to test whether
-    /// the strategy's Sharpe ratio depends on trade sequence. A strategy whose Sharpe survives
-    /// sign-flipping but collapses under shuffle has serial PnL autocorrelation — a fragility
-    /// the sign-flip test alone cannot detect.
+    /// Complementary Monte Carlo test: shuffles trade ordering (Fisher-Yates) and
+    /// compares the resulting equity-curve max drawdown to the actual sequence's
+    /// drawdown. This catches serial PnL autocorrelation that the sign-flip test
+    /// cannot — a strategy whose wins and losses cluster favourably (low actual
+    /// drawdown) versus random orderings has a real path-dependent edge; a
+    /// strategy whose drawdown profile is indistinguishable from random orderings
+    /// of the same PnL set is fragile to sequence luck.
+    ///
+    /// Compares max drawdown rather than Sharpe because mean/stddev are
+    /// permutation-invariant — only path-dependent metrics produce a meaningful
+    /// shuffle distribution. Returns the fraction of permutations whose
+    /// drawdown was at least as good (≤) as the actual ordering; small p-values
+    /// indicate the actual sequence is significantly better than chance.
     /// </summary>
     internal static double RunMonteCarloShuffleTest(
         IReadOnlyList<BacktestTrade> trades, decimal initialBalance, int permutations, int seed)
@@ -902,9 +911,14 @@ public class StrategyScreeningEngine
         if (trades.Count < 5) return 0.0;
 
         var pnls = trades.Select(t => (double)t.PnL).ToArray();
-        double actualSharpe = ComputeSharpeFromPnlArray(pnls);
-        if (double.IsNaN(actualSharpe) || double.IsInfinity(actualSharpe))
-            return 1.0;
+        double initial = (double)initialBalance;
+        double actualMaxDD = ComputeMaxDrawdownFromPnlArray(pnls, initial);
+
+        // Equity that never dips below its running peak has no drawdown for the
+        // shuffle distribution to beat. Treat as significant (p=0) — the
+        // sequence is monotonically improving and there is nothing to refute.
+        if (actualMaxDD <= 0.0)
+            return 0.0;
 
         int beatCount = 0;
         var rng = new Random(seed);
@@ -919,12 +933,41 @@ public class StrategyScreeningEngine
                 (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
             }
 
-            double syntheticSharpe = ComputeSharpeFromPnlArray(shuffled);
-            if (syntheticSharpe >= actualSharpe)
+            double syntheticMaxDD = ComputeMaxDrawdownFromPnlArray(shuffled, initial);
+            // Lower drawdown is better — a synthetic ordering "beats" the
+            // actual when its drawdown is ≤ the actual's.
+            if (syntheticMaxDD <= actualMaxDD)
                 beatCount++;
         }
 
         return (double)beatCount / permutations;
+    }
+
+    /// <summary>
+    /// Computes the maximum peak-to-trough drawdown of the equity curve produced
+    /// by walking <paramref name="pnls"/> sequentially against <paramref name="initialBalance"/>.
+    /// Returns drawdown as a fraction of the running peak (0..1).
+    /// </summary>
+    internal static double ComputeMaxDrawdownFromPnlArray(double[] pnls, double initialBalance)
+    {
+        if (pnls.Length == 0) return 0;
+
+        double equity = initialBalance;
+        double peak = initialBalance;
+        double maxDD = 0;
+
+        for (int i = 0; i < pnls.Length; i++)
+        {
+            equity += pnls[i];
+            if (equity > peak) peak = equity;
+            if (peak > 0)
+            {
+                double dd = (peak - equity) / peak;
+                if (dd > maxDD) maxDD = dd;
+            }
+        }
+
+        return maxDD;
     }
 
     /// <summary>Computes Sharpe ratio from a raw PnL array (mean / stddev).</summary>
@@ -1349,21 +1392,21 @@ public sealed record ScreeningConfig
 
     /// <summary>
     /// Maximum allowed relative delta between the full-range trade count and
-    /// (IS + OOS) trade counts. Defaults to 0.50 (50%). A perfectly-warmed-up
-    /// evaluator typically sits within ~10–20%; 50% leaves room for legitimate
-    /// warmup effects while still catching gross lookahead. Delta computed as
+    /// (IS + OOS) trade counts. Defaults to 0.20 (20%) — a perfectly-warmed-up
+    /// evaluator typically sits within ~10%, so 20% leaves room for legitimate
+    /// warmup effects while catching subtle leakage. Delta computed as
     /// <c>|full − (is + oos)| / max(1, is + oos)</c>.
     /// </summary>
-    public double LookaheadAuditMaxTradeCountDelta { get; init; } = 0.50;
+    public double LookaheadAuditMaxTradeCountDelta { get; init; } = 0.20;
 
     /// <summary>
     /// Maximum allowed relative delta between the full-range net profit and
     /// (IS + OOS) combined net profit, using the IS+OOS magnitude as the
-    /// denominator. Defaults to 0.50 (50%). Trade count alone can match while
+    /// denominator. Defaults to 0.20 (20%). Trade count alone can match while
     /// PnL diverges when lookahead produces different exit timings, so both
     /// bounds are enforced.
     /// </summary>
-    public double LookaheadAuditMaxPnlDelta { get; init; } = 0.50;
+    public double LookaheadAuditMaxPnlDelta { get; init; } = 0.20;
 
     /// <summary>
     /// Fraction of the full candle range to skip between each walk-forward
@@ -1437,4 +1480,15 @@ public sealed record ScreeningOutcome
 }
 
 /// <summary>Per-gate timing and pass/fail trace for screening pipeline diagnostics.</summary>
-public sealed record ScreeningGateTrace(string Gate, bool Passed, double DurationMs);
+public sealed record ScreeningGateTrace(string Gate, bool Passed, double DurationMs)
+{
+    /// <summary>
+    /// True when the gate was skipped entirely (insufficient input or explicit
+    /// config disable) rather than evaluated. Distinct from <c>Passed=true</c>:
+    /// a bypassed gate was not run, so its <c>true</c> outcome should be read
+    /// as "untested," not "approved." Audit and monitoring should surface
+    /// candidates approved with bypassed gates so short-history strategies
+    /// don't silently skip walk-forward or lookahead validation.
+    /// </summary>
+    public bool Bypassed { get; init; }
+}

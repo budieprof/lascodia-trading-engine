@@ -1,14 +1,18 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Services;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -25,11 +29,28 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// failures (for example Torch/libtorch bootstrap failures) or after exceeding a non-infra
 /// failure budget within the rotation window, without being banned permanently.
 /// </remarks>
-public sealed class MLArchitectureRotationWorker : BackgroundService
+public sealed partial class MLArchitectureRotationWorker : BackgroundService
 {
     internal const string WorkerName = nameof(MLArchitectureRotationWorker);
 
     private const string DistributedLockKey = "workers:ml-architecture-rotation:cycle";
+    private const string StaleContextAlertDeduplicationPrefix = "ml-architecture-rotation-stale:";
+    private const int AlertConditionMaxLength = 1000;
+
+    // Knob names that are overridable per (Symbol, Timeframe) context. The override-token
+    // validator flags any override key whose final segment isn't in this set so operators
+    // see typos like "WidnowDays" instead of having the row silently fall through to the
+    // global default.
+    private static readonly string[] ValidOverrideKnobs =
+    [
+        "MinRunsPerWindow",
+        "WindowDays",
+        "CooldownMinutes",
+        "MaxFailuresPerWindow",
+        "ActiveRunFreshnessHours",
+        "InfraFailureLookbackHours",
+        "TrainingDataWindowDays",
+    ];
 
     private const string CK_Enabled = "MLArchitectureRotation:Enabled";
     private const string CK_PollSecs = "MLArchitectureRotation:PollIntervalSeconds";
@@ -45,6 +66,9 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
     private const string CK_MaxPendingScheduledRuns = "MLArchitectureRotation:MaxPendingScheduledRuns";
     private const string CK_MaxFailuresPerWindow = "MLArchitectureRotation:MaxFailuresPerWindow";
     private const string CK_InfraFailurePatterns = "MLArchitectureRotation:InfraFailurePatterns";
+    private const string CK_MaxDegreeOfParallelism = "MLArchitectureRotation:MaxDegreeOfParallelism";
+    private const string CK_LongCycleWarnSeconds = "MLArchitectureRotation:LongCycleWarnSeconds";
+    private const string CK_StaleContextAlertEnabled = "MLArchitectureRotation:StaleContextAlertEnabled";
 
     private const int DefaultPollSeconds = 2 * 60 * 60;
     private const int MinPollSeconds = 60;
@@ -90,6 +114,24 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
     private const int MinMaxFailuresPerWindow = 1;
     private const int MaxMaxFailuresPerWindow = 100;
 
+    // Bounded in-process concurrency for per-context evaluation. Default 1 preserves
+    // strictly-sequential semantics; bumping fans out to N concurrent (context, save,
+    // metrics) chains, each in its own DI scope. Per-iteration save isolation means
+    // a single context's persistence failure no longer rolls back the whole cycle.
+    private const int DefaultMaxDegreeOfParallelism = 1;
+    private const int MinMaxDegreeOfParallelism = 1;
+    private const int MaxMaxDegreeOfParallelism = 16;
+
+    // Wall-clock cycle warning threshold. The cycle-level distributed lock is held for
+    // the duration of one cycle; if cycle wall-time approaches the lock TTL the lock
+    // can be re-acquired by another replica before this one finishes. The duration
+    // histogram with the parallelism tag is the source-of-truth alerting signal; this
+    // log is the operator's prompt to verify the IDistributedLock TTL is at least that
+    // long.
+    private const int DefaultLongCycleWarnSeconds = 300;
+    private const int MinLongCycleWarnSeconds = 0;
+    private const int MaxLongCycleWarnSeconds = 24 * 60 * 60;
+
     private const int BasePriority = 5;
     private const int StarvedPriority = 10;
 
@@ -117,6 +159,10 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
     private int _consecutiveFailures;
     private bool _missingDistributedLockWarningEmitted;
 
+    // Hashed signature of the unmatched-tokens set last reported by the override-key
+    // validator. Same dedup primitive as the calibration / edge workers. 0 = empty.
+    private long _lastUnmatchedTokensSignature;
+
     private readonly record struct ActiveContext(string Symbol, Timeframe Timeframe);
 
     private readonly record struct TrainingRunProjection(
@@ -132,7 +178,43 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
     private readonly record struct ContextRotationOutcome(
         int QueuedRuns,
         int SkippedArchitectures,
-        bool BackpressureHit);
+        bool BackpressureHit,
+        bool AllEligibleSuppressed);
+
+    /// <summary>
+    /// Mutable per-cycle state shared by every iteration of the parallel context loop.
+    /// Wrapped in one heap object so the parallel lambda captures <c>ctx</c> instead of
+    /// N individual locals; counters atomic-incremented through <c>ref ctx.Field</c>.
+    /// </summary>
+    /// <remarks>
+    /// Public mutable fields are deliberate — the only way to provide stable addresses
+    /// for <c>Interlocked.Increment(ref ctx.Field)</c> from outside. Class is private
+    /// and scoped to one in-flight cycle (cycles are serialised by the cycle-level
+    /// distributed lock), so the open-mutable shape never escapes.
+    /// </remarks>
+    private sealed class CycleIteration
+    {
+        public required MLArchitectureRotationWorkerSettings Settings;
+        public DateTime NowUtc;
+        public required IReadOnlyList<LearnerArchitecture> EligibleArchitectures;
+        public required IReadOnlyDictionary<(string Symbol, Timeframe Timeframe), List<TrainingRunProjection>> RunsByContext;
+        public required IReadOnlyDictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>> OverridesByContext;
+        public ConcurrentDictionary<(string Symbol, Timeframe Timeframe), byte> ActiveStaleContextAlertKeys = new();
+
+        // Counters mutated atomically by Interlocked through `ref ctx.Field`.
+        public int ContextsProcessed;
+        public int QueuedRuns;
+        public int SkippedArchitectures;
+        public int FailedContexts;
+        public int RemainingContexts;
+        public int StaleContextAlertsDispatched;
+        public int StaleContextAlertsResolved;
+
+        // Per-cycle queue budget. Atomic-decremented per individual queue attempt; on
+        // negative result the run is not queued and the budget is restored. 0 = exhausted.
+        public int RemainingPendingQueueBudget;
+        public bool BackpressureHit;
+    }
 
     public MLArchitectureRotationWorker(
         IServiceScopeFactory scopeFactory,
@@ -191,9 +273,24 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
                     _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
                     _metrics?.WorkerCycleDurationMs.Record(
                         durationMs,
-                        new KeyValuePair<string, object?>("worker", WorkerName));
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("parallelism", result.Settings.MaxDegreeOfParallelism));
                     _metrics?.MLArchitectureRotationCycleDurationMs.Record(durationMs);
                     _metrics?.MLArchitectureRotationQueuedRunsPerCycle.Record(result.QueuedRunCount);
+
+                    // Long-cycle guard: warn when wall-time approaches the lock TTL window.
+                    // The cycle-level distributed lock is held for the entire cycle, so a
+                    // long cycle risks the lock expiring and another replica re-acquiring
+                    // before this one finishes. The duration histogram with the parallelism
+                    // tag is the source-of-truth alerting signal; this log is the operator's
+                    // prompt to verify the IDistributedLock TTL is at least this long.
+                    int warnSec = result.Settings.LongCycleWarnSeconds;
+                    if (warnSec > 0 && durationMs > warnSec * 1000L)
+                    {
+                        _logger.LogWarning(
+                            "{Worker}: cycle wall-time {DurationMs}ms exceeded LongCycleWarnSeconds={WarnSec}s. Verify the IDistributedLock TTL is at least this long; otherwise another replica may re-acquire the cycle lock mid-flight.",
+                            WorkerName, durationMs, warnSec);
+                    }
 
                     if (result.SkippedReason is { Length: > 0 })
                     {
@@ -205,13 +302,16 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
                     else
                     {
                         _logger.LogInformation(
-                            "{Worker}: contexts={Contexts}, processed={Processed}, eligibleArchitectures={EligibleArchitectures}, queuedRuns={Queued}, skippedArchitectures={Skipped}, backpressureHit={Backpressure}.",
+                            "{Worker}: contexts={Contexts}, processed={Processed}, eligibleArchitectures={EligibleArchitectures}, queuedRuns={Queued}, skippedArchitectures={Skipped}, failedContexts={FailedContexts}, staleAlertsDispatched={StaleDispatched}, staleAlertsResolved={StaleResolved}, backpressureHit={Backpressure}.",
                             WorkerName,
                             result.ContextCount,
                             result.ContextsProcessed,
                             result.EligibleArchitectureCount,
                             result.QueuedRunCount,
                             result.SkippedArchitectureCount,
+                            result.FailedContextCount,
+                            result.StaleContextAlertsDispatched,
+                            result.StaleContextAlertsResolved,
                             result.BackpressureHit);
                     }
 
@@ -401,59 +501,138 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
                     && run.Status == RunStatus.Queued,
                 ct);
 
+        // Single broad-prefix scan over override rows; bucket per (Symbol, Timeframe)
+        // in-memory and run the override-token validator over the same list.
+        var allOverrideRows = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(c => c.Key.StartsWith("MLArchitectureRotation:Override:"))
+            .Select(c => new KeyValuePair<string, string>(c.Key, c.Value))
+            .ToListAsync(ct);
+        ValidateOverrideTokens(allOverrideRows);
+        var overridesByContext = BucketOverridesByContext(contexts, allOverrideRows);
+
         var runsByContext = await BatchLoadRunsAsync(db, contexts, settings, nowUtc, ct);
+        var activeStaleContextAlertKeys = await BatchLoadActiveStaleContextAlertKeysAsync(db, contexts, ct);
 
-        int queuedRuns = 0;
-        int skippedArchitectures = 0;
-        bool backpressureHit = false;
-
-        foreach (var context in contexts)
+        int initialQueueBudget = Math.Max(0, settings.MaxPendingScheduledRuns - currentPendingScheduled);
+        if (initialQueueBudget == 0)
         {
-            _metrics?.MLArchitectureRotationContextsEvaluated.Add(1);
-
-            int remainingQueueBudget = Math.Max(0, settings.MaxPendingScheduledRuns - currentPendingScheduled);
-            if (remainingQueueBudget == 0)
-            {
-                backpressureHit = true;
-                _logger.LogDebug(
-                    "{Worker}: queue backpressure hit (pending={Pending} >= max={Max}); deferring remaining contexts.",
-                    WorkerName,
-                    currentPendingScheduled,
-                    settings.MaxPendingScheduledRuns);
-                _metrics?.MLArchitectureRotationCyclesSkipped.Add(
-                    1,
-                    new KeyValuePair<string, object?>("reason", "queue_backpressure"));
-                break;
-            }
-
-            runsByContext.TryGetValue((context.Symbol, context.Timeframe), out var contextRuns);
-            var outcome = ProcessContext(
-                db,
-                context,
-                contextRuns ?? [],
-                eligibleArchitectures,
+            _metrics?.MLArchitectureRotationCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "queue_backpressure"));
+            _logger.LogDebug(
+                "{Worker}: queue backpressure hit at cycle start (pending={Pending} >= max={Max}); deferring all contexts.",
+                WorkerName,
+                currentPendingScheduled,
+                settings.MaxPendingScheduledRuns);
+            return new MLArchitectureRotationCycleResult(
                 settings,
-                nowUtc,
-                remainingQueueBudget);
-
-            queuedRuns += outcome.QueuedRuns;
-            skippedArchitectures += outcome.SkippedArchitectures;
-            currentPendingScheduled += outcome.QueuedRuns;
-            backpressureHit |= outcome.BackpressureHit;
+                SkippedReason: null,
+                ContextCount: contexts.Count,
+                ContextsProcessed: 0,
+                EligibleArchitectureCount: eligibleArchitectures.Count,
+                QueuedRunCount: 0,
+                SkippedArchitectureCount: 0,
+                BackpressureHit: true,
+                FailedContextCount: 0,
+                StaleContextAlertsDispatched: 0,
+                StaleContextAlertsResolved: 0);
         }
 
-        if (queuedRuns > 0)
-            await writeContext.SaveChangesAsync(ct);
+        var ctx = new CycleIteration
+        {
+            Settings = settings,
+            NowUtc = nowUtc,
+            EligibleArchitectures = eligibleArchitectures,
+            RunsByContext = runsByContext,
+            OverridesByContext = overridesByContext,
+            RemainingContexts = contexts.Count,
+            RemainingPendingQueueBudget = initialQueueBudget,
+        };
+        foreach (var key in activeStaleContextAlertKeys)
+            ctx.ActiveStaleContextAlertKeys.TryAdd(key, 0);
+
+        // Per-context evaluation counter — emitted up front so the metric reflects total
+        // contexts entering the parallel block, not just the ones that completed without
+        // throwing.
+        if (_metrics is not null)
+        {
+            for (int i = 0; i < contexts.Count; i++)
+                _metrics.MLArchitectureRotationContextsEvaluated.Add(1);
+        }
+
+        int parallelism = Math.Clamp(settings.MaxDegreeOfParallelism, 1, MaxMaxDegreeOfParallelism);
+
+        await Parallel.ForEachAsync(
+            contexts,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = parallelism,
+                CancellationToken = ct,
+            },
+            async (context, contextCt) => await EvaluateOneContextAsync(ctx, context, contextCt))
+            .ConfigureAwait(false);
 
         return new MLArchitectureRotationCycleResult(
             settings,
             SkippedReason: null,
             ContextCount: contexts.Count,
-            ContextsProcessed: contexts.Count,
+            ContextsProcessed: ctx.ContextsProcessed,
             EligibleArchitectureCount: eligibleArchitectures.Count,
-            QueuedRunCount: queuedRuns,
-            SkippedArchitectureCount: skippedArchitectures,
-            BackpressureHit: backpressureHit);
+            QueuedRunCount: ctx.QueuedRuns,
+            SkippedArchitectureCount: ctx.SkippedArchitectures,
+            BackpressureHit: ctx.BackpressureHit,
+            FailedContextCount: ctx.FailedContexts,
+            StaleContextAlertsDispatched: ctx.StaleContextAlertsDispatched,
+            StaleContextAlertsResolved: ctx.StaleContextAlertsResolved);
+    }
+
+    private static async Task<HashSet<(string Symbol, Timeframe Timeframe)>> BatchLoadActiveStaleContextAlertKeysAsync(
+        DbContext db,
+        IReadOnlyList<ActiveContext> contexts,
+        CancellationToken ct)
+    {
+        if (contexts.Count == 0)
+            return [];
+
+        var dedupKeys = contexts
+            .Select(context => StaleContextDeduplicationKey(context.Symbol, context.Timeframe))
+            .ToList();
+
+        var matchedKeys = await db.Set<Alert>()
+            .AsNoTracking()
+            .Where(alert => !alert.IsDeleted
+                         && alert.IsActive
+                         && alert.DeduplicationKey != null
+                         && dedupKeys.Contains(alert.DeduplicationKey))
+            .Select(alert => alert.DeduplicationKey!)
+            .ToListAsync(ct);
+
+        var result = new HashSet<(string Symbol, Timeframe Timeframe)>();
+        foreach (var key in matchedKeys)
+        {
+            if (TryParseStaleContextDeduplicationKey(key, out var symbol, out var timeframe))
+                result.Add((symbol, timeframe));
+        }
+        return result;
+    }
+
+    private static string StaleContextDeduplicationKey(string symbol, Timeframe timeframe)
+        => $"{StaleContextAlertDeduplicationPrefix}{symbol}:{timeframe}";
+
+    private static bool TryParseStaleContextDeduplicationKey(string key, out string symbol, out Timeframe timeframe)
+    {
+        symbol = string.Empty;
+        timeframe = default;
+        if (!key.StartsWith(StaleContextAlertDeduplicationPrefix, StringComparison.Ordinal))
+            return false;
+
+        var rest = key[StaleContextAlertDeduplicationPrefix.Length..];
+        int colon = rest.LastIndexOf(':');
+        if (colon <= 0 || colon >= rest.Length - 1) return false;
+
+        symbol = rest[..colon];
+        return Enum.TryParse(rest[(colon + 1)..], ignoreCase: true, out timeframe);
     }
 
     private static async Task<Dictionary<(string Symbol, Timeframe Timeframe), List<TrainingRunProjection>>> BatchLoadRunsAsync(
@@ -516,15 +695,106 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
         return runsByContext;
     }
 
-    private ContextRotationOutcome ProcessContext(
+    /// <summary>
+    /// Per-iteration entry point invoked by the parallel context loop. Owns one DI scope
+    /// per iteration so the per-context queue insert never crosses an EF state boundary,
+    /// and re-throws cancellation cleanly so shutdown doesn't masquerade as context failure.
+    /// </summary>
+    private async ValueTask EvaluateOneContextAsync(
+        CycleIteration ctx, ActiveContext context, CancellationToken ctxCt)
+    {
+        await using var contextScope = _scopeFactory.CreateAsyncScope();
+        var contextWriteCtx = contextScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var contextDb = contextWriteCtx.GetDbContext();
+
+        try
+        {
+            // Refresh the worker heartbeat before each context evaluation. Long cycles
+            // (large fleet / DOP=1) would otherwise leave the health monitor without a
+            // signal until cycle end.
+            _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+            ctx.RunsByContext.TryGetValue((context.Symbol, context.Timeframe), out var contextRuns);
+            var outcome = await ProcessContextAsync(
+                contextScope.ServiceProvider, contextWriteCtx, contextDb, context, contextRuns ?? [], ctx, ctxCt);
+
+            Interlocked.Increment(ref ctx.ContextsProcessed);
+            Interlocked.Add(ref ctx.QueuedRuns, outcome.QueuedRuns);
+            Interlocked.Add(ref ctx.SkippedArchitectures, outcome.SkippedArchitectures);
+            if (outcome.BackpressureHit) ctx.BackpressureHit = true;
+
+            // Stale-context alert lifecycle. Dispatch when every eligible architecture got
+            // suppressed for THIS context (none queued, none recently handled). Auto-resolve
+            // when the context successfully queues at least one run after a prior alert.
+            if (ctx.Settings.StaleContextAlertEnabled && outcome.AllEligibleSuppressed && outcome.QueuedRuns == 0)
+            {
+                bool dispatched = await UpsertAndDispatchStaleContextAlertAsync(
+                    contextScope.ServiceProvider, contextWriteCtx, contextDb, context, ctx.Settings, ctx.NowUtc, ctxCt);
+                if (dispatched)
+                {
+                    ctx.ActiveStaleContextAlertKeys.TryAdd((context.Symbol, context.Timeframe), 0);
+                    Interlocked.Increment(ref ctx.StaleContextAlertsDispatched);
+                }
+            }
+            else if (outcome.QueuedRuns > 0
+                  && ctx.ActiveStaleContextAlertKeys.ContainsKey((context.Symbol, context.Timeframe)))
+            {
+                bool resolved = await ResolveStaleContextAlertAsync(
+                    contextScope.ServiceProvider, contextWriteCtx, contextDb, context, ctx.NowUtc, ctxCt);
+                if (resolved)
+                {
+                    ctx.ActiveStaleContextAlertKeys.TryRemove((context.Symbol, context.Timeframe), out _);
+                    Interlocked.Increment(ref ctx.StaleContextAlertsResolved);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ctxCt.IsCancellationRequested)
+        {
+            // Shutdown propagation, not a context failure. Re-throw so Parallel.ForEachAsync
+            // surfaces it and the ExecuteAsync loop honours stoppingToken.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref ctx.FailedContexts);
+            _metrics?.MLArchitectureRotationCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "context_error"),
+                new KeyValuePair<string, object?>("symbol", context.Symbol),
+                new KeyValuePair<string, object?>("timeframe", context.Timeframe.ToString()),
+                new KeyValuePair<string, object?>("exception_type", ex.GetType().Name));
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to process context {Symbol}/{Timeframe}.",
+                WorkerName,
+                context.Symbol,
+                context.Timeframe);
+        }
+        finally
+        {
+            int remaining = Interlocked.Decrement(ref ctx.RemainingContexts);
+            _healthMonitor?.RecordBacklogDepth(WorkerName, remaining);
+        }
+    }
+
+    private async Task<ContextRotationOutcome> ProcessContextAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
         DbContext db,
         ActiveContext context,
         IReadOnlyList<TrainingRunProjection> contextRuns,
-        IReadOnlyList<LearnerArchitecture> eligibleArchitectures,
-        MLArchitectureRotationWorkerSettings settings,
-        DateTime nowUtc,
-        int remainingQueueBudget)
+        CycleIteration ctx,
+        CancellationToken ct)
     {
+        // Apply per-context overrides (5-tier hierarchy: Symbol:Timeframe → Symbol:* →
+        // *:Timeframe → *:* → defaults). Each context evaluates against its own effective
+        // settings; the cycle-wide settings flow through unchanged when no overrides match.
+        var overrides = ctx.OverridesByContext.TryGetValue((context.Symbol, context.Timeframe), out var ctxOverrides)
+            ? ctxOverrides
+            : new Dictionary<string, string>();
+        var settings = ApplyPerContextOverrides(ctx.Settings, overrides, context.Symbol, context.Timeframe);
+        var nowUtc = ctx.NowUtc;
+
         var windowCutoff = nowUtc.AddDays(-settings.WindowDays);
         var cooldownCutoff = nowUtc.AddMinutes(-settings.CooldownMinutes);
         var activeRunFreshnessCutoff = nowUtc.AddHours(-settings.ActiveRunFreshnessHours);
@@ -575,9 +845,10 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
         int queuedRuns = 0;
         int skippedArchitectures = 0;
         bool backpressureHit = false;
-        int budgetRemaining = remainingQueueBudget;
+        bool anyEligibleQuotaUnsatisfied = false;
+        bool anyEligibleQuotaUnsatisfiedNotSuppressed = false;
 
-        foreach (var architecture in eligibleArchitectures)
+        foreach (var architecture in ctx.EligibleArchitectures)
         {
             int creditedRuns = successfulCounts.GetValueOrDefault(architecture)
                                + freshInFlightCounts.GetValueOrDefault(architecture);
@@ -590,6 +861,11 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
                     new KeyValuePair<string, object?>("reason", "quota_satisfied"));
                 continue;
             }
+
+            // From this point on the architecture is below quota for this context. Track
+            // it so we can tell "fully blocked" (every eligible arch suppressed) from
+            // "everything fine, just nothing to queue".
+            anyEligibleQuotaUnsatisfied = true;
 
             if (recentInfraFailures.Contains(architecture))
             {
@@ -611,6 +887,11 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
                 continue;
             }
 
+            // Cooldown and queue-backpressure are transient (not "suppressed"); recording
+            // these alongside the queue path means the context is still healthy, just
+            // throttled.
+            anyEligibleQuotaUnsatisfiedNotSuppressed = true;
+
             if (recentlyHandled.Contains(architecture))
             {
                 skippedArchitectures++;
@@ -621,8 +902,12 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
                 continue;
             }
 
-            if (budgetRemaining <= 0)
+            // Atomic per-cycle queue budget consumption. On negative result (budget
+            // exhausted by parallel iterations) restore so other contexts still see
+            // accurate capacity, mark backpressure, and skip-without-error.
+            if (Interlocked.Decrement(ref ctx.RemainingPendingQueueBudget) < 0)
             {
+                Interlocked.Increment(ref ctx.RemainingPendingQueueBudget);
                 backpressureHit = true;
                 skippedArchitectures++;
                 LogDecision(context, architecture, "skipped", "queue_backpressure");
@@ -657,14 +942,49 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
             });
 
             queuedRuns++;
-            budgetRemaining--;
             recentlyHandled.Add(architecture);
             freshInFlightCounts[architecture] = freshInFlightCounts.GetValueOrDefault(architecture) + 1;
             LogDecision(context, architecture, "queued", $"priority={priority}");
             _metrics?.MLArchitectureRotationRunsQueued.Add(1);
         }
 
-        return new ContextRotationOutcome(queuedRuns, skippedArchitectures, backpressureHit);
+        // Per-iteration save: each context's queue inserts commit independently, so a
+        // single context's persistence failure does not roll back the whole cycle.
+        if (queuedRuns > 0)
+        {
+            try
+            {
+                await writeContext.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException ex) when (IsLikelyUniqueViolation(ex))
+            {
+                // Another worker/replica raced this insert. Drop the duplicate, log,
+                // and report no queued runs for this context — the budget restoration
+                // happened atomically above on the per-architecture path so callers
+                // already see accurate budget state.
+                db.ChangeTracker.Clear();
+                _logger.LogInformation(
+                    "{Worker}: training-run insert race for {Symbol}/{Timeframe} resolved by uniqueness; skipping this context's queue this cycle.",
+                    WorkerName,
+                    context.Symbol,
+                    context.Timeframe);
+                queuedRuns = 0;
+            }
+        }
+
+        // "All eligible architectures suppressed" = there is at least one arch below
+        // quota AND every below-quota arch hit a hard suppression gate (infra-failure
+        // or failure-budget). Cooldown and backpressure are transient — they don't
+        // qualify. anyEligibleQuotaUnsatisfiedNotSuppressed flips on as soon as any
+        // arch reaches the cooldown/queue-budget/queue path.
+        bool allEligibleSuppressed = anyEligibleQuotaUnsatisfied
+                                  && !anyEligibleQuotaUnsatisfiedNotSuppressed;
+
+        return new ContextRotationOutcome(
+            QueuedRuns: queuedRuns,
+            SkippedArchitectures: skippedArchitectures,
+            BackpressureHit: backpressureHit,
+            AllEligibleSuppressed: allEligibleSuppressed);
     }
 
     private void LogDecision(ActiveContext context, LearnerArchitecture architecture, string decision, string reason)
@@ -707,6 +1027,9 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
             CK_MaxPendingScheduledRuns,
             CK_MaxFailuresPerWindow,
             CK_InfraFailurePatterns,
+            CK_MaxDegreeOfParallelism,
+            CK_LongCycleWarnSeconds,
+            CK_StaleContextAlertEnabled,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -740,7 +1063,12 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
             MaxFailuresPerWindow: ClampInt(GetInt(values, CK_MaxFailuresPerWindow, DefaultMaxFailuresPerWindow),
                 DefaultMaxFailuresPerWindow, MinMaxFailuresPerWindow, MaxMaxFailuresPerWindow),
             BlockedArchitectures: ParseArchitectures(values.GetValueOrDefault(CK_BlockedArchitectures)),
-            InfraFailurePatterns: ParseInfraFailurePatterns(values.GetValueOrDefault(CK_InfraFailurePatterns)));
+            InfraFailurePatterns: ParseInfraFailurePatterns(values.GetValueOrDefault(CK_InfraFailurePatterns)),
+            MaxDegreeOfParallelism: ClampInt(GetInt(values, CK_MaxDegreeOfParallelism, DefaultMaxDegreeOfParallelism),
+                DefaultMaxDegreeOfParallelism, MinMaxDegreeOfParallelism, MaxMaxDegreeOfParallelism),
+            LongCycleWarnSeconds: ClampIntAllowingZero(GetInt(values, CK_LongCycleWarnSeconds, DefaultLongCycleWarnSeconds),
+                DefaultLongCycleWarnSeconds, MinLongCycleWarnSeconds, MaxLongCycleWarnSeconds),
+            StaleContextAlertEnabled: GetBool(values, CK_StaleContextAlertEnabled, true));
     }
 
     private IReadOnlyList<LearnerArchitecture> ResolveEligibleArchitectures(
@@ -848,6 +1176,195 @@ public sealed class MLArchitectureRotationWorker : BackgroundService
     private static DateTime GetActiveTimestamp(TrainingRunProjection run)
         => run.PickedUpAt ?? run.StartedAt;
 
+    private async Task<bool> UpsertAndDispatchStaleContextAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveContext context,
+        MLArchitectureRotationWorkerSettings settings,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var dispatcher = serviceProvider.GetService<IAlertDispatcher>();
+        if (dispatcher is null)
+            return false;
+
+        try
+        {
+            string deduplicationKey = StaleContextDeduplicationKey(context.Symbol, context.Timeframe);
+            var alert = await db.Set<Alert>()
+                .FirstOrDefaultAsync(candidate => !candidate.IsDeleted
+                                               && candidate.IsActive
+                                               && candidate.DeduplicationKey == deduplicationKey, ct);
+
+            int cooldownSeconds = await AlertCooldownDefaults.GetCooldownAsync(
+                db,
+                AlertCooldownDefaults.CK_MLMonitoring,
+                AlertCooldownDefaults.Default_MLMonitoring,
+                ct);
+
+            string conditionJson = Truncate(JsonSerializer.Serialize(new
+            {
+                detector = "MLArchitectureRotation",
+                reason = "all_eligible_architectures_suppressed",
+                symbol = context.Symbol,
+                timeframe = context.Timeframe.ToString(),
+                rotationWindowDays = settings.WindowDays,
+                infraFailureLookbackHours = settings.InfraFailureLookbackHours,
+                maxFailuresPerWindow = settings.MaxFailuresPerWindow,
+                detectedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture),
+            }), AlertConditionMaxLength);
+
+            DateTime? previousTriggeredAt = alert?.LastTriggeredAt;
+
+            if (alert is null)
+            {
+                alert = new Alert
+                {
+                    AlertType = AlertType.MLMonitoringStale,
+                    DeduplicationKey = deduplicationKey,
+                    IsActive = true,
+                };
+                db.Set<Alert>().Add(alert);
+            }
+            else
+            {
+                alert.AlertType = AlertType.MLMonitoringStale;
+            }
+
+            alert.Symbol = context.Symbol;
+            alert.Severity = AlertSeverity.High;
+            alert.CooldownSeconds = cooldownSeconds;
+            alert.AutoResolvedAt = null;
+            alert.ConditionJson = conditionJson;
+
+            try
+            {
+                await writeContext.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException ex) when (IsLikelyAlertDeduplicationRace(serviceProvider, ex))
+            {
+                DetachIfAdded(db, alert);
+                alert = await db.Set<Alert>()
+                    .FirstAsync(candidate => !candidate.IsDeleted
+                                          && candidate.IsActive
+                                          && candidate.DeduplicationKey == deduplicationKey, ct);
+                previousTriggeredAt ??= alert.LastTriggeredAt;
+                alert.AlertType = AlertType.MLMonitoringStale;
+                alert.Symbol = context.Symbol;
+                alert.Severity = AlertSeverity.High;
+                alert.CooldownSeconds = cooldownSeconds;
+                alert.AutoResolvedAt = null;
+                alert.ConditionJson = conditionJson;
+                await writeContext.SaveChangesAsync(ct);
+            }
+
+            // Cooldown the dispatch (the row is upserted regardless so dashboards see
+            // the latest state).
+            if (previousTriggeredAt.HasValue
+                && nowUtc - NormalizeUtc(previousTriggeredAt.Value) < TimeSpan.FromSeconds(cooldownSeconds))
+            {
+                return false;
+            }
+
+            string message = string.Format(
+                CultureInfo.InvariantCulture,
+                "MLArchitectureRotation: every eligible architecture is currently suppressed for context {0}/{1} (recent infra failures or per-architecture failure budget exhausted). Rotation cannot make progress until at least one architecture clears suppression — investigate the recent failures or extend MaxFailuresPerWindow.",
+                context.Symbol,
+                context.Timeframe);
+
+            await dispatcher.DispatchAsync(alert, message, ct);
+            await writeContext.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to dispatch stale-context alert for {Symbol}/{Timeframe}.",
+                WorkerName,
+                context.Symbol,
+                context.Timeframe);
+            return false;
+        }
+    }
+
+    private async Task<bool> ResolveStaleContextAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveContext context,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string deduplicationKey = StaleContextDeduplicationKey(context.Symbol, context.Timeframe);
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(candidate => !candidate.IsDeleted
+                                           && candidate.IsActive
+                                           && candidate.DeduplicationKey == deduplicationKey, ct);
+
+        if (alert is null)
+            return false;
+
+        var dispatcher = serviceProvider.GetService<IAlertDispatcher>();
+        if (dispatcher is not null && alert.LastTriggeredAt.HasValue)
+        {
+            try
+            {
+                await dispatcher.TryAutoResolveAsync(alert, conditionStillActive: false, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(
+                    ex,
+                    "{Worker}: failed to auto-resolve stale-context alert {DeduplicationKey} for {Symbol}/{Timeframe}.",
+                    WorkerName,
+                    deduplicationKey,
+                    context.Symbol,
+                    context.Timeframe);
+            }
+        }
+
+        alert.IsActive = false;
+        alert.AutoResolvedAt ??= nowUtc;
+        await writeContext.SaveChangesAsync(ct);
+        return true;
+    }
+
+    private static bool IsLikelyAlertDeduplicationRace(IServiceProvider serviceProvider, DbUpdateException ex)
+    {
+        var classifier = serviceProvider.GetService<IDatabaseExceptionClassifier>();
+        if (classifier?.IsUniqueConstraintViolation(ex) == true)
+            return true;
+
+        string message = ex.InnerException?.Message ?? ex.Message;
+        return message.Contains("DeduplicationKey", StringComparison.OrdinalIgnoreCase) &&
+               (message.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("unique", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsLikelyUniqueViolation(DbUpdateException ex)
+    {
+        string message = ex.InnerException?.Message ?? ex.Message;
+        return message.Contains("duplicate", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("unique", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void DetachIfAdded(DbContext db, Alert alert)
+    {
+        var entry = db.Entry(alert);
+        if (entry.State is EntityState.Added or EntityState.Modified)
+            entry.State = EntityState.Detached;
+    }
+
+    private static string Truncate(string value, int maxLength)
+        => value.Length <= maxLength ? value : value[..maxLength];
+
+    private static DateTime NormalizeUtc(DateTime timestamp)
+        => timestamp.Kind == DateTimeKind.Utc
+            ? timestamp
+            : DateTime.SpecifyKind(timestamp, DateTimeKind.Utc);
+
     private static bool GetBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
     {
         if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
@@ -904,7 +1421,10 @@ internal sealed record MLArchitectureRotationWorkerSettings(
     int MaxPendingScheduledRuns,
     int MaxFailuresPerWindow,
     HashSet<LearnerArchitecture> BlockedArchitectures,
-    IReadOnlyList<string> InfraFailurePatterns);
+    IReadOnlyList<string> InfraFailurePatterns,
+    int MaxDegreeOfParallelism,
+    int LongCycleWarnSeconds,
+    bool StaleContextAlertEnabled);
 
 internal sealed record MLArchitectureRotationCycleResult(
     MLArchitectureRotationWorkerSettings Settings,
@@ -914,7 +1434,10 @@ internal sealed record MLArchitectureRotationCycleResult(
     int EligibleArchitectureCount,
     int QueuedRunCount,
     int SkippedArchitectureCount,
-    bool BackpressureHit)
+    bool BackpressureHit,
+    int FailedContextCount,
+    int StaleContextAlertsDispatched,
+    int StaleContextAlertsResolved)
 {
     public static MLArchitectureRotationCycleResult Skipped(
         MLArchitectureRotationWorkerSettings settings,
@@ -927,5 +1450,8 @@ internal sealed record MLArchitectureRotationCycleResult(
             EligibleArchitectureCount: 0,
             QueuedRunCount: 0,
             SkippedArchitectureCount: 0,
-            BackpressureHit: false);
+            BackpressureHit: false,
+            FailedContextCount: 0,
+            StaleContextAlertsDispatched: 0,
+            StaleContextAlertsResolved: 0);
 }

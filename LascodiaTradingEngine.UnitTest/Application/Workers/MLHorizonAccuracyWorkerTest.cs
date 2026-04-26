@@ -382,6 +382,189 @@ public class MLHorizonAccuracyWorkerTest
     }
 
     [Fact]
+    public async Task ComputeAllModelsAsync_FiltersToRoutableActiveModelsAndResolvesStaleAlerts()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var active = await SeedActiveModelAsync(db, "EURUSD");
+        var fallback = await SeedActiveModelAsync(
+            db,
+            "GBPUSD",
+            status: MLModelStatus.Superseded,
+            isFallbackChampion: true);
+        var suppressed = await SeedActiveModelAsync(db, "USDJPY", isSuppressed: true);
+        var meta = await SeedActiveModelAsync(db, "AUDUSD", isMetaLearner: true);
+        var maml = await SeedActiveModelAsync(db, "NZDUSD", isMamlInitializer: true);
+        var training = await SeedActiveModelAsync(db, "USDCAD", status: MLModelStatus.Training);
+        var blank = await SeedActiveModelAsync(db, " ");
+        var t0 = DateTime.UtcNow.AddDays(-1);
+        var staleDedupKey = $"MLHorizon:{suppressed.Id}:USDJPY:{suppressed.Timeframe}:3";
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLHorizon:MinPredictions", "1"),
+            Config("MLHorizon:WilsonZ", "0"));
+        db.Set<Alert>().Add(new Alert
+        {
+            Symbol = suppressed.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            DeduplicationKey = staleDedupKey,
+            ConditionJson = "{}",
+            IsActive = true,
+        });
+
+        await SeedPredictionAsync(db, active, t0, TradeDirection.Buy, true, true, true, true);
+        await SeedPredictionAsync(db, fallback, t0.AddMinutes(1), TradeDirection.Sell, true, true, true, true);
+        await SeedPredictionAsync(db, suppressed, t0.AddMinutes(2), TradeDirection.Buy, true, true, true, true);
+        await SeedPredictionAsync(db, meta, t0.AddMinutes(3), TradeDirection.Buy, true, true, true, true);
+        await SeedPredictionAsync(db, maml, t0.AddMinutes(4), TradeDirection.Buy, true, true, true, true);
+        await SeedPredictionAsync(db, training, t0.AddMinutes(5), TradeDirection.Buy, true, true, true, true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var rows = await db.Set<MLModelHorizonAccuracy>()
+            .OrderBy(r => r.MLModelId)
+            .ThenBy(r => r.HorizonBars)
+            .ToListAsync();
+
+        Assert.Equal(6, rows.Count);
+        Assert.All(rows, row => Assert.Contains(row.MLModelId, new[] { active.Id, fallback.Id }));
+        Assert.DoesNotContain(rows, row => row.MLModelId == suppressed.Id);
+        Assert.DoesNotContain(rows, row => row.MLModelId == meta.Id);
+        Assert.DoesNotContain(rows, row => row.MLModelId == maml.Id);
+        Assert.DoesNotContain(rows, row => row.MLModelId == training.Id);
+        Assert.DoesNotContain(rows, row => row.MLModelId == blank.Id);
+
+        var staleAlert = await db.Set<Alert>().SingleAsync(a => a.DeduplicationKey == staleDedupKey);
+        Assert.False(staleAlert.IsActive);
+        Assert.NotNull(staleAlert.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task ComputeAllModelsAsync_ProcessesOldestOrMissingModelsWhenCycleIsCapped()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var fresh = await SeedActiveModelAsync(db, "EURUSD");
+        var stale = await SeedActiveModelAsync(db, "GBPUSD");
+        var missing = await SeedActiveModelAsync(db, "USDJPY");
+        var t0 = DateTime.UtcNow.AddDays(-1);
+        var freshComputedAt = t0.AddHours(-1);
+        var staleComputedAt = t0.AddHours(-10);
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLHorizon:MinPredictions", "1"),
+            Config("MLHorizon:MaxModelsPerCycle", "2"),
+            Config("MLHorizon:WilsonZ", "0"));
+
+        foreach (int horizon in new[] { 3, 6, 12 })
+        {
+            db.Set<MLModelHorizonAccuracy>().Add(ExistingHorizonRow(fresh, horizon, freshComputedAt));
+            db.Set<MLModelHorizonAccuracy>().Add(ExistingHorizonRow(stale, horizon, staleComputedAt));
+        }
+
+        await SeedPredictionAsync(db, fresh, t0, TradeDirection.Buy, true, false, false, false);
+        await SeedPredictionAsync(db, stale, t0.AddMinutes(1), TradeDirection.Buy, true, true, true, true);
+        await SeedPredictionAsync(db, missing, t0.AddMinutes(2), TradeDirection.Buy, true, true, true, true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var freshRows = await db.Set<MLModelHorizonAccuracy>()
+            .Where(r => r.MLModelId == fresh.Id)
+            .ToListAsync();
+        var staleRows = await db.Set<MLModelHorizonAccuracy>()
+            .Where(r => r.MLModelId == stale.Id)
+            .ToListAsync();
+        var missingRows = await db.Set<MLModelHorizonAccuracy>()
+            .Where(r => r.MLModelId == missing.Id)
+            .ToListAsync();
+
+        Assert.Equal(3, freshRows.Count);
+        Assert.All(freshRows, row => Assert.Equal(freshComputedAt, row.ComputedAt));
+        Assert.Equal(3, staleRows.Count);
+        Assert.All(staleRows, row => Assert.True(row.ComputedAt > staleComputedAt));
+        Assert.Equal([3, 6, 12], missingRows.OrderBy(r => r.HorizonBars).Select(r => r.HorizonBars).ToArray());
+    }
+
+    [Fact]
+    public async Task ComputeAllModelsAsync_ReactivatesResolvedGapAlertInsteadOfCreatingDuplicateRows()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddDays(-1);
+        var dedupKey = $"MLHorizon:{model.Id}:{model.Symbol}:{model.Timeframe}:3";
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLHorizon:MinPredictions", "2"),
+            Config("MLHorizon:HorizonGapThreshold", "0.10"),
+            Config("MLHorizon:WilsonZ", "0"));
+        db.Set<Alert>().Add(new Alert
+        {
+            Symbol = model.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            DeduplicationKey = dedupKey,
+            ConditionJson = """{"reason":"previous"}""",
+            AutoResolvedAt = t0.AddHours(-1),
+            IsActive = false,
+        });
+
+        await SeedPredictionAsync(db, model, t0.AddMinutes(1), TradeDirection.Buy, true, false, true, true);
+        await SeedPredictionAsync(db, model, t0.AddMinutes(2), TradeDirection.Buy, true, false, true, true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var alerts = await db.Set<Alert>()
+            .Where(a => a.DeduplicationKey == dedupKey)
+            .ToListAsync();
+
+        var alert = Assert.Single(alerts);
+        Assert.True(alert.IsActive);
+        Assert.Null(alert.AutoResolvedAt);
+        Assert.Contains("\"reason\":\"horizon_accuracy_gap\"", alert.ConditionJson);
+    }
+
+    [Fact]
+    public async Task ComputeAllModelsAsync_UsesCaseInsensitiveLatestEngineConfigValues()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddDays(-1);
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLHorizon:MinPredictions", "5", t0),
+            Config("mlhorizon:minpredictions", "1", t0.AddMinutes(1)),
+            Config("MLHorizon:WilsonZ", "0", t0));
+
+        await SeedPredictionAsync(db, model, t0.AddHours(1), TradeDirection.Buy, true, true, true, true);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var rows = await db.Set<MLModelHorizonAccuracy>()
+            .Where(r => r.MLModelId == model.Id)
+            .ToListAsync();
+
+        Assert.Equal(3, rows.Count);
+        Assert.All(rows, row =>
+        {
+            Assert.True(row.IsReliable);
+            Assert.Equal("Computed", row.Status);
+        });
+    }
+
+    [Fact]
     public void HorizonAccuracyHelpers_RejectUnsafeValuesAndComputeWilsonBound()
     {
         Assert.Equal(3600, MLHorizonAccuracyWorker.NormalizePollSeconds(0));
@@ -454,8 +637,48 @@ public class MLHorizonAccuracyWorkerTest
             NullLogger<MLHorizonAccuracyWorker>.Instance,
             classifier);
 
-    private static async Task<MLModel> SeedActiveModelAsync(HorizonTestDbContext db)
+    private static async Task<MLModel> SeedActiveModelAsync(
+        HorizonTestDbContext db,
+        string symbol = "EURUSD",
+        Timeframe timeframe = Timeframe.H1,
+        MLModelStatus status = MLModelStatus.Active,
+        bool isActive = true,
+        bool isSuppressed = false,
+        bool isFallbackChampion = false,
+        bool isMetaLearner = false,
+        bool isMamlInitializer = false)
     {
+        await EnsureStrategyAsync(db);
+
+        var model = new MLModel
+        {
+            Symbol = symbol,
+            Timeframe = timeframe,
+            ModelVersion = $"horizon-test-{Guid.NewGuid():N}"[..32],
+            FilePath = "memory",
+            Status = status,
+            IsActive = isActive,
+            IsSuppressed = isSuppressed,
+            IsFallbackChampion = isFallbackChampion,
+            IsMetaLearner = isMetaLearner,
+            IsMamlInitializer = isMamlInitializer,
+            TrainingSamples = 100,
+            ActivatedAt = DateTime.UtcNow.AddDays(-2),
+            RowVersion = 1,
+        };
+
+        db.Set<MLModel>().Add(model);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+        return model;
+    }
+
+    private static async Task<Strategy> EnsureStrategyAsync(HorizonTestDbContext db)
+    {
+        var existing = await db.Set<Strategy>().OrderBy(s => s.Id).FirstOrDefaultAsync();
+        if (existing is not null)
+            return existing;
+
         var strategy = new Strategy
         {
             Name = "Horizon Test",
@@ -465,24 +688,9 @@ public class MLHorizonAccuracyWorkerTest
             RowVersion = 1,
         };
 
-        var model = new MLModel
-        {
-            Symbol = "EURUSD",
-            Timeframe = Timeframe.H1,
-            ModelVersion = "horizon-test",
-            FilePath = "memory",
-            Status = MLModelStatus.Active,
-            IsActive = true,
-            TrainingSamples = 100,
-            ActivatedAt = DateTime.UtcNow.AddDays(-2),
-            RowVersion = 1,
-        };
-
         db.Set<Strategy>().Add(strategy);
-        db.Set<MLModel>().Add(model);
         await db.SaveChangesAsync();
-        db.ChangeTracker.Clear();
-        return model;
+        return strategy;
     }
 
     private static async Task<MLModelPredictionLog> SeedPredictionAsync(
@@ -496,7 +704,7 @@ public class MLHorizonAccuracyWorkerTest
         bool? h12 = null,
         ModelRole role = ModelRole.Champion)
     {
-        var strategy = await db.Set<Strategy>().SingleAsync();
+        var strategy = await db.Set<Strategy>().OrderBy(s => s.Id).FirstAsync();
         var signal = new TradeSignal
         {
             StrategyId = strategy.Id,
@@ -571,14 +779,38 @@ public class MLHorizonAccuracyWorkerTest
             IsDeleted = true,
         };
 
-    private static EngineConfig Config(string key, string value)
+    private static MLModelHorizonAccuracy ExistingHorizonRow(
+        MLModel model,
+        int horizonBars,
+        DateTime computedAt)
+        => new()
+        {
+            MLModelId = model.Id,
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            HorizonBars = horizonBars,
+            TotalPredictions = 10,
+            CorrectPredictions = 8,
+            Accuracy = 0.8,
+            AccuracyLowerBound = 0.7,
+            PrimaryTotalPredictions = 10,
+            PrimaryCorrectPredictions = 8,
+            PrimaryAccuracy = 0.8,
+            PrimaryAccuracyGap = 0.0,
+            IsReliable = true,
+            Status = "Computed",
+            WindowStart = computedAt.AddDays(-30),
+            ComputedAt = computedAt,
+        };
+
+    private static EngineConfig Config(string key, string value, DateTime? lastUpdatedAt = null)
         => new()
         {
             Key = key,
             Value = value,
             DataType = ConfigDataType.String,
             IsHotReloadable = true,
-            LastUpdatedAt = DateTime.UtcNow,
+            LastUpdatedAt = lastUpdatedAt ?? DateTime.UtcNow,
         };
 
     private sealed class HorizonFixture : IAsyncDisposable

@@ -40,4 +40,33 @@ public class MLConformalCalibrationOptions : ConfigurationOption<MLConformalCali
 
     /// <summary>When true, calibration evidence must be resolved at or after model activation.</summary>
     public bool RequirePostActivationLogs { get; set; } = true;
+
+    /// <summary>
+    /// Bounded in-process concurrency for per-model evaluation. Default 1 preserves
+    /// strictly-sequential semantics; bumping fans out to N concurrent (model, log
+    /// load, calibration compute, transactional persist) chains, each in its own DI scope.
+    /// </summary>
+    public int MaxDegreeOfParallelism { get; set; } = 1;
+
+    /// <summary>
+    /// Wall-clock cycle warning threshold in seconds. The cycle-level distributed lock
+    /// is held for the duration of one cycle; a long cycle risks the lock expiring and
+    /// another replica re-acquiring it before this one finishes. 0 disables the warn.
+    /// </summary>
+    public int LongCycleWarnSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// When true, the worker dispatches a durable stale-calibration alert for any model
+    /// that is skipped for <see cref="StaleSkipAlertThreshold"/> consecutive cycles due
+    /// to insufficient logs or invalid snapshot — surfacing broken prediction-logging
+    /// pipelines or silently-corrupted snapshots that would otherwise stay invisible.
+    /// </summary>
+    public bool StaleAlertEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Number of consecutive insufficient-logs / invalid-snapshot skips before the
+    /// stale-calibration alert fires for a model. Default 5 ≈ 2.5h at the default 30m
+    /// cycle.
+    /// </summary>
+    public int StaleSkipAlertThreshold { get; set; } = 5;
 }

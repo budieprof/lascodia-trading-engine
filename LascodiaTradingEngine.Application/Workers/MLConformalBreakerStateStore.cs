@@ -398,16 +398,11 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         alert.Severity = AlertSeverity.High;
         alert.CooldownSeconds = AlertCooldownSeconds;
         alert.AutoResolvedAt = null;
-        alert.ConditionJson = JsonSerializer.Serialize(new MLConformalBreakerAlertPayload(
+        alert.ConditionJson = JsonSerializer.Serialize(BuildAlertPayload(
             candidate.MLModelId,
-            candidate.Timeframe.ToString(),
-            candidate.Evaluation.TripReason.ToString(),
-            candidate.Evaluation.EmpiricalCoverage,
+            candidate.Timeframe,
+            candidate.Evaluation,
             candidate.TargetCoverage,
-            candidate.Evaluation.CoverageLowerBound,
-            candidate.Evaluation.CoverageUpperBound,
-            candidate.Evaluation.CoveragePValue,
-            candidate.Evaluation.LastEvaluatedOutcomeAt,
             resumeAt));
 
         return (alert, shouldDispatch);
@@ -432,17 +427,36 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         alert.Severity = AlertSeverity.High;
         alert.CooldownSeconds = AlertCooldownSeconds;
         alert.AutoResolvedAt = null;
-        alert.ConditionJson = JsonSerializer.Serialize(new MLConformalBreakerAlertPayload(
+        alert.ConditionJson = JsonSerializer.Serialize(BuildAlertPayload(
             candidate.MLModelId,
-            candidate.Timeframe.ToString(),
-            candidate.Evaluation.TripReason.ToString(),
-            candidate.Evaluation.EmpiricalCoverage,
+            candidate.Timeframe,
+            candidate.Evaluation,
             candidate.TargetCoverage,
-            candidate.Evaluation.CoverageLowerBound,
-            candidate.Evaluation.CoverageUpperBound,
-            candidate.Evaluation.CoveragePValue,
-            candidate.Evaluation.LastEvaluatedOutcomeAt,
             resumeAt));
+    }
+
+    private static MLConformalBreakerAlertPayload BuildAlertPayload(
+        long modelId,
+        Timeframe timeframe,
+        ConformalCoverageEvaluation evaluation,
+        double targetCoverage,
+        DateTime resumeAt)
+    {
+        var worst = evaluation.WorstRegime();
+        return new MLConformalBreakerAlertPayload(
+            modelId,
+            timeframe.ToString(),
+            evaluation.TripReason.ToString(),
+            evaluation.EmpiricalCoverage,
+            targetCoverage,
+            evaluation.CoverageLowerBound,
+            evaluation.CoverageUpperBound,
+            evaluation.CoveragePValue,
+            evaluation.LastEvaluatedOutcomeAt,
+            resumeAt,
+            WorstRegime: worst?.Regime.ToString(),
+            WorstRegimeCoverage: worst?.Breakdown.EmpiricalCoverage,
+            WorstRegimeSampleCount: worst?.Breakdown.SampleCount);
     }
 
     private async Task ResolveActiveAlertAsync(

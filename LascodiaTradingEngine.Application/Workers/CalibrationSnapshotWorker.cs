@@ -1,155 +1,177 @@
+using System.Diagnostics;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Rolls up the <see cref="SignalRejectionAudit"/> stream into monthly
-/// <see cref="CalibrationSnapshot"/> rows so operators can watch gate hit rates
-/// drift over time and calibrate thresholds against real traffic instead of
-/// guesses.
+/// <see cref="CalibrationSnapshot"/> rows so operators can watch gate hit rates drift over
+/// time and calibrate thresholds against real traffic instead of guesses.
 ///
-/// <para>
-/// <b>Why:</b> the engine has 200+ config knobs, 12 screening gates, and ~20
-/// runtime rejection stages. Defaults carry a lot of load — when a gate's
-/// rejection rate climbs to 40% of signals, that usually means the threshold is
-/// mis-calibrated, not that traders suddenly got worse. A time series of
-/// rejection counts per (stage, reason) turns a subjective "seems off" into an
-/// alertable signal.
-/// </para>
+/// <para><b>Cadence:</b> runs once on startup (after a small initial delay) and then every
+/// <c>Calibration:PollIntervalHours</c> (default 24). Each cycle adds uniform jitter from
+/// <c>Calibration:PollJitterSeconds</c> so replicas don't poll in lockstep, and applies
+/// <c>2^min(consecutiveFailures, FailureBackoffCapShift)</c> exponential backoff so a DB
+/// outage isn't hammered at full poll rate.</para>
 ///
-/// <para>
-/// <b>Cadence:</b> runs once on startup (after a small initial delay) and then
-/// every <c>Calibration:PollIntervalHours</c> (default 24, clamped to
-/// <c>[1, 168]</c>). On each cycle it writes the snapshot for all complete
-/// months not yet snapshotted.
-/// </para>
+/// <para><b>Coordination:</b> a singleton cycle-level distributed lock keeps only one
+/// replica driving backfill per cycle, so two replicas don't redundantly aggregate
+/// rejections and race on the unique-index backstop. Per-month idempotency is enforced by
+/// an existence check; the unique index <c>(PeriodStart, PeriodGranularity, Stage, Reason)</c>
+/// is a defense-in-depth backstop that <see cref="IDatabaseExceptionClassifier"/> classifies
+/// as <c>AlreadyExists</c> rather than <c>Failed</c>.</para>
 ///
-/// <para>
-/// <b>Idempotency:</b> each month is guarded by an <c>AnyAsync</c> existence
-/// check keyed on <c>(PeriodStart, PeriodGranularity)</c> — that is the primary
-/// defence against duplicate work. The unique index on
-/// <c>(PeriodStart, PeriodGranularity, Stage, Reason)</c> is a defense-in-depth
-/// backstop: if two writers race past the guard, one succeeds and the other
-/// surfaces as a <c>DbUpdateException</c>, is logged by the per-month catch,
-/// and retried on the next poll cycle.
-/// </para>
+/// <para><b>Failure isolation:</b> each month is processed in its own DI scope and its own
+/// <c>SaveChangesAsync</c>. A transient DB blip or malformed row fails exactly one month —
+/// the remaining months in the back-fill window continue.</para>
 ///
-/// <para>
-/// <b>Failure isolation:</b> each month is processed in its own DI scope and
-/// its own <c>SaveChangesAsync</c>. A transient DB blip or malformed row fails
-/// exactly one month — the remaining months in the back-fill window continue
-/// to be processed in the same cycle. The failed scope (and its change
-/// tracker) is disposed immediately, so no pending entities leak into the next
-/// month's save.
-/// </para>
-///
-/// <para>
-/// <b>Configuration</b> (read from <see cref="EngineConfig"/>):
+/// <para><b>Operator alerts:</b>
 /// <list type="bullet">
-///   <item><c>Calibration:PollIntervalHours</c> — default 24, clamped to <c>[1, 168]</c></item>
-///   <item><c>Calibration:BackfillMonths</c>    — default 6, clamped to <c>[1, 120]</c>
-///         (the ceiling prevents a config typo like "6000" from triggering a decade-plus scan)</item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Observability:</b> emits <c>trading.calibration.snapshots_written</c>
-/// counter (tagged <c>period="Monthly"</c>) — incremented only after a
-/// successful per-month save, so a rolled-back batch never inflates the
-/// counter. Per-month failures increment <c>WorkerErrors</c> with
-/// <c>worker="CalibrationSnapshotWorker"</c>. The end-of-cycle summary log
-/// reports processed / skipped / failed counts.
-/// </para>
+///   <item>Fleet-systemic alert fires when <c>FleetSystemicConsecutiveFailureCycles</c> cycles
+///   in a row produce zero successful month writes despite candidates existing — usually a
+///   broken DB schema or upstream pipeline.</item>
+///   <item>Staleness alert fires when the most recent <see cref="CalibrationSnapshot"/> is
+///   older than <c>StalenessAlertHours</c>. Auto-resolves on the next successful write.</item>
+/// </list></para>
 /// </summary>
-public sealed class CalibrationSnapshotWorker : BackgroundService
+public sealed partial class CalibrationSnapshotWorker : BackgroundService
 {
-    private const string CK_PollHours      = "Calibration:PollIntervalHours";
-    private const string CK_BackfillMonths = "Calibration:BackfillMonths";
-
+    internal const string WorkerName = nameof(CalibrationSnapshotWorker);
     internal const string GranularityMonthly = "Monthly";
-
-    private const int DefaultBackfillMonths =   6;
-    private const int MaxBackfillMonths     = 120;
-    private const int DefaultPollHours      =  24;
-    private const int MaxPollHours          = 168;
+    internal const string CycleLockKey = "calibration-snapshot:cycle";
+    internal const string FleetSystemicDedupeKey = "Calibration:FleetSystemic";
+    internal const string StalenessDedupeKey = "Calibration:Staleness";
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<CalibrationSnapshotWorker> _logger;
     private readonly TradingMetrics _metrics;
     private readonly TimeProvider _timeProvider;
+    private readonly CalibrationSnapshotOptions _options;
+    private readonly CalibrationSnapshotConfigReader _configReader;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDatabaseExceptionClassifier? _dbExceptionClassifier;
+
+    private int  _consecutiveFailures;
+    private bool _fleetSystemicAlertActive;
+    private bool _stalenessAlertActive;
 
     public CalibrationSnapshotWorker(
         IServiceScopeFactory scopeFactory,
         ILogger<CalibrationSnapshotWorker> logger,
         TradingMetrics metrics,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        CalibrationSnapshotOptions? options = null,
+        CalibrationSnapshotConfigReader? configReader = null,
+        IDistributedLock? distributedLock = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDatabaseExceptionClassifier? dbExceptionClassifier = null)
     {
         _scopeFactory = scopeFactory;
         _logger       = logger;
         _metrics      = metrics;
         _timeProvider = timeProvider;
+        _options      = options ?? new CalibrationSnapshotOptions();
+        _configReader = configReader ?? new CalibrationSnapshotConfigReader(_options);
+        _distributedLock = distributedLock;
+        _healthMonitor = healthMonitor;
+        _dbExceptionClassifier = dbExceptionClassifier;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Small initial delay so the worker does not compete with startup
-        // hydration for DB connections. Each cycle then self-paces based on
-        // EngineConfig (hot-reloadable).
-        try { await Task.Delay(TimeSpan.FromMinutes(2), stoppingToken); }
-        catch (OperationCanceledException) { return; }
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Rolls SignalRejectionAudit into monthly CalibrationSnapshot rows.",
+            TimeSpan.FromHours(_options.PollIntervalHours));
+
+        try { await Task.Delay(TimeSpan.FromMinutes(Math.Max(0, _options.InitialDelayMinutes)), _timeProvider, stoppingToken); }
+        catch (OperationCanceledException) { _healthMonitor?.RecordWorkerStopped(WorkerName); return; }
+
+        // Lazy-initialised on first cycle so we can read jitter/backoff from EngineConfig.
+        var lastConfig = new CalibrationSnapshotRuntimeConfig(
+            _options.PollIntervalHours,
+            _options.BackfillMonths,
+            _options.PollJitterSeconds,
+            _options.FailureBackoffCapShift,
+            _options.UseCycleLock,
+            _options.CycleLockTimeoutSeconds,
+            _options.FleetSystemicConsecutiveFailureCycles,
+            _options.StalenessAlertHours);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            int pollHours = DefaultPollHours;
+            _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+            var cycleStopwatch = Stopwatch.StartNew();
             try
             {
-                await RunCycleAsync(stoppingToken);
-
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                pollHours = await ReadIntConfigAsync(readCtx.GetDbContext(), CK_PollHours, DefaultPollHours, stoppingToken);
+                var (result, config) = await RunCycleAsync(stoppingToken);
+                lastConfig = config;
+                _consecutiveFailures = 0;
+                _healthMonitor?.RecordCycleSuccess(WorkerName, (long)cycleStopwatch.Elapsed.TotalMilliseconds);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
+                _healthMonitor?.RecordWorkerStopped(WorkerName);
                 return;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "CalibrationSnapshotWorker: cycle failed");
-                _metrics.WorkerErrors.Add(1,
-                    new KeyValuePair<string, object?>("worker", "CalibrationSnapshotWorker"));
+                _consecutiveFailures++;
+                _logger.LogError(ex, "{Worker}: cycle failed", WorkerName);
+                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", WorkerName));
+                _metrics.CalibrationSnapshotConsecutiveCycleFailures.Add(_consecutiveFailures);
+                _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
             }
 
-            try { await Task.Delay(TimeSpan.FromHours(Math.Clamp(pollHours, 1, MaxPollHours)), stoppingToken); }
-            catch (OperationCanceledException) { return; }
+            try
+            {
+                await Task.Delay(NextDelay(lastConfig, _consecutiveFailures), _timeProvider, stoppingToken);
+            }
+            catch (OperationCanceledException) { _healthMonitor?.RecordWorkerStopped(WorkerName); return; }
         }
+        _healthMonitor?.RecordWorkerStopped(WorkerName);
     }
 
     /// <summary>
-    /// Internal for unit-test access. Writes snapshots for every complete month
-    /// in the back-fill window that hasn't already been snapshotted. A "complete
-    /// month" is any month whose end boundary is strictly before <c>UtcNow</c>
-    /// — the current month is deliberately excluded because partial data would
-    /// make the series non-monotonic. Each month is processed in its own DI
-    /// scope so a single bad month does not stall the remaining window.
+    /// Runs one cycle. Returns the per-month counts plus the resolved runtime config so the
+    /// executor can compute the next jittered + backoff-aware poll interval.
     /// </summary>
-    internal async Task<CycleResult> RunCycleAsync(CancellationToken ct)
+    internal async Task<(CycleResult Result, CalibrationSnapshotRuntimeConfig Config)> RunCycleAsync(CancellationToken ct)
     {
+        var cycleStart = Stopwatch.GetTimestamp();
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        int backfillMonths;
+        CalibrationSnapshotRuntimeConfig config;
         await using (var cfgScope = _scopeFactory.CreateAsyncScope())
         {
             var readCtx = cfgScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-            backfillMonths = await ReadIntConfigAsync(readCtx.GetDbContext(), CK_BackfillMonths, DefaultBackfillMonths, ct);
+            config = await _configReader.LoadAsync(readCtx.GetDbContext(), ct);
         }
-        backfillMonths = Math.Clamp(backfillMonths, 1, MaxBackfillMonths);
+
+        // Cycle-level distributed lock — only one replica drives backfill per cycle.
+        await using var cycleLock = config.UseCycleLock
+            ? await TryAcquireCycleLockAsync(config, ct)
+            : NoopAsyncDisposable.Instance;
+        if (cycleLock is null)
+        {
+            _metrics.CalibrationSnapshotCycleLockAttempts.Add(1, new KeyValuePair<string, object?>("outcome", "busy"));
+            _logger.LogDebug("{Worker}: another replica holds the cycle lock — skipping cycle.", WorkerName);
+            RecordCycleDuration(cycleStart, "cycle_lock_busy");
+            return (new CycleResult(0, 0, 0, 0, 0), config);
+        }
+        if (config.UseCycleLock)
+            _metrics.CalibrationSnapshotCycleLockAttempts.Add(1, new KeyValuePair<string, object?>("outcome", "acquired"));
 
         var currentMonthStart = new DateTime(now.Year, now.Month, 1, 0, 0, 0, DateTimeKind.Utc);
 
@@ -159,7 +181,7 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
         int  monthsFailed             = 0;
         long snapshotsWritten         = 0;
 
-        for (int i = 1; i <= backfillMonths; i++)
+        for (int i = 1; i <= config.BackfillMonths; i++)
         {
             if (ct.IsCancellationRequested) break;
 
@@ -187,39 +209,38 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
             {
                 throw;
             }
+            catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
+            {
+                // Two writers raced past the existence guard; the unique index won. Record
+                // as AlreadyExists, not a failure, since the data was correctly written by
+                // the other replica.
+                _logger.LogInformation(
+                    "{Worker}: unique-constraint race on period {PeriodStart:yyyy-MM} — treating as already-exists.",
+                    WorkerName, periodStart);
+                monthsSkippedAlreadyDone++;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "CalibrationSnapshotWorker: failed to process period {PeriodStart:yyyy-MM} — continuing with remaining months",
-                    periodStart);
+                    "{Worker}: failed to process period {PeriodStart:yyyy-MM} — continuing with remaining months",
+                    WorkerName, periodStart);
                 monthsFailed++;
-                _metrics.WorkerErrors.Add(1,
-                    new KeyValuePair<string, object?>("worker", "CalibrationSnapshotWorker"));
+                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", WorkerName));
             }
         }
 
-        if (snapshotsWritten > 0 || monthsFailed > 0)
-        {
-            _logger.LogInformation(
-                "CalibrationSnapshotWorker: cycle complete — processed={Processed} alreadyExists={AlreadyExists} empty={Empty} failed={Failed} rowsWritten={Rows}",
-                monthsProcessed, monthsSkippedAlreadyDone, monthsSkippedEmpty, monthsFailed, snapshotsWritten);
-        }
+        // Always log so a quiet cycle still emits an "alive" signal.
+        _logger.LogInformation(
+            "{Worker}: cycle complete — processed={Processed} alreadyExists={AlreadyExists} empty={Empty} failed={Failed} rowsWritten={Rows}",
+            WorkerName, monthsProcessed, monthsSkippedAlreadyDone, monthsSkippedEmpty, monthsFailed, snapshotsWritten);
 
-        return new CycleResult(
-            monthsProcessed,
-            monthsSkippedAlreadyDone,
-            monthsSkippedEmpty,
-            monthsFailed,
-            snapshotsWritten);
+        await UpdateFleetSystemicAlertAsync(monthsFailed, monthsProcessed, monthsSkippedEmpty + monthsSkippedAlreadyDone, config, now, ct);
+        await UpdateStalenessAlertAsync(config, now, ct);
+
+        RecordCycleDuration(cycleStart, "ok");
+        return (new CycleResult(monthsProcessed, monthsSkippedAlreadyDone, monthsSkippedEmpty, monthsFailed, snapshotsWritten), config);
     }
 
-    /// <summary>
-    /// Processes exactly one month in its own DI scope. Returns an outcome
-    /// distinguishing a successful write, a skip because the month was
-    /// already snapshotted, and a skip because the month had no rejections.
-    /// Throws on DB failures — the outer loop catches and keeps the cycle
-    /// alive.
-    /// </summary>
     private async Task<MonthResult> ProcessMonthAsync(
         DateTime periodStart,
         DateTime periodEnd,
@@ -235,6 +256,7 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
             .AnyAsync(s => s.PeriodStart == periodStart && s.PeriodGranularity == GranularityMonthly, ct);
         if (alreadyExists) return new MonthResult(MonthOutcome.AlreadyExists, 0);
 
+        var loadStart = Stopwatch.GetTimestamp();
         var aggregates = await readCtx.GetDbContext()
             .Set<SignalRejectionAudit>()
             .AsNoTracking()
@@ -249,6 +271,9 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
                 DistinctStrategies = g.Select(x => x.StrategyId).Distinct().Count(),
             })
             .ToListAsync(ct);
+        _metrics.CalibrationSnapshotMonthLoadMs.Record(
+            Stopwatch.GetElapsedTime(loadStart).TotalMilliseconds,
+            new KeyValuePair<string, object?>("period", GranularityMonthly));
 
         if (aggregates.Count == 0) return new MonthResult(MonthOutcome.Empty, 0);
 
@@ -268,22 +293,17 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
             });
         }
 
+        var insertStart = Stopwatch.GetTimestamp();
         await writeCtx.SaveChangesAsync(ct);
+        _metrics.CalibrationSnapshotMonthInsertMs.Record(
+            Stopwatch.GetElapsedTime(insertStart).TotalMilliseconds,
+            new KeyValuePair<string, object?>("period", GranularityMonthly));
 
         // Metric only after the save — a rolled-back batch must not inflate it.
         _metrics.CalibrationSnapshotsWritten.Add(aggregates.Count,
             new KeyValuePair<string, object?>("period", GranularityMonthly));
 
         return new MonthResult(MonthOutcome.Written, aggregates.Count);
-    }
-
-    private static async Task<int> ReadIntConfigAsync(DbContext ctx, string key, int defaultValue, CancellationToken ct)
-    {
-        var entry = await ctx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
-        if (entry?.Value is null || !int.TryParse(entry.Value, out var parsed)) return defaultValue;
-        return parsed;
     }
 
     /// <summary>Outcome of one cycle — per-month counts and total rows written.</summary>

@@ -6,6 +6,8 @@ namespace LascodiaTradingEngine.Domain.Enums;
 public enum MLModelLifecycleEventType
 {
     DegradationRetirement,
+    AutoRollbackPromotion,
+    AutoRollbackDemotion,
     AbTestPromotion,
     AbTestDemotion,
     AbTestRejection,

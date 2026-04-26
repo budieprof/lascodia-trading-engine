@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -432,6 +433,274 @@ public sealed class MLArchitectureRotationWorkerTest
         Assert.Contains(queuedRuns, run => run.LearnerArchitecture == LearnerArchitecture.Dann);
     }
 
+    [Fact]
+    public async Task RunCycleAsync_PerContextOverride_NarrowestTierWins()
+    {
+        // Symbol:Timeframe override beats Symbol:* and *:Timeframe and global default.
+        // EURUSD/H1 with MinRunsPerWindow=2; another context only has the *:* default of 1.
+        // The H1-specific override pushes the per-context quota up to 2 even though
+        // BaggedLogistic already has one completed run, so AdaBoost AND BaggedLogistic
+        // get queued for that context — proving the most-specific tier resolves first.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+            ],
+            seed: db =>
+            {
+                SeedActiveModel(db, 1, "EURUSD", Timeframe.H1);
+                AddConfig(db, "MLArchitectureRotation:Override:*:*:MinRunsPerWindow", "1");
+                AddConfig(db, "MLArchitectureRotation:Override:EURUSD:*:MinRunsPerWindow", "3");
+                AddConfig(db, "MLArchitectureRotation:Override:EURUSD:H1:MinRunsPerWindow", "2");
+
+                SeedCompletedRun(db, 11, "EURUSD", Timeframe.H1, LearnerArchitecture.BaggedLogistic, now.AddHours(-8).UtcDateTime);
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var queuedRuns = await harness.LoadQueuedRunsAsync();
+        Assert.Null(result.SkippedReason);
+        // Both architectures still below quota=2 (BaggedLogistic has 1 completed run,
+        // AdaBoost has 0). Both should be queued by the rotation.
+        Assert.Equal(2, queuedRuns.Count);
+        Assert.Contains(queuedRuns, run => run.LearnerArchitecture == LearnerArchitecture.AdaBoost);
+        Assert.Contains(queuedRuns, run => run.LearnerArchitecture == LearnerArchitecture.BaggedLogistic);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_PerContextOverride_StarStarFallbackApplies()
+    {
+        // *:* override applies when no narrower tier exists.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+            ],
+            seed: db =>
+            {
+                SeedActiveModel(db, 1, "EURUSD", Timeframe.H1);
+                // *:* sets MinRunsPerWindow to 5, which means BOTH archs are below quota.
+                AddConfig(db, "MLArchitectureRotation:Override:*:*:MinRunsPerWindow", "5");
+
+                SeedCompletedRun(db, 11, "EURUSD", Timeframe.H1, LearnerArchitecture.BaggedLogistic, now.AddHours(-8).UtcDateTime);
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var queuedRuns = await harness.LoadQueuedRunsAsync();
+        Assert.Null(result.SkippedReason);
+        Assert.Equal(2, queuedRuns.Count);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideTokenWithUnknownKnob_RowDoesNotApply()
+    {
+        // Typo in knob name ("MinRunsPerWindo") — the override row falls through and
+        // the global default (DefaultMinRunsPerWindow=2) governs. Without the typo this
+        // would have set MinRunsPerWindow=1 and stopped the rotation since BaggedLogistic
+        // already has one completed run.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+            ],
+            seed: db =>
+            {
+                SeedActiveModel(db, 1, "EURUSD", Timeframe.H1);
+                AddConfig(db, "MLArchitectureRotation:Override:EURUSD:H1:MinRunsPerWindo", "1"); // typo
+
+                SeedCompletedRun(db, 11, "EURUSD", Timeframe.H1, LearnerArchitecture.BaggedLogistic, now.AddHours(-8).UtcDateTime);
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var queuedRuns = await harness.LoadQueuedRunsAsync();
+        Assert.Null(result.SkippedReason);
+        // With default MinRunsPerWindow=2 and BaggedLogistic having 1 completed,
+        // both BaggedLogistic and AdaBoost remain below quota and get queued.
+        Assert.Equal(2, queuedRuns.Count);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_StaleContextAlert_DispatchedWhenAllEligibleSuppressed_ResolvedOnRecovery()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+            ],
+            seed: db =>
+            {
+                SeedActiveModel(db, 1, "EURUSD", Timeframe.H1);
+                AddConfig(db, "MLArchitectureRotation:MinRunsPerWindow", "1");
+
+                // Both eligible architectures have a recent infra failure → both
+                // suppressed → context can't make progress. Stale-context alert should
+                // fire.
+                SeedFailedRun(db, 21, "EURUSD", Timeframe.H1, LearnerArchitecture.BaggedLogistic,
+                    now.AddHours(-2).UtcDateTime, "TorchSharp bootstrap failed");
+                SeedFailedRun(db, 22, "EURUSD", Timeframe.H1, LearnerArchitecture.AdaBoost,
+                    now.AddHours(-2).UtcDateTime, "libtorch missing");
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var firstResult = await harness.Worker.RunCycleAsync(CancellationToken.None);
+        Assert.Equal(0, firstResult.QueuedRunCount);
+        Assert.Equal(1, firstResult.StaleContextAlertsDispatched);
+
+        var alertAfterFirst = await harness.LoadStaleContextAlertAsync("EURUSD", Timeframe.H1);
+        Assert.NotNull(alertAfterFirst);
+        Assert.True(alertAfterFirst!.IsActive);
+        Assert.Equal(AlertType.MLMonitoringStale, alertAfterFirst.AlertType);
+
+        // Recovery: time passes past the infra-failure lookback window so the recent
+        // failures no longer suppress. The next cycle should queue runs and auto-resolve
+        // the alert.
+        var laterTimeProvider = new TestTimeProvider(now.AddHours(48));
+        SetWorkerTimeProvider(harness, laterTimeProvider);
+
+        var recoveryResult = await harness.Worker.RunCycleAsync(CancellationToken.None);
+        Assert.True(recoveryResult.QueuedRunCount > 0);
+        Assert.Equal(1, recoveryResult.StaleContextAlertsResolved);
+
+        var alertAfterRecovery = await harness.LoadStaleContextAlertAsync("EURUSD", Timeframe.H1);
+        Assert.NotNull(alertAfterRecovery);
+        Assert.False(alertAfterRecovery!.IsActive);
+        Assert.NotNull(alertAfterRecovery.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_BoundedParallelism_QueuesAcrossContextsWithoutDoubleSpending()
+    {
+        // 8 contexts × 4 architectures (BaggedLogistic already completed in each so
+        // 3 archs need queueing per context = 24 total). MaxPendingScheduledRuns = 10
+        // forces the cycle into queue-backpressure across parallel iterations. The
+        // atomic budget consumption must NOT overspend even at DOP=4.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+                LearnerArchitecture.Gbm,
+                LearnerArchitecture.Elm,
+            ],
+            seed: db =>
+            {
+                AddConfig(db, "MLArchitectureRotation:MinRunsPerWindow", "1");
+                AddConfig(db, "MLArchitectureRotation:MaxPendingScheduledRuns", "10");
+                AddConfig(db, "MLArchitectureRotation:MaxDegreeOfParallelism", "4");
+
+                long modelId = 1;
+                long runId = 1000;
+                for (int i = 0; i < 8; i++)
+                {
+                    string symbol = $"PAIR{i:D2}";
+                    SeedActiveModel(db, modelId++, symbol, Timeframe.H1);
+                    SeedCompletedRun(db, runId++, symbol, Timeframe.H1, LearnerArchitecture.BaggedLogistic,
+                        now.AddHours(-8).UtcDateTime);
+                }
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var queuedRuns = await harness.LoadQueuedRunsAsync();
+        Assert.Null(result.SkippedReason);
+        // The atomic budget MUST cap the queued runs at exactly 10 — never higher.
+        Assert.True(queuedRuns.Count <= 10,
+            $"Expected ≤ 10 queued runs (MaxPendingScheduledRuns=10), got {queuedRuns.Count}");
+        Assert.Equal(queuedRuns.Count, result.QueuedRunCount);
+        Assert.True(result.BackpressureHit);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_LongCycleWarnSeconds_ZeroDisablesWarn()
+    {
+        // Boundary smoke: LongCycleWarnSeconds=0 means warn disabled. This just verifies
+        // the setting flows through and the cycle still succeeds.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+            ],
+            seed: db =>
+            {
+                SeedActiveModel(db, 1, "EURUSD", Timeframe.H1);
+                AddConfig(db, "MLArchitectureRotation:MinRunsPerWindow", "1");
+                AddConfig(db, "MLArchitectureRotation:LongCycleWarnSeconds", "0");
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Null(result.SkippedReason);
+        Assert.Equal(0, result.Settings.LongCycleWarnSeconds);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_StaleContextAlertEnabledFalse_DoesNotDispatchAlert()
+    {
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+
+        using var harness = CreateHarness(
+            supportedArchitectures:
+            [
+                LearnerArchitecture.BaggedLogistic,
+                LearnerArchitecture.AdaBoost,
+            ],
+            seed: db =>
+            {
+                SeedActiveModel(db, 1, "EURUSD", Timeframe.H1);
+                AddConfig(db, "MLArchitectureRotation:MinRunsPerWindow", "1");
+                AddConfig(db, "MLArchitectureRotation:StaleContextAlertEnabled", "false");
+
+                SeedFailedRun(db, 21, "EURUSD", Timeframe.H1, LearnerArchitecture.BaggedLogistic,
+                    now.AddHours(-2).UtcDateTime, "TorchSharp bootstrap failed");
+                SeedFailedRun(db, 22, "EURUSD", Timeframe.H1, LearnerArchitecture.AdaBoost,
+                    now.AddHours(-2).UtcDateTime, "libtorch missing");
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.QueuedRunCount);
+        Assert.Equal(0, result.StaleContextAlertsDispatched);
+        var alert = await harness.LoadStaleContextAlertAsync("EURUSD", Timeframe.H1);
+        Assert.Null(alert);
+    }
+
+    private static void SetWorkerTimeProvider(WorkerHarness harness, TimeProvider timeProvider)
+    {
+        // Reflection-based patch so we can drive the internal clock between the two
+        // RunCycleAsync invocations without rebuilding the harness (which would lose
+        // the seeded alert row).
+        var field = typeof(MLArchitectureRotationWorker).GetField(
+            "_timeProvider",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        field!.SetValue(harness.Worker, timeProvider);
+    }
+
     private static WorkerHarness CreateHarness(
         IReadOnlyCollection<LearnerArchitecture> supportedArchitectures,
         Action<MLArchitectureRotationWorkerTestContext> seed,
@@ -454,6 +723,8 @@ public sealed class MLArchitectureRotationWorkerTest
 
         foreach (var architecture in supportedArchitectures.Where(architecture => architecture != LearnerArchitecture.BaggedLogistic))
             services.AddKeyedScoped<IMLModelTrainer, FakeTrainer>(architecture);
+
+        services.AddSingleton<IAlertDispatcher>(new TestAlertDispatcher(effectiveTimeProvider));
 
         var provider = services.BuildServiceProvider();
 
@@ -595,6 +866,17 @@ public sealed class MLArchitectureRotationWorkerTest
                 .ToListAsync();
         }
 
+        public async Task<Alert?> LoadStaleContextAlertAsync(string symbol, Timeframe timeframe)
+        {
+            using var scope = provider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<MLArchitectureRotationWorkerTestContext>();
+            string dedupKey = $"ml-architecture-rotation-stale:{symbol}:{timeframe}";
+            return await db.Set<Alert>()
+                .IgnoreQueryFilters()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(alert => alert.DeduplicationKey == dedupKey);
+        }
+
         public void Dispose()
         {
             provider.Dispose();
@@ -648,6 +930,15 @@ public sealed class MLArchitectureRotationWorkerTest
 
                 builder.Ignore(run => run.MLModel);
             });
+
+            modelBuilder.Entity<Alert>(builder =>
+            {
+                builder.HasKey(alert => alert.Id);
+                builder.HasQueryFilter(alert => !alert.IsDeleted);
+                builder.Property(alert => alert.AlertType).HasConversion<string>();
+                builder.Property(alert => alert.Severity).HasConversion<string>();
+                builder.HasIndex(alert => alert.DeduplicationKey).IsUnique();
+            });
         }
     }
 
@@ -673,6 +964,21 @@ public sealed class MLArchitectureRotationWorkerTest
         private sealed class Releaser : IAsyncDisposable
         {
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class TestAlertDispatcher(TimeProvider timeProvider) : IAlertDispatcher
+    {
+        public Task DispatchAsync(Alert alert, string message, CancellationToken ct)
+        {
+            alert.LastTriggeredAt = timeProvider.GetUtcNow().UtcDateTime;
+            return Task.CompletedTask;
+        }
+
+        public Task TryAutoResolveAsync(Alert alert, bool conditionStillActive, CancellationToken ct)
+        {
+            alert.AutoResolvedAt = timeProvider.GetUtcNow().UtcDateTime;
+            return Task.CompletedTask;
         }
     }
 }

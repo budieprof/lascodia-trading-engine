@@ -6,6 +6,7 @@ using Moq;
 using MockQueryable.Moq;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -63,7 +64,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
             MakeRejection(mar.AddDays(10), strategyId: 10, symbol: "EURUSD", stage: "MTF",    reason: "mtf_not_confirmed"));
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         // Expect 2 rows for March: (Regime,regime_blocked,count=3,symbols=2,strategies=2)
         //                          (MTF,mtf_not_confirmed,count=1,symbols=1,strategies=1)
@@ -106,7 +107,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections(MakeRejection(mar.AddDays(5), 1, "EURUSD", "Regime", "regime_blocked"));
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(_writtenSnapshots);
         Assert.Equal(0, result.MonthsProcessed);
@@ -122,7 +123,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections();
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(_writtenSnapshots);
         Assert.Equal(0, result.MonthsProcessed);
@@ -141,7 +142,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections(MakeRejection(apr, 1, "EURUSD", "Regime", "regime_blocked"));
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(_writtenSnapshots);
         Assert.Equal(0, result.MonthsProcessed);
@@ -160,7 +161,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
             MakeRejection(feb.AddDays(7), 11, "GBPUSD", "MTF",    "mtf_not_confirmed"));
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Equal(2, _writtenSnapshots.Count);
         Assert.Equal(2, result.MonthsProcessed);
@@ -186,7 +187,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
             MakeRejection(feb.AddDays(7), 2, "GBPUSD", "MTF",    "mtf_not_confirmed"));
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         // Only March (the single complete month) is in the window — Feb must be ignored.
         Assert.Single(_writtenSnapshots);
@@ -206,7 +207,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections(MakeRejection(mar.AddDays(3), 1, "EURUSD", "Regime", "regime_blocked"));
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         // 0 is clamped up to 1, so March still gets processed.
         Assert.Single(_writtenSnapshots);
@@ -231,13 +232,154 @@ public class CalibrationSnapshotWorkerTest : IDisposable
             .ReturnsAsync(1);
 
         var worker = NewWorker();
-        var result = await worker.RunCycleAsync(CancellationToken.None);
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Equal(1, result.MonthsProcessed);            // Feb succeeded
         Assert.Equal(1, result.MonthsFailed);               // Mar failed
         Assert.Equal(0, result.MonthsSkippedAlreadyExists);
         Assert.Equal(4, result.MonthsSkippedEmpty);         // 4 empty months in the rest of the window
         Assert.Equal(1L, result.SnapshotsWritten);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_UniqueConstraintViolation_TreatedAsAlreadyExists_NotFailure()
+    {
+        // Two writers race past the existence guard: SaveChangesAsync throws
+        // DbUpdateException; the injected classifier reports it as a unique-constraint
+        // violation, so the worker counts it as AlreadyExists, not a real failure.
+        _timeProvider.SetNow(new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc));
+        var mar = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        SetRejections(MakeRejection(mar.AddDays(3), 10, "EURUSD", "Regime", "regime_blocked"));
+
+        _writeCtx.SetupSequence(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new DbUpdateException("unique violation"))
+            .ReturnsAsync(1);
+
+        var classifier = new Mock<IDatabaseExceptionClassifier>();
+        classifier.Setup(c => c.IsUniqueConstraintViolation(It.IsAny<DbUpdateException>())).Returns(true);
+
+        var worker = new CalibrationSnapshotWorker(
+            _scopeFactory.Object,
+            Mock.Of<ILogger<CalibrationSnapshotWorker>>(),
+            _metrics,
+            _timeProvider,
+            dbExceptionClassifier: classifier.Object);
+
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.MonthsProcessed);
+        Assert.Equal(1, result.MonthsSkippedAlreadyExists); // Mar — won by the other replica
+        Assert.Equal(0, result.MonthsFailed);               // not a failure
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_CycleLockBusy_RecordsBusyOutcome_NoMonthsProcessed()
+    {
+        _timeProvider.SetNow(new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc));
+        var mar = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        SetRejections(MakeRejection(mar.AddDays(3), 10, "EURUSD", "Regime", "regime_blocked"));
+
+        var distributedLock = new Mock<IDistributedLock>();
+        distributedLock
+            .Setup(l => l.TryAcquireAsync(It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IAsyncDisposable?)null);
+
+        var worker = new CalibrationSnapshotWorker(
+            _scopeFactory.Object,
+            Mock.Of<ILogger<CalibrationSnapshotWorker>>(),
+            _metrics,
+            _timeProvider,
+            options: new CalibrationSnapshotOptions { UseCycleLock = true },
+            distributedLock: distributedLock.Object);
+
+        var (result, _) = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.MonthsProcessed);
+        Assert.Equal(0, result.MonthsFailed);
+        Assert.Equal(0, result.MonthsSkippedAlreadyExists);
+        Assert.Equal(0, result.MonthsSkippedEmpty);
+        // Lock was attempted exactly once and reported busy.
+        distributedLock.Verify(l => l.TryAcquireAsync(
+            CalibrationSnapshotWorker.CycleLockKey, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Theory]
+    [InlineData(1, 1,   3600,  10800)] // 1h base, 1 failure, no jitter → 3600s; +jitter ≤ 10800-ish
+    [InlineData(1, 3,   28800, 36000)] // 1h base, 3 failures (2^3=8) → 28800s + jitter
+    [InlineData(1, 100, 32 * 3600, 32 * 3600 + 600)] // capped at shift=5 → 2^5=32 hours
+    public void NextDelay_AppliesExponentialBackoffWithJitter(int pollHours, int failures, int minSeconds, int maxSeconds)
+    {
+        var config = new CalibrationSnapshotRuntimeConfig(
+            PollIntervalHours: pollHours,
+            BackfillMonths: 6,
+            PollJitterSeconds: 600,
+            FailureBackoffCapShift: 5,
+            UseCycleLock: true,
+            CycleLockTimeoutSeconds: 0,
+            FleetSystemicConsecutiveFailureCycles: 3,
+            StalenessAlertHours: 24 * 38);
+        var delay = CalibrationSnapshotWorker.NextDelay(config, failures);
+        Assert.InRange(delay.TotalSeconds, minSeconds, maxSeconds);
+    }
+
+    [Fact]
+    public void NextDelay_SuccessPath_AppliesJitterButNoBackoff()
+    {
+        var config = new CalibrationSnapshotRuntimeConfig(
+            PollIntervalHours: 1,
+            BackfillMonths: 6,
+            PollJitterSeconds: 600,
+            FailureBackoffCapShift: 5,
+            UseCycleLock: true,
+            CycleLockTimeoutSeconds: 0,
+            FleetSystemicConsecutiveFailureCycles: 3,
+            StalenessAlertHours: 24 * 38);
+        var delay = CalibrationSnapshotWorker.NextDelay(config, consecutiveFailures: 0);
+        // base = 3600s, jitter ∈ [0, 600] → total ∈ [3600, 4200]
+        Assert.InRange(delay.TotalSeconds, 3600, 4200);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(86_401)]
+    public void Validator_RejectsOutOfRangePollJitter(int value)
+    {
+        var validator = new CalibrationSnapshotOptionsValidator();
+        var result = validator.Validate(name: null, new CalibrationSnapshotOptions { PollJitterSeconds = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("PollJitterSeconds"));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(17)]
+    public void Validator_RejectsOutOfRangeBackoffShift(int value)
+    {
+        var validator = new CalibrationSnapshotOptionsValidator();
+        var result = validator.Validate(name: null, new CalibrationSnapshotOptions { FailureBackoffCapShift = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FailureBackoffCapShift"));
+    }
+
+    [Fact]
+    public void Validator_RejectsZeroFleetSystemicCycles()
+    {
+        var validator = new CalibrationSnapshotOptionsValidator();
+        var result = validator.Validate(name: null,
+            new CalibrationSnapshotOptions { FleetSystemicConsecutiveFailureCycles = 0 });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FleetSystemicConsecutiveFailureCycles"));
+    }
+
+    [Fact]
+    public void Validator_RejectsZeroStalenessAlertHours()
+    {
+        var validator = new CalibrationSnapshotOptionsValidator();
+        var result = validator.Validate(name: null,
+            new CalibrationSnapshotOptions { StalenessAlertHours = 0 });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("StalenessAlertHours"));
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

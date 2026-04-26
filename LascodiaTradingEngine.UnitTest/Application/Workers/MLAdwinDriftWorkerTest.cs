@@ -469,6 +469,198 @@ public sealed class MLAdwinDriftWorkerTest
         Assert.Contains("ADWIN drift", dispatched.message);
     }
 
+    [Fact]
+    public async Task RunCycleAsync_FleetSystemicAlert_FiresWhenManyModelsDriftSimultaneously()
+    {
+        // Three pairs all drift in one cycle. With FleetSystemicDriftThreshold=2, the
+        // worker raises a single SystemicMLDegradation alert keyed by the fleet dedupe.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                long modelId = 1;
+                long logIdOffset = 0;
+                var startUtc = now.AddHours(-100).UtcDateTime;
+                foreach (var symbol in new[] { "EURUSD", "GBPUSD", "USDJPY" })
+                {
+                    db.Set<MLModel>().Add(new MLModel
+                    {
+                        Id = modelId,
+                        Symbol = symbol,
+                        Timeframe = Timeframe.H1,
+                        ModelVersion = "1.0.0",
+                        FilePath = "/tmp/model.bin",
+                        Status = MLModelStatus.Active,
+                        IsActive = true,
+                        TrainedAt = new DateTime(2026, 04, 20, 12, 0, 0, DateTimeKind.Utc),
+                        ModelBytes = [1, 2, 3],
+                        LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+                        IsDeleted = false,
+                        RowVersion = 1
+                    });
+                    db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                        modelId: modelId,
+                        startUtc: startUtc,
+                        outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50)),
+                        idOffset: logIdOffset,
+                        symbol: symbol));
+                    logIdOffset += 100;
+                    modelId++;
+                }
+            },
+            timeProvider: new TestTimeProvider(now),
+            options: new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptions
+            {
+                FleetSystemicDriftThreshold = 2,
+            });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var alert = await harness.LoadAlertAsync(MLAdwinDriftWorker.FleetSystemicDedupeKey);
+        Assert.NotNull(alert);
+        Assert.Equal(AlertType.SystemicMLDegradation, alert!.AlertType);
+        Assert.True(alert.IsActive);
+        Assert.Contains("fleet_systemic_drift", alert.ConditionJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_StalenessAlert_FiresWhenNewestDriftLogIsOld()
+    {
+        // Pre-seed an MLAdwinDriftLog whose DetectedAt is older than StalenessAlertHours.
+        // The cycle has no candidates (no models seeded), so no fresh log is written.
+        // Staleness phase still runs and fires the alert.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                db.Set<MLAdwinDriftLog>().Add(new MLAdwinDriftLog
+                {
+                    MLModelId = 99,
+                    Symbol = "ZZZUSD",
+                    Timeframe = Timeframe.H1,
+                    DriftDetected = false,
+                    Window1Mean = 0.5,
+                    Window2Mean = 0.5,
+                    EpsilonCut = 0.05,
+                    Window1Size = 50,
+                    Window2Size = 50,
+                    DetectedAt = now.AddHours(-100).UtcDateTime, // 100h old
+                    AccuracyDrop = 0.0,
+                    DeltaUsed = 0.002,
+                    IsDeleted = false,
+                });
+            },
+            timeProvider: new TestTimeProvider(now),
+            options: new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptions
+            {
+                StalenessAlertHours = 36,
+            });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var alert = await harness.LoadAlertAsync(MLAdwinDriftWorker.StalenessDedupeKey);
+        Assert.NotNull(alert);
+        Assert.Equal(AlertType.DataQualityIssue, alert!.AlertType);
+        Assert.True(alert.IsActive);
+        Assert.Contains("adwin_drift_log_stale", alert.ConditionJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideHierarchy_SymbolOnlyTier_AppliesToMatchingPair()
+    {
+        // Symbol-only tier override (no Timeframe qualifier) should apply when no more-
+        // specific override exists. Tightens delta from 0.002 to 0.05 so a borderline
+        // distribution that would not normally trip becomes a drift.
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                AddConfig(db, "MLAdwinDrift:Override:Symbol:EURUSD:Delta", "0.05");
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var driftLogs = await harness.LoadDriftLogsAsync();
+        var log = Assert.Single(driftLogs);
+        Assert.Equal(0.05, log.DeltaUsed, precision: 6);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_OverrideHierarchy_FirstHitWins_MoreSpecificTakesPrecedence()
+    {
+        // Symbol-only tier sets Delta=0.05 (would apply if alone).
+        // Symbol+Timeframe explicit tier sets Delta=0.10 (more specific, wins).
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(
+            seed: db =>
+            {
+                SeedActiveModel(db, 1);
+                AddConfig(db, "MLAdwinDrift:Override:Symbol:EURUSD:Delta", "0.05");
+                AddConfig(db, "MLAdwinDrift:Override:Symbol:EURUSD:Timeframe:H1:Delta", "0.10");
+                db.Set<MLModelPredictionLog>().AddRange(NewLogs(
+                    modelId: 1,
+                    startUtc: now.AddHours(-100).UtcDateTime,
+                    outcomes: Enumerable.Repeat(true, 50).Concat(Enumerable.Repeat(false, 50))));
+            },
+            timeProvider: new TestTimeProvider(now));
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var driftLogs = await harness.LoadDriftLogsAsync();
+        var log = Assert.Single(driftLogs);
+        Assert.Equal(0.10, log.DeltaUsed, precision: 6);
+    }
+
+    [Theory]
+    [InlineData(0,    1, 1, 1)]    // jitter disabled → returns base unchanged
+    [InlineData(60,   1, 1, 61)]   // base 1s + uniform[0, 60] ∈ [1, 61]
+    [InlineData(600, 60, 60, 660)] // base 60s + uniform[0, 600] ∈ [60, 660]
+    public void ApplyJitter_RespectsBoundsAndDisableSemantics(int jitterSeconds, int baseSeconds, int minTotal, int maxTotal)
+    {
+        var result = MLAdwinDriftWorker.ApplyJitter(TimeSpan.FromSeconds(baseSeconds), jitterSeconds);
+        Assert.InRange(result.TotalSeconds, minTotal, maxTotal);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(86_401)]
+    public void Validator_RejectsOutOfRangePollJitter(int value)
+    {
+        var validator = new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptionsValidator();
+        var result = validator.Validate(name: null,
+            new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptions { PollJitterSeconds = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("PollJitterSeconds"));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(17)]
+    public void Validator_RejectsOutOfRangeBackoffShift(int value)
+    {
+        var validator = new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptionsValidator();
+        var result = validator.Validate(name: null,
+            new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptions { FailureBackoffCapShift = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FailureBackoffCapShift"));
+    }
+
+    [Fact]
+    public void Validator_RejectsZeroFleetSystemicDriftThreshold()
+    {
+        var validator = new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptionsValidator();
+        var result = validator.Validate(name: null,
+            new LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptions { FleetSystemicDriftThreshold = 0 });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FleetSystemicDriftThreshold"));
+    }
+
     private static byte[] DecompressOutcomeSeries(byte[] compressed)
     {
         using var input = new MemoryStream(compressed);
@@ -482,7 +674,8 @@ public sealed class MLAdwinDriftWorkerTest
         Action<MLAdwinDriftWorkerTestContext> seed,
         TimeProvider? timeProvider = null,
         IDistributedLock? distributedLock = null,
-        IAlertDispatcher? alertDispatcher = null)
+        IAlertDispatcher? alertDispatcher = null,
+        LascodiaTradingEngine.Application.Common.Options.MLAdwinDriftOptions? options = null)
     {
         var connection = new SqliteConnection("Filename=:memory:");
         connection.Open();
@@ -509,7 +702,9 @@ public sealed class MLAdwinDriftWorkerTest
             healthMonitor: null,
             metrics: null,
             timeProvider: timeProvider,
-            alertDispatcher: alertDispatcher);
+            alertDispatcher: alertDispatcher,
+            dbExceptionClassifier: null,
+            options: options);
 
         return new WorkerHarness(provider, connection, worker);
     }
@@ -554,7 +749,9 @@ public sealed class MLAdwinDriftWorkerTest
     private static IReadOnlyList<MLModelPredictionLog> NewLogs(
         long modelId,
         DateTime startUtc,
-        IEnumerable<bool> outcomes)
+        IEnumerable<bool> outcomes,
+        long idOffset = 0,
+        string symbol = "EURUSD")
     {
         var logs = new List<MLModelPredictionLog>();
         int index = 0;
@@ -564,11 +761,11 @@ public sealed class MLAdwinDriftWorkerTest
             var predictedAtUtc = startUtc.AddHours(index);
             logs.Add(new MLModelPredictionLog
             {
-                Id = index + 1,
-                TradeSignalId = index + 1,
+                Id = idOffset + index + 1,
+                TradeSignalId = idOffset + index + 1,
                 MLModelId = modelId,
                 ModelRole = ModelRole.Champion,
-                Symbol = "EURUSD",
+                Symbol = symbol,
                 Timeframe = Timeframe.H1,
                 PredictedDirection = TradeDirection.Buy,
                 PredictedMagnitudePips = 0,
@@ -628,6 +825,16 @@ public sealed class MLAdwinDriftWorkerTest
                 f.Symbol == symbol &&
                 f.Timeframe == timeframe &&
                 f.DetectorType == "AdwinDrift");
+        }
+
+        public async Task<Alert?> LoadAlertAsync(string dedupeKey)
+        {
+            using var scope = provider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<MLAdwinDriftWorkerTestContext>();
+            return await db.Set<Alert>()
+                .AsNoTracking()
+                .OrderByDescending(a => a.Id)
+                .FirstOrDefaultAsync(a => a.DeduplicationKey == dedupeKey);
         }
 
         public void Dispose()
@@ -722,6 +929,15 @@ public sealed class MLAdwinDriftWorkerTest
                 builder.HasQueryFilter(s => !s.IsDeleted);
                 builder.Property(s => s.Timeframe).HasConversion<string>();
                 builder.Property(s => s.Regime).HasConversion<string>();
+            });
+
+            modelBuilder.Entity<Alert>(builder =>
+            {
+                builder.HasKey(a => a.Id);
+                builder.HasQueryFilter(a => !a.IsDeleted);
+                builder.Property(a => a.AlertType).HasConversion<string>();
+                builder.Property(a => a.Severity).HasConversion<string>();
+                builder.HasIndex(a => a.DeduplicationKey);
             });
         }
     }

@@ -1,7 +1,10 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
@@ -26,11 +29,13 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </remarks>
 public sealed class MLFeatureInteractionWorker : BackgroundService
 {
-    private const string WorkerName = nameof(MLFeatureInteractionWorker);
+    internal const string WorkerName = nameof(MLFeatureInteractionWorker);
     private const string DistributedLockKey = "ml:feature-interaction:cycle";
     private const string RawFeatureMethod = "RawFeaturePartialF";
     private const string ShapFallbackMethod = "ShapContributionPartialF";
 
+    private const string CK_Enabled = "MLFeatureInteraction:Enabled";
+    private const string CK_InitialDelaySecs = "MLFeatureInteraction:InitialDelaySeconds";
     private const string CK_PollSecs = "MLFeatureInteraction:PollIntervalSeconds";
     private const string CK_TopK = "MLFeatureInteraction:TopK";
     private const string CK_IncludedTopN = "MLFeatureInteraction:IncludedTopN";
@@ -41,8 +46,10 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
     private const string CK_MinEffectSize = "MLFeatureInteraction:MinEffectSize";
     private const string CK_MaxQValue = "MLFeatureInteraction:MaxQValue";
     private const string CK_LockTimeoutSecs = "MLFeatureInteraction:LockTimeoutSeconds";
+    private const string CK_DbCommandTimeoutSecs = "MLFeatureInteraction:DbCommandTimeoutSeconds";
 
     private const int DefaultPollSeconds = 7 * 24 * 60 * 60;
+    private const int DefaultInitialDelaySeconds = 0;
     private const int DefaultTopK = 5;
     private const int DefaultIncludedTopN = 3;
     private const int DefaultMinSamples = 100;
@@ -50,11 +57,32 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
     private const int DefaultMaxFeatures = MLFeatureHelper.FeatureCountV7;
     private const int DefaultMaxModelsPerCycle = 256;
     private const int DefaultLockTimeoutSeconds = 0;
+    private const int DefaultDbCommandTimeoutSeconds = 30;
     private const double DefaultMinEffectSize = 0.001;
     private const double DefaultMaxQValue = 0.20;
 
+    private static readonly string[] ConfigKeys =
+    [
+        CK_Enabled,
+        CK_InitialDelaySecs,
+        CK_PollSecs,
+        CK_TopK,
+        CK_IncludedTopN,
+        CK_MinSamples,
+        CK_MaxLogsPerModel,
+        CK_MaxFeatures,
+        CK_MaxModelsPerCycle,
+        CK_MinEffectSize,
+        CK_MaxQValue,
+        CK_LockTimeoutSecs,
+        CK_DbCommandTimeoutSecs
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions =
         new() { PropertyNameCaseInsensitive = true };
+    private static readonly TimeSpan WakeInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(15);
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLFeatureInteractionWorker> _logger;
@@ -62,6 +90,15 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly TradingMetrics? _metrics;
     private readonly TimeProvider _timeProvider;
+    private readonly MLFeatureInteractionOptions _options;
+    private int _missingDistributedLockWarningEmitted;
+    private int _consecutiveCycleFailuresField;
+
+    private int ConsecutiveCycleFailures
+    {
+        get => Volatile.Read(ref _consecutiveCycleFailuresField);
+        set => Interlocked.Exchange(ref _consecutiveCycleFailuresField, value);
+    }
 
     public MLFeatureInteractionWorker(
         IServiceScopeFactory scopeFactory,
@@ -69,7 +106,8 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         IDistributedLock? distributedLock = null,
         IWorkerHealthMonitor? healthMonitor = null,
         TradingMetrics? metrics = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        MLFeatureInteractionOptions? options = null)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
@@ -77,57 +115,129 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         _healthMonitor = healthMonitor;
         _metrics = metrics;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _options = options ?? new MLFeatureInteractionOptions();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLFeatureInteractionWorker started.");
+        _logger.LogInformation("{Worker} started.", WorkerName);
         _healthMonitor?.RecordWorkerMetadata(
             WorkerName,
             "Ranks schema-aware feature-product candidates from resolved ML prediction logs.",
-            TimeSpan.FromSeconds(DefaultPollSeconds));
+            TimeSpan.FromSeconds(NormalizePollSeconds(_options.PollIntervalSeconds)));
 
-        while (!stoppingToken.IsCancellationRequested)
+        DateTime lastCycleStartUtc = DateTime.MinValue;
+        DateTime lastSuccessUtc = DateTime.MinValue;
+        TimeSpan currentPollInterval = TimeSpan.FromSeconds(NormalizePollSeconds(_options.PollIntervalSeconds));
+
+        try
         {
-            int pollSecs = DefaultPollSeconds;
-            var cycleStart = Stopwatch.GetTimestamp();
-            try
-            {
-                _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
-                pollSecs = await RunCycleAsync(stoppingToken);
+            var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName)
+                               + TimeSpan.FromSeconds(NormalizeInitialDelaySeconds(_options.InitialDelaySeconds));
+            if (initialDelay > TimeSpan.Zero)
+                await Task.Delay(initialDelay, _timeProvider, stoppingToken);
 
-                long durationMs = (long)Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds;
-                _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
-                _metrics?.WorkerCycleDurationMs.Record(
-                    durationMs,
-                    new KeyValuePair<string, object?>("worker", WorkerName));
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _metrics?.WorkerErrors.Add(
-                    1,
-                    new KeyValuePair<string, object?>("worker", WorkerName));
-                _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
-                _logger.LogError(ex, "MLFeatureInteractionWorker loop error.");
-            }
+                var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                if (lastSuccessUtc != DateTime.MinValue)
+                    _metrics?.MLFeatureInteractionTimeSinceLastSuccessSec.Record((nowUtc - lastSuccessUtc).TotalSeconds);
 
-            await Task.Delay(TimeSpan.FromSeconds(Math.Clamp(pollSecs, 60, 7 * 24 * 60 * 60)), stoppingToken);
+                if (nowUtc - lastCycleStartUtc >= currentPollInterval)
+                {
+                    lastCycleStartUtc = nowUtc;
+                    var cycleStart = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                        var result = await RunCycleAsync(stoppingToken);
+                        currentPollInterval = result.Config.PollInterval;
+
+                        long durationMs = (long)Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds;
+                        _healthMonitor?.RecordBacklogDepth(WorkerName, result.ModelsDiscovered);
+                        _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                        _metrics?.WorkerCycleDurationMs.Record(
+                            durationMs,
+                            new KeyValuePair<string, object?>("worker", WorkerName));
+                        _metrics?.MLFeatureInteractionCycleDurationMs.Record(durationMs);
+
+                        if (result.SkippedReason is { Length: > 0 })
+                        {
+                            _logger.LogDebug("{Worker}: cycle skipped ({Reason}).", WorkerName, result.SkippedReason);
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "{Worker}: models={Models}, processed={Processed}, skipped={Skipped}, failed={Failed}, auditsWritten={AuditsWritten}, staleAuditsDeleted={StaleAuditsDeleted}.",
+                                WorkerName,
+                                result.ModelsDiscovered,
+                                result.ModelsProcessed,
+                                result.ModelsSkipped,
+                                result.ModelsFailed,
+                                result.AuditsWritten,
+                                result.StaleAuditsDeleted);
+                        }
+
+                        var previousFailures = ConsecutiveCycleFailures;
+                        if (previousFailures > 0)
+                        {
+                            _healthMonitor?.RecordRecovery(WorkerName, previousFailures);
+                            _logger.LogInformation(
+                                "{Worker}: recovered after {Failures} consecutive failure(s).",
+                                WorkerName,
+                                previousFailures);
+                        }
+
+                        ConsecutiveCycleFailures = 0;
+                        lastSuccessUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref _consecutiveCycleFailuresField);
+                        _metrics?.WorkerErrors.Add(
+                            1,
+                            new KeyValuePair<string, object?>("worker", WorkerName),
+                            new KeyValuePair<string, object?>("reason", "ml_feature_interaction_cycle"));
+                        _healthMonitor?.RecordRetry(WorkerName);
+                        _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                        _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                    }
+                }
+
+                var delay = ConsecutiveCycleFailures > 0
+                    ? CalculateBackoffDelay(ConsecutiveCycleFailures)
+                    : WakeInterval;
+                await Task.Delay(delay, _timeProvider, stoppingToken);
+            }
         }
-
-        _healthMonitor?.RecordWorkerStopped(WorkerName);
-        _logger.LogInformation("MLFeatureInteractionWorker stopping.");
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopped.", WorkerName);
+        }
     }
 
-    internal async Task<int> RunCycleAsync(CancellationToken ct)
+    internal async Task<FeatureInteractionCycleResult> RunCycleAsync(CancellationToken ct)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>().GetDbContext();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
-        var config = await LoadConfigAsync(readCtx, ct);
+        var config = await LoadConfigAsync(readCtx, _options, ct);
+        ApplyCommandTimeout(readCtx, config.DbCommandTimeoutSeconds);
+        ApplyCommandTimeout(writeCtx, config.DbCommandTimeoutSeconds);
+
+        if (!config.Enabled)
+        {
+            RecordCycleSkipped("disabled");
+            return FeatureInteractionCycleResult.Skipped(config, "disabled");
+        }
 
         IAsyncDisposable? cycleLock = null;
         if (_distributedLock is not null)
@@ -139,14 +249,23 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
 
             if (cycleLock is null)
             {
-                _logger.LogDebug("MLFeatureInteractionWorker: cycle skipped because distributed lock is held elsewhere.");
-                return config.PollSeconds;
+                _metrics?.MLFeatureInteractionLockAttempts.Add(1, Tag("outcome", "busy"));
+                RecordCycleSkipped("lock_busy");
+                _logger.LogDebug("{Worker}: cycle skipped because distributed lock is held elsewhere.", WorkerName);
+                return FeatureInteractionCycleResult.Skipped(config, "lock_busy");
             }
+
+            _metrics?.MLFeatureInteractionLockAttempts.Add(1, Tag("outcome", "acquired"));
         }
         else
         {
-            _logger.LogWarning(
-                "MLFeatureInteractionWorker running without IDistributedLock; duplicate audit rows are possible in multi-instance deployments.");
+            _metrics?.MLFeatureInteractionLockAttempts.Add(1, Tag("outcome", "unavailable"));
+            if (Interlocked.Exchange(ref _missingDistributedLockWarningEmitted, 1) == 0)
+            {
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate audit rows are possible in multi-instance deployments.",
+                    WorkerName);
+            }
         }
 
         await using (cycleLock)
@@ -154,18 +273,16 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
             await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
             try
             {
-                await RunCycleCoreAsync(readCtx, writeCtx, config, ct);
+                return await RunCycleCoreAsync(readCtx, writeCtx, config, ct);
             }
             finally
             {
                 WorkerBulkhead.MLMonitoring.Release();
             }
         }
-
-        return config.PollSeconds;
     }
 
-    private async Task RunCycleCoreAsync(
+    private async Task<FeatureInteractionCycleResult> RunCycleCoreAsync(
         DbContext readCtx,
         DbContext writeCtx,
         FeatureInteractionConfig config,
@@ -173,7 +290,13 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
     {
         var models = await readCtx.Set<MLModel>()
             .AsNoTracking()
-            .Where(m => m.IsActive && !m.IsDeleted && !m.IsMetaLearner && m.ModelBytes != null)
+            .Where(m => m.IsActive
+                        && !m.IsDeleted
+                        && !m.IsSuppressed
+                        && !m.IsMetaLearner
+                        && !m.IsMamlInitializer
+                        && m.ModelBytes != null
+                        && (m.Status == MLModelStatus.Active || m.IsFallbackChampion))
             .OrderBy(m => m.Symbol)
             .ThenBy(m => m.Timeframe)
             .ThenByDescending(m => m.TrainedAt)
@@ -189,13 +312,13 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
 
         _healthMonitor?.RecordBacklogDepth(WorkerName, models.Count);
 
-        int written = 0, skipped = 0, failed = 0;
+        int processed = 0, skipped = 0, failed = 0, auditsWritten = 0, staleAuditsDeleted = 0;
         foreach (var model in models)
         {
             ct.ThrowIfCancellationRequested();
             try
             {
-                bool didWrite = await ProcessModelAsync(
+                var modelResult = await ProcessModelAsync(
                     readCtx,
                     writeCtx,
                     model.Id,
@@ -205,24 +328,61 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
                     config,
                     ct);
 
-                if (didWrite) written++;
-                else skipped++;
+                if (modelResult.Processed)
+                {
+                    processed++;
+                }
+                else
+                {
+                    skipped++;
+                    _metrics?.MLFeatureInteractionModelsSkipped.Add(
+                        1,
+                        Tag("reason", modelResult.State),
+                        Tag("symbol", model.Symbol),
+                        Tag("timeframe", model.Timeframe.ToString()));
+                }
+
+                auditsWritten += modelResult.AuditsWritten;
+                staleAuditsDeleted += modelResult.StaleAuditsDeleted;
+                _metrics?.MLFeatureInteractionPredictionRows.Record(
+                    modelResult.UsableRows,
+                    Tag("method", modelResult.Method ?? "none"),
+                    Tag("state", modelResult.State));
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failed++;
+                _metrics?.MLFeatureInteractionModelsSkipped.Add(
+                    1,
+                    Tag("reason", "model_error"),
+                    Tag("symbol", model.Symbol),
+                    Tag("timeframe", model.Timeframe.ToString()));
                 _logger.LogWarning(ex,
-                    "MLFeatureInteractionWorker: failed model {ModelId} ({Symbol}/{Timeframe}); continuing.",
-                    model.Id, model.Symbol, model.Timeframe);
+                    "{Worker}: failed model {ModelId} ({Symbol}/{Timeframe}); continuing.",
+                    WorkerName, model.Id, model.Symbol, model.Timeframe);
             }
         }
 
-        _logger.LogInformation(
-            "MLFeatureInteractionWorker cycle complete: written={Written}, skipped={Skipped}, failed={Failed}, models={Total}.",
-            written, skipped, failed, models.Count);
+        _metrics?.MLFeatureInteractionModelsEvaluated.Add(processed);
+        if (skipped > 0)
+            _metrics?.MLFeatureInteractionModelsSkipped.Add(skipped, Tag("reason", "cycle_total"));
+        if (auditsWritten > 0)
+            _metrics?.MLFeatureInteractionAuditsWritten.Add(auditsWritten);
+        if (staleAuditsDeleted > 0)
+            _metrics?.MLFeatureInteractionStaleAuditsDeleted.Add(staleAuditsDeleted);
+
+        return new FeatureInteractionCycleResult(
+            config,
+            ModelsDiscovered: models.Count,
+            ModelsProcessed: processed,
+            ModelsSkipped: skipped,
+            ModelsFailed: failed,
+            AuditsWritten: auditsWritten,
+            StaleAuditsDeleted: staleAuditsDeleted,
+            SkippedReason: null);
     }
 
-    private async Task<bool> ProcessModelAsync(
+    private async Task<FeatureInteractionModelResult> ProcessModelAsync(
         DbContext readCtx,
         DbContext writeCtx,
         long modelId,
@@ -234,7 +394,7 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
     {
         var snapshot = TryDeserializeSnapshot(modelBytes, modelId);
         if (snapshot is null)
-            return false;
+            return FeatureInteractionModelResult.Skipped("invalid_snapshot");
 
         int resolvedFeatures = snapshot.ResolveExpectedInputFeatures();
         int baseFeatureCount = snapshot.InteractionBaseFeatureCount > 0
@@ -242,7 +402,7 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
             : resolvedFeatures;
         baseFeatureCount = Math.Min(baseFeatureCount, resolvedFeatures);
         if (baseFeatureCount < 2 || baseFeatureCount > MLFeatureHelper.MaxAllowedFeatureCount)
-            return false;
+            return FeatureInteractionModelResult.Skipped("invalid_feature_count");
 
         int schemaVersion = snapshot.ResolveFeatureSchemaVersion();
         int featureLimit = Math.Clamp(config.MaxFeatures, 2, baseFeatureCount);
@@ -265,9 +425,9 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         if (logs.Count < config.MinSamples)
         {
             _logger.LogDebug(
-                "MLFeatureInteractionWorker: model {ModelId} has {Rows}/{Min} feature rows before parsing.",
-                modelId, logs.Count, config.MinSamples);
-            return false;
+                "{Worker}: model {ModelId} has {Rows}/{Min} feature rows before parsing.",
+                WorkerName, modelId, logs.Count, config.MinSamples);
+            return FeatureInteractionModelResult.Skipped("insufficient_logs", logs.Count);
         }
 
         int rawRows = logs.Count(l => l.RawFeaturesJson is not null);
@@ -291,10 +451,10 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         if (rows.Count < config.MinSamples)
         {
             _logger.LogDebug(
-                "MLFeatureInteractionWorker: model {ModelId} usable rows {Rows}/{Min}; method={Method}, rawRows={RawRows}, shapRows={ShapRows}, malformed={Malformed}, wrongShape={WrongShape}, nonFinite={NonFinite}.",
-                modelId, rows.Count, config.MinSamples, method, rawRows, shapRows,
+                "{Worker}: model {ModelId} usable rows {Rows}/{Min}; method={Method}, rawRows={RawRows}, shapRows={ShapRows}, malformed={Malformed}, wrongShape={WrongShape}, nonFinite={NonFinite}.",
+                WorkerName, modelId, rows.Count, config.MinSamples, method, rawRows, shapRows,
                 selectedParse.Malformed, selectedParse.WrongShape, selectedParse.NonFinite);
-            return false;
+            return FeatureInteractionModelResult.Skipped("insufficient_usable_rows", rows.Count, method);
         }
 
         var candidates = ScorePairs(rows, featureLimit);
@@ -309,7 +469,10 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
 
         await using var tx = await writeCtx.Database.BeginTransactionAsync(ct);
         var old = await writeCtx.Set<MLFeatureInteractionAudit>()
-            .Where(a => a.MLModelId == modelId && !a.IsDeleted)
+            .Where(a => a.Symbol == symbol
+                        && a.Timeframe == timeframe
+                        && a.BaseFeatureCount == baseFeatureCount
+                        && !a.IsDeleted)
             .ToListAsync(ct);
         foreach (var audit in old)
             audit.IsDeleted = true;
@@ -345,14 +508,20 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         await tx.CommitAsync(ct);
 
         _logger.LogInformation(
-            "MLFeatureInteractionWorker: {Symbol}/{Timeframe} model={ModelId} method={Method} rows={Rows}, pairsTested={Pairs}, written={Written}, top={TopA}x{TopB}, score={Score:F3}, q={Q:F4}.",
-            symbol, timeframe, modelId, method, rows.Count, candidates.Count, topK.Count,
+            "{Worker}: {Symbol}/{Timeframe} model={ModelId} method={Method} rows={Rows}, pairsTested={Pairs}, written={Written}, staleDeleted={StaleDeleted}, top={TopA}x{TopB}, score={Score:F3}, q={Q:F4}.",
+            WorkerName, symbol, timeframe, modelId, method, rows.Count, candidates.Count, topK.Count, old.Count,
             topK.Count > 0 ? featureNames[topK[0].A] : "?",
             topK.Count > 0 ? featureNames[topK[0].B] : "?",
             topK.Count > 0 ? topK[0].Score : 0.0,
             topK.Count > 0 ? topK[0].QValue : 1.0);
 
-        return true;
+        return new FeatureInteractionModelResult(
+            Processed: true,
+            State: topK.Count > 0 ? "audits_written" : "no_significant_pairs",
+            UsableRows: rows.Count,
+            AuditsWritten: topK.Count,
+            StaleAuditsDeleted: old.Count,
+            Method: method);
     }
 
     internal static List<InteractionCandidate> ScorePairs(IReadOnlyList<InteractionRow> rows, int featureCount)
@@ -686,36 +855,192 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         }
     }
 
-    private static async Task<FeatureInteractionConfig> LoadConfigAsync(DbContext ctx, CancellationToken ct)
+    internal static async Task<FeatureInteractionConfig> LoadConfigAsync(
+        DbContext ctx,
+        MLFeatureInteractionOptions options,
+        CancellationToken ct)
     {
-        var values = await ctx.Set<EngineConfig>()
+        var rows = await ctx.Set<EngineConfig>()
             .AsNoTracking()
-            .Where(c => c.Key.StartsWith("MLFeatureInteraction:"))
-            .Select(c => new { c.Key, c.Value })
-            .ToDictionaryAsync(c => c.Key, c => c.Value, StringComparer.OrdinalIgnoreCase, ct);
+            .Where(c => ConfigKeys.Contains(c.Key) && !c.IsDeleted)
+            .Select(c => new { c.Id, c.Key, c.Value, c.LastUpdatedAt })
+            .ToListAsync(ct);
+
+        var values = rows
+            .Where(c => c.Value is not null)
+            .GroupBy(c => c.Key, StringComparer.Ordinal)
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderBy(c => c.LastUpdatedAt).ThenBy(c => c.Id).Last().Value!,
+                StringComparer.Ordinal);
+
+        var topK = NormalizeTopK(GetConfig(values, CK_TopK, options.TopK));
+        var includedTopN = NormalizeIncludedTopN(
+            GetConfig(values, CK_IncludedTopN, options.IncludedTopN),
+            topK);
+        var pollSeconds = NormalizePollSeconds(GetConfig(values, CK_PollSecs, options.PollIntervalSeconds));
 
         return new FeatureInteractionConfig(
-            PollSeconds: GetInt(values, CK_PollSecs, DefaultPollSeconds, 60, 7 * 24 * 60 * 60),
-            TopK: GetInt(values, CK_TopK, DefaultTopK, 1, 20),
-            IncludedTopN: GetInt(values, CK_IncludedTopN, DefaultIncludedTopN, 0, 10),
-            MinSamples: GetInt(values, CK_MinSamples, DefaultMinSamples, 50, 100_000),
-            MaxLogsPerModel: GetInt(values, CK_MaxLogsPerModel, DefaultMaxLogsPerModel, 100, 100_000),
-            MaxFeatures: GetInt(values, CK_MaxFeatures, DefaultMaxFeatures, 2, MLFeatureHelper.MaxAllowedFeatureCount),
-            MaxModelsPerCycle: GetInt(values, CK_MaxModelsPerCycle, DefaultMaxModelsPerCycle, 1, 10_000),
-            MinEffectSize: GetDouble(values, CK_MinEffectSize, DefaultMinEffectSize, 0.0, 1.0),
-            MaxQValue: GetDouble(values, CK_MaxQValue, DefaultMaxQValue, 0.0, 1.0),
-            LockTimeoutSeconds: GetInt(values, CK_LockTimeoutSecs, DefaultLockTimeoutSeconds, 0, 300));
+            Enabled: GetConfig(values, CK_Enabled, options.Enabled),
+            InitialDelay: TimeSpan.FromSeconds(NormalizeInitialDelaySeconds(
+                GetConfig(values, CK_InitialDelaySecs, options.InitialDelaySeconds))),
+            PollInterval: TimeSpan.FromSeconds(pollSeconds),
+            PollSeconds: pollSeconds,
+            TopK: topK,
+            IncludedTopN: includedTopN,
+            MinSamples: NormalizeMinSamples(GetConfig(values, CK_MinSamples, options.MinSamples)),
+            MaxLogsPerModel: NormalizeMaxLogsPerModel(
+                GetConfig(values, CK_MaxLogsPerModel, options.MaxLogsPerModel)),
+            MaxFeatures: NormalizeMaxFeatures(GetConfig(values, CK_MaxFeatures, options.MaxFeatures)),
+            MaxModelsPerCycle: NormalizeMaxModelsPerCycle(
+                GetConfig(values, CK_MaxModelsPerCycle, options.MaxModelsPerCycle)),
+            MinEffectSize: NormalizeMinEffectSize(GetConfig(values, CK_MinEffectSize, options.MinEffectSize)),
+            MaxQValue: NormalizeMaxQValue(GetConfig(values, CK_MaxQValue, options.MaxQValue)),
+            LockTimeoutSeconds: NormalizeLockTimeoutSeconds(
+                GetConfig(values, CK_LockTimeoutSecs, options.LockTimeoutSeconds)),
+            DbCommandTimeoutSeconds: NormalizeDbCommandTimeoutSeconds(
+                GetConfig(values, CK_DbCommandTimeoutSecs, options.DbCommandTimeoutSeconds)));
     }
 
-    private static int GetInt(Dictionary<string, string> values, string key, int fallback, int min, int max)
-        => values.TryGetValue(key, out var raw) && int.TryParse(raw, out var parsed)
-            ? Math.Clamp(parsed, min, max)
-            : fallback;
+    private static T GetConfig<T>(
+        IReadOnlyDictionary<string, string> values,
+        string key,
+        T defaultValue)
+    {
+        if (!values.TryGetValue(key, out var raw))
+            return defaultValue;
 
-    private static double GetDouble(Dictionary<string, string> values, string key, double fallback, double min, double max)
-        => values.TryGetValue(key, out var raw) && double.TryParse(raw, out var parsed) && double.IsFinite(parsed)
-            ? Math.Clamp(parsed, min, max)
-            : fallback;
+        return TryConvertConfig(raw, out T parsed)
+            ? parsed
+            : defaultValue;
+    }
+
+    private static bool TryConvertConfig<T>(string value, out T result)
+    {
+        object? parsed = null;
+        var targetType = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
+        var normalized = value.Trim();
+
+        if (targetType == typeof(string))
+        {
+            parsed = value;
+        }
+        else if (targetType == typeof(int)
+                 && int.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intValue))
+        {
+            parsed = intValue;
+        }
+        else if (targetType == typeof(double)
+                 && double.TryParse(normalized, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var doubleValue))
+        {
+            parsed = doubleValue;
+        }
+        else if (targetType == typeof(bool)
+                 && TryParseBool(normalized, out var boolValue))
+        {
+            parsed = boolValue;
+        }
+
+        if (parsed is T typed)
+        {
+            result = typed;
+            return true;
+        }
+
+        result = default!;
+        return false;
+    }
+
+    internal static int NormalizeInitialDelaySeconds(int value)
+        => value is >= 0 and <= 86_400 ? value : DefaultInitialDelaySeconds;
+
+    internal static int NormalizePollSeconds(int value)
+        => value is >= 60 and <= 604_800 ? value : DefaultPollSeconds;
+
+    internal static int NormalizeTopK(int value)
+        => value is >= 1 and <= 20 ? value : DefaultTopK;
+
+    internal static int NormalizeIncludedTopN(int value, int topK)
+    {
+        if (value is < 0 or > 20)
+            return Math.Min(DefaultIncludedTopN, topK);
+
+        return Math.Min(value, topK);
+    }
+
+    internal static int NormalizeMinSamples(int value)
+        => value is >= 50 and <= 100_000 ? value : DefaultMinSamples;
+
+    internal static int NormalizeMaxLogsPerModel(int value)
+        => value is >= 100 and <= 100_000 ? value : DefaultMaxLogsPerModel;
+
+    internal static int NormalizeMaxFeatures(int value)
+        => value is >= 2 and <= MLFeatureHelper.MaxAllowedFeatureCount ? value : DefaultMaxFeatures;
+
+    internal static int NormalizeMaxModelsPerCycle(int value)
+        => value is >= 1 and <= 10_000 ? value : DefaultMaxModelsPerCycle;
+
+    internal static double NormalizeMinEffectSize(double value)
+        => double.IsFinite(value) && value is >= 0.0 and <= 1.0 ? value : DefaultMinEffectSize;
+
+    internal static double NormalizeMaxQValue(double value)
+        => double.IsFinite(value) && value is >= 0.0 and <= 1.0 ? value : DefaultMaxQValue;
+
+    internal static int NormalizeLockTimeoutSeconds(int value)
+        => value is >= 0 and <= 300 ? value : DefaultLockTimeoutSeconds;
+
+    internal static int NormalizeDbCommandTimeoutSeconds(int value)
+        => value is >= 1 and <= 600 ? value : DefaultDbCommandTimeoutSeconds;
+
+    private static bool TryParseBool(string value, out bool result)
+    {
+        if (bool.TryParse(value, out result))
+            return true;
+
+        if (string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "on", StringComparison.OrdinalIgnoreCase))
+        {
+            result = true;
+            return true;
+        }
+
+        if (string.Equals(value, "0", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "no", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "off", StringComparison.OrdinalIgnoreCase))
+        {
+            result = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void RecordCycleSkipped(string reason)
+        => _metrics?.MLFeatureInteractionCyclesSkipped.Add(1, Tag("reason", reason));
+
+    private static KeyValuePair<string, object?> Tag(string key, object? value)
+        => new(key, value);
+
+    private static TimeSpan CalculateBackoffDelay(int consecutiveFailures)
+    {
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var seconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(seconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private static void ApplyCommandTimeout(DbContext db, int seconds)
+    {
+        try
+        {
+            if (db.Database.IsRelational())
+                db.Database.SetCommandTimeout(TimeSpan.FromSeconds(seconds));
+        }
+        catch (InvalidOperationException)
+        {
+            // Some providers do not expose relational command timeout configuration.
+        }
+    }
 
     public readonly record struct InteractionRow(double[] Values, double Label);
 
@@ -739,7 +1064,10 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         int WrongShape,
         int NonFinite);
 
-    private sealed record FeatureInteractionConfig(
+    internal sealed record FeatureInteractionConfig(
+        bool Enabled,
+        TimeSpan InitialDelay,
+        TimeSpan PollInterval,
         int PollSeconds,
         int TopK,
         int IncludedTopN,
@@ -749,5 +1077,49 @@ public sealed class MLFeatureInteractionWorker : BackgroundService
         int MaxModelsPerCycle,
         double MinEffectSize,
         double MaxQValue,
-        int LockTimeoutSeconds);
+        int LockTimeoutSeconds,
+        int DbCommandTimeoutSeconds);
+
+    internal sealed record FeatureInteractionCycleResult(
+        FeatureInteractionConfig Config,
+        int ModelsDiscovered,
+        int ModelsProcessed,
+        int ModelsSkipped,
+        int ModelsFailed,
+        int AuditsWritten,
+        int StaleAuditsDeleted,
+        string? SkippedReason)
+    {
+        public static FeatureInteractionCycleResult Skipped(FeatureInteractionConfig config, string reason)
+            => new(
+                config,
+                ModelsDiscovered: 0,
+                ModelsProcessed: 0,
+                ModelsSkipped: 0,
+                ModelsFailed: 0,
+                AuditsWritten: 0,
+                StaleAuditsDeleted: 0,
+                SkippedReason: reason);
+    }
+
+    private sealed record FeatureInteractionModelResult(
+        bool Processed,
+        string State,
+        int UsableRows,
+        int AuditsWritten,
+        int StaleAuditsDeleted,
+        string? Method)
+    {
+        public static FeatureInteractionModelResult Skipped(
+            string reason,
+            int usableRows = 0,
+            string? method = null)
+            => new(
+                Processed: false,
+                State: reason,
+                UsableRows: usableRows,
+                AuditsWritten: 0,
+                StaleAuditsDeleted: 0,
+                Method: method);
+    }
 }

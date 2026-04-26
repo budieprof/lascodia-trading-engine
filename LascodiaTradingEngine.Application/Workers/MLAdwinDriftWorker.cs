@@ -6,6 +6,7 @@ using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Drift;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
@@ -48,7 +49,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// the TOCTOU race between read and insert.
 /// </para>
 /// </remarks>
-public sealed class MLAdwinDriftWorker : BackgroundService
+public sealed partial class MLAdwinDriftWorker : BackgroundService
 {
     internal const string WorkerName = nameof(MLAdwinDriftWorker);
 
@@ -142,11 +143,17 @@ public sealed class MLAdwinDriftWorker : BackgroundService
     private readonly TradingMetrics? _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly IAlertDispatcher? _alertDispatcher;
+    private readonly IDatabaseExceptionClassifier? _dbExceptionClassifier;
+    private readonly MLAdwinDriftOptions _options;
 
     // Mutated only from ExecuteAsync's single thread today, but flagged volatile/Interlocked
     // so a future refactor that runs cycles concurrently does not silently break.
     private long _consecutiveFailuresField;
     private int _missingDistributedLockWarningEmitted;
+    private bool _fleetSystemicAlertActive;
+    private bool _stalenessAlertActive;
+    internal const string FleetSystemicDedupeKey = "MLAdwinDrift:FleetSystemic";
+    internal const string StalenessDedupeKey = "MLAdwinDrift:Staleness";
 
     private readonly record struct ActiveModelCandidate(
         long Id,
@@ -196,7 +203,9 @@ public sealed class MLAdwinDriftWorker : BackgroundService
         IWorkerHealthMonitor? healthMonitor = null,
         TradingMetrics? metrics = null,
         TimeProvider? timeProvider = null,
-        IAlertDispatcher? alertDispatcher = null)
+        IAlertDispatcher? alertDispatcher = null,
+        IDatabaseExceptionClassifier? dbExceptionClassifier = null,
+        MLAdwinDriftOptions? options = null)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
@@ -205,6 +214,8 @@ public sealed class MLAdwinDriftWorker : BackgroundService
         _metrics = metrics;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _alertDispatcher = alertDispatcher;
+        _dbExceptionClassifier = dbExceptionClassifier;
+        _options = options ?? new MLAdwinDriftOptions();
     }
 
     private int ConsecutiveFailures
@@ -322,7 +333,12 @@ public sealed class MLAdwinDriftWorker : BackgroundService
 
                 try
                 {
-                    await Task.Delay(CalculateDelay(WakeInterval, ConsecutiveFailures), _timeProvider, stoppingToken);
+                    // Anti-lockstep: jitter the wake interval so replicas started together
+                    // don't race on the cycle-level lock at the same instant.
+                    await Task.Delay(
+                        ApplyJitter(CalculateDelay(WakeInterval, ConsecutiveFailures), _options.PollJitterSeconds),
+                        _timeProvider,
+                        stoppingToken);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -451,10 +467,15 @@ public sealed class MLAdwinDriftWorker : BackgroundService
         var recentPredictionCutoff = nowUtc.AddDays(-settings.LookbackDays);
 
         // Phase A: load active models (with the dormant-model filter pushed into SQL).
+        var phaseStart = Stopwatch.GetTimestamp();
         var activeModels = await LoadActiveModelsAsync(db, settings, recentPredictionCutoff, ct);
+        _metrics?.MLAdwinPhaseLoadActiveModelsMs.Record(Stopwatch.GetElapsedTime(phaseStart).TotalMilliseconds);
 
         if (activeModels.Count == 0)
         {
+            // Even when there are no active models to evaluate, the staleness alert still
+            // runs — a fleet that has lost every model should not silently go stale.
+            await UpdateStalenessAlertAsync(db, nowUtc, ct);
             return new AdwinCycleResult(
                 settings,
                 SkippedReason: null,
@@ -468,17 +489,20 @@ public sealed class MLAdwinDriftWorker : BackgroundService
 
         // Phase B: batch-load all per-pair data (overrides + outcomes + flags + regimes).
         // Each is a single query — no per-model round-trips.
-        var overrides = await LoadAllPerPairOverridesAsync(db, ct);
+        var overrides = await LoadAllPerPairOverridesAsync(db, activeModels, ct);
         int maxBatchedWindowSize = ComputeMaxBatchedWindowSize(activeModels, settings, overrides);
 
         var modelIds = activeModels.Select(m => m.Id).ToList();
+        phaseStart = Stopwatch.GetTimestamp();
         var outcomesByModel = await LoadOutcomesBatchedAsync(
             db, modelIds, maxBatchedWindowSize, recentPredictionCutoff, ct);
         var flagsByPair = await LoadFlagsBatchedAsync(db, activeModels, ct);
         var regimesByPair = await LoadDominantRegimesBatchedAsync(
             db, activeModels, recentPredictionCutoff, ct);
+        _metrics?.MLAdwinPhaseLoadOutcomesMs.Record(Stopwatch.GetElapsedTime(phaseStart).TotalMilliseconds);
 
         // Phase C: pure-CPU evaluation per model (no DB writes, no exceptions from queries).
+        phaseStart = Stopwatch.GetTimestamp();
         var prepared = new List<PreparedOutcome>(activeModels.Count);
         int failedModelCount = 0;
 
@@ -546,10 +570,13 @@ public sealed class MLAdwinDriftWorker : BackgroundService
             }
         }
 
+        _metrics?.MLAdwinPhaseEvaluationMs.Record(Stopwatch.GetElapsedTime(phaseStart).TotalMilliseconds);
+
         // Phase D: batched audit log + flag mutation saves. One commit per batch (default 32),
         // with per-model fallback on DbUpdateException so a single bad row doesn't poison
         // the others. Saves audit+flag changes only — retrain inserts (which need their own
         // unique-violation handling) happen in phase E.
+        phaseStart = Stopwatch.GetTimestamp();
         int flagClearCount = 0;
         var evaluated = prepared.Where(p => p.Evaluated).ToList();
         foreach (var batch in Chunk(evaluated, settings.SaveBatchSize))
@@ -557,9 +584,11 @@ public sealed class MLAdwinDriftWorker : BackgroundService
             flagClearCount += await SaveAuditAndFlagsBatchAsync(
                 db, batch, flagsByPair, settings, nowUtc, ct);
         }
+        _metrics?.MLAdwinPhaseSaveAuditAndFlagsMs.Record(Stopwatch.GetElapsedTime(phaseStart).TotalMilliseconds);
 
         // Phase E: per-drift retrain queue + alert dispatch. Audit row is already committed,
         // so drift evidence is durable even if retrain or alert dispatch fails downstream.
+        phaseStart = Stopwatch.GetTimestamp();
         int evaluatedModelCount = evaluated.Count;
         int driftCount = evaluated.Count(p => p.Scan!.Value.DriftDetected);
         int retrainingQueuedCount = 0;
@@ -617,6 +646,13 @@ public sealed class MLAdwinDriftWorker : BackgroundService
                     WorkerName, p.Model.Id, p.Model.Symbol, p.Model.Timeframe);
             }
         }
+
+        _metrics?.MLAdwinPhasePostSaveMs.Record(Stopwatch.GetElapsedTime(phaseStart).TotalMilliseconds);
+
+        // Phase F: aggregate signals — fleet-systemic alert when N models drift in one
+        // cycle, staleness alert when audit-log writes have stalled. Both auto-resolve.
+        await UpdateFleetSystemicAlertAsync(driftCount, evaluatedModelCount, settings, nowUtc, ct);
+        await UpdateStalenessAlertAsync(db, nowUtc, ct);
 
         return new AdwinCycleResult(
             settings,
@@ -987,7 +1023,7 @@ public sealed class MLAdwinDriftWorker : BackgroundService
         {
             await db.SaveChangesAsync(ct);
         }
-        catch (DbUpdateException ex) when (DbExceptions.IsUniqueViolation(ex))
+        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
         {
             // Concurrent worker (or another auto-retrain trigger) won the race and inserted
             // its own Queued/Running row through the partial unique index. Treat as a
@@ -1268,7 +1304,7 @@ ORDER BY t.""MLModelId"", t.""PredictedAt"" DESC";
 
         var values = await db.Set<EngineConfig>()
             .AsNoTracking()
-            .Where(config => keys.Contains(config.Key))
+            .Where(config => !config.IsDeleted && keys.Contains(config.Key))
             .ToDictionaryAsync(config => config.Key, config => config.Value, ct);
 
         int windowSize = ClampInt(
@@ -1316,56 +1352,167 @@ ORDER BY t.""MLModelId"", t.""PredictedAt"" DESC";
     }
 
     /// <summary>
-    /// Single-query fetch of all per-pair overrides keyed under <c>MLAdwinDrift:Override:</c>,
-    /// parsed and clamped to safe ranges. Replaces the previous per-model overrides query.
+    /// Single-query fetch of every <c>MLAdwinDrift:Override:*</c> row. Supports four key
+    /// formats with first-hit-wins precedence (most specific to least specific):
+    /// <list type="number">
+    ///   <item><c>MLAdwinDrift:Override:Symbol:{symbol}:Timeframe:{timeframe}:{Knob}</c></item>
+    ///   <item><c>MLAdwinDrift:Override:Symbol:{symbol}:{Knob}</c></item>
+    ///   <item><c>MLAdwinDrift:Override:Timeframe:{timeframe}:{Knob}</c></item>
+    ///   <item>Legacy: <c>MLAdwinDrift:Override:{symbol}:{timeframe}:{Knob}</c></item>
+    /// </list>
+    /// Knob suffixes outside the allowlist (<c>Delta</c>, <c>WindowSize</c>) are logged via
+    /// <c>MLAdwinOverridesUnknownKnob</c> and ignored. Returns one entry per override-bearing
+    /// (symbol, timeframe) pair; <see cref="PrepareOutcome"/> resolves the per-model effective
+    /// values from this map at evaluation time.
     /// </summary>
-    private static async Task<Dictionary<(string Symbol, Timeframe Timeframe), (double? Delta, int? WindowSize)>> LoadAllPerPairOverridesAsync(
+    private async Task<Dictionary<(string Symbol, Timeframe Timeframe), (double? Delta, int? WindowSize)>> LoadAllPerPairOverridesAsync(
         DbContext db,
+        IReadOnlyList<ActiveModelCandidate> activeModels,
         CancellationToken ct)
     {
+        if (!_options.OverridesEnabled)
+            return new Dictionary<(string, Timeframe), (double?, int?)>();
+
         var rows = await db.Set<EngineConfig>()
             .AsNoTracking()
-            .Where(c => c.Key.StartsWith(CK_OverridePrefix))
+            .Where(c => !c.IsDeleted && c.Key.StartsWith(CK_OverridePrefix))
             .Select(c => new { c.Key, c.Value })
             .ToListAsync(ct);
 
-        var dict = new Dictionary<(string Symbol, Timeframe Timeframe), (double? Delta, int? WindowSize)>();
+        // Three buckets keyed by (symbol|null, timeframe|null) — null = wildcard tier.
+        var symbolTfDelta = new Dictionary<(string, Timeframe), double>();
+        var symbolTfWindow = new Dictionary<(string, Timeframe), int>();
+        var symbolDelta = new Dictionary<string, double>(StringComparer.Ordinal);
+        var symbolWindow = new Dictionary<string, int>(StringComparer.Ordinal);
+        var timeframeDelta = new Dictionary<Timeframe, double>();
+        var timeframeWindow = new Dictionary<Timeframe, int>();
+        var legacyDelta = new Dictionary<(string, Timeframe), double>();
+        var legacyWindow = new Dictionary<(string, Timeframe), int>();
+
         foreach (var row in rows)
         {
-            // Format: MLAdwinDrift:Override:{Symbol}:{Timeframe}:{Delta|WindowSize}
             var rest = row.Key.Substring(CK_OverridePrefix.Length);
             var parts = rest.Split(':');
-            if (parts.Length != 3)
-                continue;
 
-            string symbol = parts[0];
-            if (!Enum.TryParse<Timeframe>(parts[1], ignoreCase: false, out var timeframe))
-                continue;
-
-            string field = parts[2];
-            var key = (symbol, timeframe);
-            dict.TryGetValue(key, out var current);
-
-            if (field == "Delta" &&
-                double.TryParse(row.Value, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var delta) &&
-                double.IsFinite(delta) && delta >= MinDelta && delta <= MaxDelta)
+            // Tier 1: Symbol:{S}:Timeframe:{TF}:{Knob}  → 5 parts
+            if (parts.Length == 5 &&
+                parts[0] == "Symbol" && parts[2] == "Timeframe" &&
+                Enum.TryParse<Timeframe>(parts[3], ignoreCase: false, out var t1))
             {
-                current.Delta = delta;
-            }
-            else if (field == "WindowSize" &&
-                int.TryParse(row.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var windowSize) &&
-                windowSize >= MinWindowSize && windowSize <= MaxWindowSize)
-            {
-                current.WindowSize = windowSize;
-            }
-            else
-            {
+                ApplyTier(parts[4], row.Value, parts[1], t1, "symbol+timeframe", row.Key,
+                    delta => symbolTfDelta[(parts[1], t1)] = delta,
+                    window => symbolTfWindow[(parts[1], t1)] = window);
                 continue;
             }
 
-            dict[key] = current;
+            // Tier 2: Symbol:{S}:{Knob}  → 3 parts (with parts[0] == "Symbol")
+            if (parts.Length == 3 && parts[0] == "Symbol")
+            {
+                ApplyTier(parts[2], row.Value, parts[1], default, "symbol", row.Key,
+                    delta => symbolDelta[parts[1]] = delta,
+                    window => symbolWindow[parts[1]] = window);
+                continue;
+            }
+
+            // Tier 3: Timeframe:{TF}:{Knob}  → 3 parts (with parts[0] == "Timeframe")
+            if (parts.Length == 3 && parts[0] == "Timeframe" &&
+                Enum.TryParse<Timeframe>(parts[1], ignoreCase: false, out var t3))
+            {
+                ApplyTier(parts[2], row.Value, "*", t3, "timeframe", row.Key,
+                    delta => timeframeDelta[t3] = delta,
+                    window => timeframeWindow[t3] = window);
+                continue;
+            }
+
+            // Tier 4 (legacy): {Symbol}:{Timeframe}:{Knob}  → 3 parts
+            if (parts.Length == 3 &&
+                Enum.TryParse<Timeframe>(parts[1], ignoreCase: false, out var t4))
+            {
+                ApplyTier(parts[2], row.Value, parts[0], t4, "legacy", row.Key,
+                    delta => legacyDelta[(parts[0], t4)] = delta,
+                    window => legacyWindow[(parts[0], t4)] = window);
+                continue;
+            }
+
+            // Unrecognised shape (mid-key typo, malformed timeframe enum, etc.).
+            _metrics?.MLAdwinOverridesUnknownKnob.Add(1, new KeyValuePair<string, object?>("kind", "shape"));
+            _logger.LogWarning(
+                "{Worker}: ignoring override key with unrecognised shape: {Key}.",
+                WorkerName, row.Key);
+        }
+
+        // Collapse the four tiers into a (Symbol, Timeframe) → (Delta?, WindowSize?) map by
+        // walking the union of:
+        //   (a) pairs that have a pair-anchored override (tier 1 explicit or tier 4 legacy)
+        //   (b) pairs of active models for which a wildcard tier might apply
+        // Without (b), Symbol-only and Timeframe-only tiers would never emit when there's
+        // no co-located pair-anchored override.
+        var pairs = new HashSet<(string, Timeframe)>();
+        foreach (var k in symbolTfDelta.Keys) pairs.Add(k);
+        foreach (var k in symbolTfWindow.Keys) pairs.Add(k);
+        foreach (var k in legacyDelta.Keys) pairs.Add(k);
+        foreach (var k in legacyWindow.Keys) pairs.Add(k);
+        foreach (var m in activeModels) pairs.Add((m.Symbol, m.Timeframe));
+
+        var dict = new Dictionary<(string Symbol, Timeframe Timeframe), (double? Delta, int? WindowSize)>();
+        foreach (var pair in pairs)
+        {
+            double? delta =
+                (symbolTfDelta.TryGetValue(pair, out var v1) ? v1 : (double?)null)
+                ?? (symbolDelta.TryGetValue(pair.Item1, out var v2) ? v2 : (double?)null)
+                ?? (timeframeDelta.TryGetValue(pair.Item2, out var v3) ? v3 : (double?)null)
+                ?? (legacyDelta.TryGetValue(pair, out var v4) ? v4 : (double?)null);
+
+            int? window =
+                (symbolTfWindow.TryGetValue(pair, out var w1) ? w1 : (int?)null)
+                ?? (symbolWindow.TryGetValue(pair.Item1, out var w2) ? w2 : (int?)null)
+                ?? (timeframeWindow.TryGetValue(pair.Item2, out var w3) ? w3 : (int?)null)
+                ?? (legacyWindow.TryGetValue(pair, out var w4) ? w4 : (int?)null);
+
+            if (delta is not null || window is not null)
+                dict[pair] = (delta, window);
         }
         return dict;
+    }
+
+    /// <summary>
+    /// Validates the knob suffix and applies the parsed value to the appropriate tier
+    /// dictionary. Logs unknown knobs once per offending row so dashboards surface typos.
+    /// </summary>
+    private void ApplyTier(
+        string knob,
+        string rawValue,
+        string symbolHint,
+        Timeframe timeframeHint,
+        string tierLabel,
+        string fullKey,
+        Action<double> setDelta,
+        Action<int> setWindow)
+    {
+        if (knob == "Delta" &&
+            double.TryParse(rawValue, NumberStyles.Float | NumberStyles.AllowThousands,
+                CultureInfo.InvariantCulture, out var delta) &&
+            double.IsFinite(delta) && delta >= MinDelta && delta <= MaxDelta)
+        {
+            setDelta(delta);
+            return;
+        }
+        if (knob == "WindowSize" &&
+            int.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var window) &&
+            window >= MinWindowSize && window <= MaxWindowSize)
+        {
+            setWindow(window);
+            return;
+        }
+
+        // Either the knob is unrecognised or the value is out of range. Log + count.
+        _metrics?.MLAdwinOverridesUnknownKnob.Add(1,
+            new KeyValuePair<string, object?>("knob", knob),
+            new KeyValuePair<string, object?>("tier", tierLabel));
+        _logger.LogWarning(
+            "{Worker}: ignoring override {Key} (tier={Tier}, symbol={Symbol}, timeframe={Timeframe}); knob suffix or value out of allowlist (Delta in [{MinDelta}, {MaxDelta}], WindowSize in [{MinWindow}, {MaxWindow}]).",
+            WorkerName, fullKey, tierLabel, symbolHint, timeframeHint,
+            MinDelta, MaxDelta, MinWindowSize, MaxWindowSize);
     }
 
     private static bool GetBool(

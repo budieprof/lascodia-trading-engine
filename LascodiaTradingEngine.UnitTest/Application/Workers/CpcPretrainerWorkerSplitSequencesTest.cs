@@ -94,6 +94,12 @@ public class CpcPretrainerWorkerSplitSequencesTest
             MaxAdversarialValidationAuc: options.MaxAdversarialValidationAuc,
             MinAdversarialValidationSamples: options.MinAdversarialValidationSamples,
             ConfigurationDriftAlertCycles: options.ConfigurationDriftAlertCycles,
-            SystemicPauseAlertHours: options.SystemicPauseAlertHours);
+            SystemicPauseAlertHours: options.SystemicPauseAlertHours,
+            PollJitterSeconds: options.PollJitterSeconds,
+            FailureBackoffCapShift: options.FailureBackoffCapShift,
+            UseCycleLock: options.UseCycleLock,
+            CycleLockTimeoutSeconds: options.CycleLockTimeoutSeconds,
+            FleetSystemicConsecutiveZeroPromotionCycles: options.FleetSystemicConsecutiveZeroPromotionCycles,
+            OverridesEnabled: options.OverridesEnabled);
     }
 }

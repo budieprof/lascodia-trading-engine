@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.StrategyGeneration;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
@@ -319,6 +320,60 @@ public sealed class EvolutionaryGeneratorWorkerTest
         Assert.Empty(await ctx.BacktestRuns.IgnoreQueryFilters().ToListAsync());
     }
 
+    [Theory]
+    [InlineData(0,    1, 1, 1)]    // jitter disabled → returns base unchanged
+    [InlineData(60,   1, 1, 61)]   // base 1s + uniform[0, 60] ∈ [1, 61]
+    [InlineData(600, 60, 60, 660)] // base 60s + uniform[0, 600] ∈ [60, 660]
+    public void ApplyJitter_RespectsBoundsAndDisableSemantics(int jitterSeconds, int baseSeconds, int minTotal, int maxTotal)
+    {
+        var result = EvolutionaryGeneratorWorker.ApplyJitter(TimeSpan.FromSeconds(baseSeconds), jitterSeconds);
+        Assert.InRange(result.TotalSeconds, minTotal, maxTotal);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(86_401)]
+    public void Validator_RejectsOutOfRangePollJitter(int value)
+    {
+        var validator = new EvolutionaryGeneratorOptionsValidator();
+        var result = validator.Validate(name: null,
+            new EvolutionaryGeneratorOptions { PollJitterSeconds = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("PollJitterSeconds"));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(17)]
+    public void Validator_RejectsOutOfRangeBackoffShift(int value)
+    {
+        var validator = new EvolutionaryGeneratorOptionsValidator();
+        var result = validator.Validate(name: null,
+            new EvolutionaryGeneratorOptions { FailureBackoffCapShift = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FailureBackoffCapShift"));
+    }
+
+    [Fact]
+    public void Validator_RejectsZeroFleetSystemicCycles()
+    {
+        var validator = new EvolutionaryGeneratorOptionsValidator();
+        var result = validator.Validate(name: null,
+            new EvolutionaryGeneratorOptions { FleetSystemicConsecutiveZeroInsertCycles = 0 });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FleetSystemicConsecutiveZeroInsertCycles"));
+    }
+
+    [Fact]
+    public void Validator_RejectsZeroStalenessHours()
+    {
+        var validator = new EvolutionaryGeneratorOptionsValidator();
+        var result = validator.Validate(name: null,
+            new EvolutionaryGeneratorOptions { StalenessAlertHours = 0 });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("StalenessAlertHours"));
+    }
+
     [Fact]
     public void CalculateDelay_UsesExponentialBackoffWithCeiling()
     {
@@ -339,14 +394,17 @@ public sealed class EvolutionaryGeneratorWorkerTest
     private static EvolutionaryGeneratorWorker CreateWorker(
         ServiceProvider provider,
         TimeProvider timeProvider,
-        IDistributedLock? distributedLock = null)
+        IDistributedLock? distributedLock = null,
+        EvolutionaryGeneratorOptions? options = null)
         => new(
             NullLogger<EvolutionaryGeneratorWorker>.Instance,
             provider.GetRequiredService<IServiceScopeFactory>(),
             metrics: null,
             timeProvider: timeProvider,
             healthMonitor: null,
-            distributedLock: distributedLock);
+            distributedLock: distributedLock,
+            dbExceptionClassifier: null,
+            options: options);
 
     private static ServiceProvider BuildProvider(
         EvolutionaryGeneratorTestContext context,
@@ -454,6 +512,7 @@ public sealed class EvolutionaryGeneratorWorkerTest
         public DbSet<Strategy> Strategies => Set<Strategy>();
         public DbSet<StrategyPerformanceSnapshot> StrategyPerformanceSnapshots => Set<StrategyPerformanceSnapshot>();
         public DbSet<BacktestRun> BacktestRuns => Set<BacktestRun>();
+        public DbSet<Alert> Alerts => Set<Alert>();
 
         public DbContext GetDbContext() => this;
 
@@ -516,6 +575,15 @@ public sealed class EvolutionaryGeneratorWorkerTest
                     .WithMany()
                     .HasForeignKey(x => x.StrategyId)
                     .OnDelete(DeleteBehavior.Restrict);
+            });
+
+            modelBuilder.Entity<Alert>(builder =>
+            {
+                builder.HasKey(a => a.Id);
+                builder.HasQueryFilter(a => !a.IsDeleted);
+                builder.Property(a => a.AlertType).HasConversion<string>();
+                builder.Property(a => a.Severity).HasConversion<string>();
+                builder.HasIndex(a => a.DeduplicationKey);
             });
         }
     }

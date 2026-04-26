@@ -34,7 +34,7 @@ public class CpcPretrainerWorkerTest
             It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
             It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
             Times.Never);
-        Assert.True(nextPoll > 0);
+        Assert.True(nextPoll.PollSeconds > 0);
         Assert.Empty(await db.Set<MLCpcEncoder>().ToListAsync());
     }
 
@@ -1280,6 +1280,7 @@ public class CpcPretrainerWorkerTest
                 SequenceLength = 60,
                 PollIntervalSeconds = 3600,
                 LockTimeoutSeconds = 0,
+                UseCycleLock = false, // exercise per-candidate lock-busy path, not cycle lock
             },
             distributedLock: distributedLock);
 
@@ -1680,6 +1681,346 @@ public class CpcPretrainerWorkerTest
             .ToListAsync();
         Assert.Single(alerts);
     }
+
+    [Fact]
+    public async Task RunCycleAsync_Skips_When_CycleLock_Is_Busy()
+    {
+        // Cycle-level lock returns null → cycle short-circuits before candidate
+        // selection. Verifies cycle-lock guards the candidate pipeline (no candle load,
+        // no audit row).
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var distributedLock = new BusyDistributedLock();
+        var worker = CreateWorker(
+            db,
+            trainer.Object,
+            options: new MLCpcOptions
+            {
+                EmbeddingDim = 16,
+                MinCandles = 1000,
+                SequenceLength = 60,
+                PollIntervalSeconds = 3600,
+                UseCycleLock = true,
+                CycleLockTimeoutSeconds = 0,
+            },
+            distributedLock: distributedLock);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        // No training attempt, no audit row — cycle short-circuited at the lock.
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        Assert.Empty(await db.Set<MLCpcEncoderTrainingLog>().ToListAsync());
+        // The cycle lock key is the only key requested; per-candidate locks never reached.
+        Assert.Single(distributedLock.RequestedKeys);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_FleetSystemicAlert_FiresAfterConsecutiveZeroPromotionCycles()
+    {
+        // A pretrainer that throws → every cycle attempts the candidate but never
+        // promotes. After FleetSystemicConsecutiveZeroPromotionCycles cycles the worker
+        // raises the SystemicMLDegradation alert keyed by the fleet dedupe key.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(
+                It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+                It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("simulated trainer failure"));
+
+        var worker = CreateWorker(
+            db,
+            trainer.Object,
+            options: new MLCpcOptions
+            {
+                EmbeddingDim = 16,
+                MinCandles = 1000,
+                SequenceLength = 60,
+                PollIntervalSeconds = 3600,
+                FleetSystemicConsecutiveZeroPromotionCycles = 2,
+            });
+
+        // Cycle 1: failure, streak = 1, no alert yet.
+        await worker.RunCycleAsync(CancellationToken.None);
+        Assert.Empty(await db.Set<Alert>()
+            .Where(a => a.DeduplicationKey == "MLCpc:FleetSystemic")
+            .ToListAsync());
+
+        // Cycle 2: failure, streak = 2 ≥ threshold → fleet alert fires.
+        await worker.RunCycleAsync(CancellationToken.None);
+        var alert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == "MLCpc:FleetSystemic");
+        Assert.Equal(AlertType.SystemicMLDegradation, alert.AlertType);
+        Assert.True(alert.IsActive);
+        Assert.Contains("fleet_zero_promotion_streak", alert.ConditionJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_FleetSystemicAlert_AutoResolvesOnFirstPromotion()
+    {
+        // First two cycles fail → fleet alert active. Third cycle succeeds → alert
+        // auto-resolves with AutoResolvedAt set.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        int callCount = 0;
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(
+                It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+                It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Returns<string, Timeframe, IReadOnlyList<float[][]>, int, int, CancellationToken>(
+                (sym, tf, _, dim, _, _) =>
+                {
+                    callCount++;
+                    if (callCount <= 2) throw new InvalidOperationException("simulated failure");
+                    return Task.FromResult<MLCpcEncoder?>(BuildPromotableEncoder(sym, tf, dim));
+                });
+
+        var worker = CreateWorker(
+            db,
+            trainer.Object,
+            options: new MLCpcOptions
+            {
+                EmbeddingDim = 16,
+                MinCandles = 1000,
+                SequenceLength = 60,
+                PollIntervalSeconds = 3600,
+                FleetSystemicConsecutiveZeroPromotionCycles = 2,
+            });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+        await worker.RunCycleAsync(CancellationToken.None);
+        var fleetAlert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == "MLCpc:FleetSystemic");
+        Assert.True(fleetAlert.IsActive);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var resolved = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == "MLCpc:FleetSystemic");
+        Assert.False(resolved.IsActive);
+        Assert.NotNull(resolved.AutoResolvedAt);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(86_401)]
+    public void MLCpcOptionsValidator_RejectsOutOfRangePollJitter(int value)
+    {
+        var validator = new MLCpcOptionsValidator();
+        var result = validator.Validate(name: null, new MLCpcOptions { PollJitterSeconds = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("PollJitterSeconds"));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(17)]
+    public void MLCpcOptionsValidator_RejectsOutOfRangeBackoffShift(int value)
+    {
+        var validator = new MLCpcOptionsValidator();
+        var result = validator.Validate(name: null, new MLCpcOptions { FailureBackoffCapShift = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FailureBackoffCapShift"));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(301)]
+    public void MLCpcOptionsValidator_RejectsOutOfRangeCycleLockTimeout(int value)
+    {
+        var validator = new MLCpcOptionsValidator();
+        var result = validator.Validate(name: null, new MLCpcOptions { CycleLockTimeoutSeconds = value });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("CycleLockTimeoutSeconds"));
+    }
+
+    [Fact]
+    public void MLCpcOptionsValidator_RejectsZeroFleetSystemicCycles()
+    {
+        var validator = new MLCpcOptionsValidator();
+        var result = validator.Validate(name: null,
+            new MLCpcOptions { FleetSystemicConsecutiveZeroPromotionCycles = 0 });
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("FleetSystemicConsecutiveZeroPromotionCycles"));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Override_PerSymbolTimeframe_RaisesMinCandlesAndSkips()
+    {
+        // Default MinCandles=1000 would let 1500 candles train. Per-(Symbol+Timeframe)
+        // override pushes MinCandles=2000, so the candidate is now under-sample and the
+        // trainer is never invoked.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        AddConfig(db, "MLCpc:Override:Symbol:EURUSD:Timeframe:H1:MinCandles", "2000", ConfigDataType.Int);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var worker = CreateWorker(db, trainer.Object);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("rejected", log.Outcome);
+        Assert.Equal("insufficient_candles", log.Reason);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Override_PerSymbol_AppliesWhenTimeframeOverrideAbsent()
+    {
+        // Per-symbol override (no timeframe qualifier) should still match — the hierarchy
+        // walks Symbol+Timeframe → Symbol → Timeframe.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        AddConfig(db, "MLCpc:Override:Symbol:EURUSD:MinCandles", "2000", ConfigDataType.Int);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var worker = CreateWorker(db, trainer.Object);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Override_FirstHitWins_MoreSpecificTakesPrecedence()
+    {
+        // Symbol-only override sets MinCandles=2000 (would skip), but the more-specific
+        // Symbol+Timeframe override sets MinCandles=500 (would train). The hierarchy
+        // resolves to the more specific value and training proceeds.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        AddConfig(db, "MLCpc:Override:Symbol:EURUSD:MinCandles", "2000", ConfigDataType.Int);
+        AddConfig(db, "MLCpc:Override:Symbol:EURUSD:Timeframe:H1:MinCandles", "500", ConfigDataType.Int);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.5, TrainingSamples = 100,
+                    EncoderBytes = [1, 2, 3],
+                    TrainedAt = DateTime.UtcNow, IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Override_DisabledByConfig_FallsBackToGlobal()
+    {
+        // When OverridesEnabled=false the override key is ignored and global MinCandles
+        // (1000) takes effect — training proceeds as it would without the row.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        AddConfig(db, "MLCpc:Override:Symbol:EURUSD:Timeframe:H1:MinCandles", "2000", ConfigDataType.Int);
+        AddConfig(db, "MLCpc:OverridesEnabled", "false", ConfigDataType.Bool);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.5, TrainingSamples = 100,
+                    EncoderBytes = [1, 2, 3],
+                    TrainedAt = DateTime.UtcNow, IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Override_UnknownKnobIsIgnored_NoCrash()
+    {
+        // Typo'd override key (suffix not in the allowlist) must be logged-and-ignored.
+        // The cycle continues normally and training proceeds with global defaults.
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        AddConfig(db, "MLCpc:Override:Symbol:EURUSD:DefinitelyNotARealKnob", "9999", ConfigDataType.Int);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.5, TrainingSamples = 100,
+                    EncoderBytes = [1, 2, 3],
+                    TrainedAt = DateTime.UtcNow, IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    private static MLCpcEncoder BuildPromotableEncoder(string symbol, Timeframe timeframe, int embeddingDim)
+        => new()
+        {
+            Symbol = symbol,
+            Timeframe = timeframe,
+            EncoderType = CpcEncoderType.Linear,
+            EmbeddingDim = embeddingDim,
+            PredictionSteps = 3,
+            EncoderBytes = new byte[] { 1, 2, 3, 4 },
+            InfoNceLoss = 0.5,
+            TrainedAt = DateTime.UtcNow,
+            IsActive = true,
+        };
 
     // ── helpers ───────────────────────────────────────────────────────────
 

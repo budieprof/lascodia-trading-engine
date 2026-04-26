@@ -927,6 +927,554 @@ public class MLConformalBreakerWorkerTest
         Assert.Equal("0", streakConfig.Value);
     }
 
+    [Fact]
+    public void EvaluateConformalCoverage_TimeDecay_DownweightsOldObservations()
+    {
+        // Half the observations are very old uncovered, half are recent covered. With
+        // unweighted coverage the empirical comes out 0.5; with a 7-day half-life the
+        // recent (covered) ones dominate and weighted coverage > 0.7. This is the
+        // "model just recovered" scenario the worker is supposed to handle gracefully.
+        var now = new DateTime(2026, 1, 15, 12, 0, 0, DateTimeKind.Utc);
+        var observations = new List<ConformalObservation>();
+        for (int i = 0; i < 30; i++)
+            observations.Add(new ConformalObservation(false, now.AddDays(-30 - i)));
+        for (int i = 0; i < 30; i++)
+            observations.Add(new ConformalObservation(true, now.AddHours(-i)));
+
+        var unweighted = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 30,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: true,
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.01,
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 0,
+                RegressionGuardK: 0.0,
+                ModelId: 0,
+                NowUtc: now));
+
+        var weighted = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 30,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: true,
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.01,
+                TimeDecayHalfLifeDays: 7,
+                BootstrapResamples: 0,
+                RegressionGuardK: 0.0,
+                ModelId: 0,
+                NowUtc: now));
+
+        Assert.Equal(0.5, unweighted.EmpiricalCoverage, precision: 6);
+        Assert.Equal(0.5, unweighted.TimeDecayWeightedCoverage, precision: 6); // half-life=0 → unweighted
+        Assert.True(weighted.TimeDecayWeightedCoverage > 0.95,
+            $"expected recent covered observations to dominate; weighted={weighted.TimeDecayWeightedCoverage}");
+    }
+
+    [Fact]
+    public void EvaluateConformalCoverage_BootstrapStderr_IsDeterministicForSameInput()
+    {
+        // Two evaluator calls with the same observations + modelId must produce the same
+        // stderr. This is what guarantees two replicas observing identical logs compute
+        // identical K-sigma trip decisions.
+        var now = new DateTime(2026, 1, 15, 12, 0, 0, DateTimeKind.Utc);
+        var observations = new List<ConformalObservation>();
+        for (int i = 0; i < 50; i++)
+            observations.Add(new ConformalObservation(i % 3 != 0, now.AddMinutes(-i))); // 2/3 covered
+
+        var first = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 30,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: true,
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.01,
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 200,
+                RegressionGuardK: 0.0,
+                ModelId: 42,
+                NowUtc: now));
+
+        var second = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 30,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: true,
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.01,
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 200,
+                RegressionGuardK: 0.0,
+                ModelId: 42,
+                NowUtc: now));
+
+        Assert.Equal(200, first.BootstrapResamplesUsed);
+        Assert.Equal(first.CoverageStderr, second.CoverageStderr, precision: 12);
+        Assert.True(first.CoverageStderr > 0, "stderr must be positive for non-degenerate observations");
+    }
+
+    [Fact]
+    public void EvaluateConformalCoverage_KSigmaGate_BlocksTripWhenEmpiricalIsCloseToFloor()
+    {
+        // Empirical = 0.80, floor = 0.85, K=3. With stderr ~0.04 (typical for n=30,
+        // p=0.8), 3-sigma below empirical reaches 0.68 — well below floor. The K-sigma
+        // gate (empirical < floor - K*stderr) requires 0.80 < 0.85 - 3*stderr → stderr <
+        // -0.0167, impossible. So the K-sigma path blocks the trip even when the floor
+        // and Wilson paths would individually fire.
+        var now = new DateTime(2026, 1, 15, 12, 0, 0, DateTimeKind.Utc);
+        var observations = new List<ConformalObservation>();
+        // 24 covered, 6 uncovered → 0.80 empirical, no long run.
+        for (int i = 0; i < 24; i++) observations.Add(new ConformalObservation(true, now.AddMinutes(-i)));
+        for (int i = 0; i < 6; i++) observations.Add(new ConformalObservation(false, now.AddMinutes(-(24 + i))));
+
+        var withKSigma = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 30,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: false, // use p-value path so we exercise the floor logic
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.99, // relaxed → p-value path would fire
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 200,
+                RegressionGuardK: 3.0,
+                ModelId: 1,
+                NowUtc: now));
+
+        var withoutKSigma = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 30,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: false,
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.99,
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 0, // disabled → stderr=0 → K-sigma is bypassed
+                RegressionGuardK: 0.0,
+                ModelId: 1,
+                NowUtc: now));
+
+        Assert.False(withKSigma.TrippedByCoverageFloor,
+            "K-sigma gate should block the trip when stderr indicates noise");
+        Assert.True(withoutKSigma.TrippedByCoverageFloor,
+            "without K-sigma, the floor + p-value paths would fire");
+    }
+
+    [Fact]
+    public async Task RunAsync_OverrideHierarchy_PerModelMinLogsBlocksEvaluation()
+    {
+        // Without override: 30 uncovered logs trip the breaker. With per-model
+        // override MinLogs=100, the model is skipped as insufficient and no breaker
+        // is created. Verifies the override hierarchy reaches the evaluator.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-1), covered: false, startTradeSignalId: 1);
+
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformal:Override:Model:1:MinLogs",
+            Value = "100",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = false,
+            LastUpdatedAt = now,
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.False(await db.Set<MLConformalBreakerLog>().AnyAsync(b => b.MLModelId == model.Id));
+    }
+
+    [Fact]
+    public async Task RunAsync_OverrideHierarchy_UnknownKnobIsIgnored_NoCrash()
+    {
+        // A typo'd override key (knob suffix not in the allowlist) must be logged-and-
+        // ignored. The cycle continues normally and the model trips on its real signal.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-1), covered: false, startTradeSignalId: 1);
+
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformal:Override:Model:1:DefinitelyNotARealKnob",
+            Value = "9999",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = false,
+            LastUpdatedAt = now,
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.True(await db.Set<MLConformalBreakerLog>().AnyAsync(b => b.MLModelId == model.Id));
+    }
+
+    [Fact]
+    public async Task RunAsync_FleetSystemicAlert_FiresWhenManyModelsTrip()
+    {
+        // Three models trip in one cycle; FleetSystemicMinTrippedModels=2,
+        // FleetSystemicTripRatioThreshold=0.5. ratio = 3/3 = 1.0 ≥ 0.5 → fleet alert
+        // fires once with the SystemicMLDegradation type.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+
+        for (long i = 1; i <= 3; i++)
+        {
+            var model = CreateModel(i, $"EURUSD{i}", isSuppressed: false);
+            db.Set<MLModel>().Add(model);
+            AddCalibration(db, model, now);
+            AddPredictionLogs(db, model, now.AddHours(-1), covered: false, startTradeSignalId: i * 1000);
+        }
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.FleetSystemicMinTrippedModels = 2;
+        options.FleetSystemicTripRatioThreshold = 0.5;
+
+        var dispatcher = new CapturingAlertDispatcher();
+        var worker = CreateWorker(db, options, alertDispatcher: dispatcher);
+        await worker.RunAsync(CancellationToken.None);
+
+        var fleetAlert = await db.Set<Alert>()
+            .SingleOrDefaultAsync(a => a.DeduplicationKey == "ml-conformal-fleet-systemic");
+        Assert.NotNull(fleetAlert);
+        Assert.Equal(AlertType.SystemicMLDegradation, fleetAlert!.AlertType);
+        Assert.True(fleetAlert.IsActive);
+        Assert.Contains(dispatcher.Dispatched,
+            d => d.Alert.DeduplicationKey == "ml-conformal-fleet-systemic");
+    }
+
+    [Fact]
+    public async Task RunAsync_FleetSystemicAlert_AutoResolvesWhenFleetRecovers()
+    {
+        // Pre-existing active fleet alert; this cycle has zero trips → alert
+        // auto-resolves.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-1), covered: true, startTradeSignalId: 1);
+
+        db.Set<Alert>().Add(new Alert
+        {
+            Id = 7777,
+            AlertType = AlertType.SystemicMLDegradation,
+            DeduplicationKey = "ml-conformal-fleet-systemic",
+            Severity = AlertSeverity.High,
+            CooldownSeconds = 3600,
+            ConditionJson = "{}",
+            IsActive = true,
+            LastTriggeredAt = now.AddHours(-1),
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.FleetSystemicMinTrippedModels = 1;
+        options.FleetSystemicTripRatioThreshold = 0.5;
+
+        var worker = CreateWorker(db, options);
+        await worker.RunAsync(CancellationToken.None);
+
+        var fleetAlert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == "ml-conformal-fleet-systemic");
+        Assert.False(fleetAlert.IsActive);
+        Assert.NotNull(fleetAlert.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task RunAsync_StalenessAlert_FiresForModelWithOldOutcomes()
+    {
+        // Model has 30 covered logs from 60h ago; latest is 60h - 30min ago. With
+        // StalenessHours=48 the model is stale → MLMonitoringStale alert fires.
+        // No breaker trip because all are covered.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-60), covered: true, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.StalenessHours = 48;
+
+        var dispatcher = new CapturingAlertDispatcher();
+        var worker = CreateWorker(db, options, alertDispatcher: dispatcher);
+        await worker.RunAsync(CancellationToken.None);
+
+        var staleAlert = await db.Set<Alert>()
+            .SingleOrDefaultAsync(a => a.DeduplicationKey == "ml-conformal-stale:1");
+        Assert.NotNull(staleAlert);
+        Assert.Equal(AlertType.MLMonitoringStale, staleAlert!.AlertType);
+        Assert.True(staleAlert.IsActive);
+        Assert.Contains(dispatcher.Dispatched,
+            d => d.Alert.DeduplicationKey == "ml-conformal-stale:1");
+    }
+
+    [Fact]
+    public void EvaluateConformalCoverage_RegimeBreakdown_IsEmptyWhenNoObservationCarriesRegime()
+    {
+        var observations = new[]
+        {
+            new ConformalObservation(true),
+            new ConformalObservation(false),
+            new ConformalObservation(true)
+        };
+
+        var result = EvaluateConformalCoverage(observations, minLogs: 1, triggerRunLength: 100);
+
+        Assert.Empty(result.RegimeBreakdown);
+        Assert.Null(result.WorstRegime());
+    }
+
+    [Fact]
+    public void EvaluateConformalCoverage_RegimeBreakdown_AggregatesPerRegime()
+    {
+        var now = new DateTime(2026, 1, 15, 12, 0, 0, DateTimeKind.Utc);
+        // Trending: 3 covered, 1 uncovered → 0.75
+        // Ranging:  1 covered, 3 uncovered → 0.25 (the "worst")
+        var observations = new List<ConformalObservation>
+        {
+            new(true,  now.AddMinutes(-1), MarketRegime.Trending),
+            new(true,  now.AddMinutes(-2), MarketRegime.Trending),
+            new(true,  now.AddMinutes(-3), MarketRegime.Trending),
+            new(false, now.AddMinutes(-4), MarketRegime.Trending),
+            new(true,  now.AddMinutes(-5), MarketRegime.Ranging),
+            new(false, now.AddMinutes(-6), MarketRegime.Ranging),
+            new(false, now.AddMinutes(-7), MarketRegime.Ranging),
+            new(false, now.AddMinutes(-8), MarketRegime.Ranging),
+        };
+
+        var result = new MLConformalCoverageEvaluator().Evaluate(
+            observations,
+            new ConformalCoverageEvaluationOptions(
+                TargetCoverage: 0.90,
+                CoverageTolerance: 0.05,
+                MinLogs: 4,
+                TriggerRunLength: 100,
+                UseWilsonCoverageFloor: true,
+                WilsonConfidenceLevel: 0.95,
+                StatisticalAlpha: 0.01,
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 0,
+                RegressionGuardK: 0.0,
+                ModelId: 0,
+                NowUtc: now));
+
+        Assert.Equal(2, result.RegimeBreakdown.Count);
+        Assert.Equal(0.75, result.RegimeBreakdown[MarketRegime.Trending].EmpiricalCoverage, precision: 6);
+        Assert.Equal(0.25, result.RegimeBreakdown[MarketRegime.Ranging].EmpiricalCoverage, precision: 6);
+
+        var worst = result.WorstRegime();
+        Assert.NotNull(worst);
+        Assert.Equal(MarketRegime.Ranging, worst!.Value.Regime);
+        Assert.Equal(4, worst.Value.Breakdown.SampleCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_PerRegimeDecomposition_AddsWorstRegimeToTripAlertPayload()
+    {
+        // Worker has EnablePerRegimeDecomposition=true and a single regime snapshot
+        // (Trending) covering the eval window. All 30 logs are uncovered → trip fires.
+        // The trip alert payload must include WorstRegime=Trending with coverage 0.0.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-1), covered: false, startTradeSignalId: 1);
+
+        db.Set<MarketRegimeSnapshot>().Add(new MarketRegimeSnapshot
+        {
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            Regime = MarketRegime.Trending,
+            Confidence = 0.9m,
+            ADX = 30m,
+            ATR = 0.001m,
+            BollingerBandWidth = 0.002m,
+            DetectedAt = now.AddDays(-1),
+            IsDeleted = false,
+        });
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.EnablePerRegimeDecomposition = true;
+
+        var worker = CreateWorker(db, options);
+        await worker.RunAsync(CancellationToken.None);
+
+        var trip = await db.Set<MLConformalBreakerLog>()
+            .SingleAsync(b => b.MLModelId == model.Id);
+        Assert.True(trip.IsActive);
+
+        var alert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey.StartsWith("MLConformalBreaker:"));
+        var payload = JsonSerializer.Deserialize<MLConformalBreakerAlertPayload>(alert.ConditionJson);
+        Assert.NotNull(payload);
+        Assert.Equal("Trending", payload!.WorstRegime);
+        Assert.Equal(0.0, payload.WorstRegimeCoverage!.Value, precision: 6);
+        Assert.Equal(30, payload.WorstRegimeSampleCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_PerRegimeDecomposition_DisabledByDefault_NoRegimeFieldsInPayload()
+    {
+        // Sanity: with EnablePerRegimeDecomposition=false (default), the trip alert
+        // payload's regime fields are null even when MarketRegimeSnapshot rows exist.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-1), covered: false, startTradeSignalId: 1);
+
+        db.Set<MarketRegimeSnapshot>().Add(new MarketRegimeSnapshot
+        {
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            Regime = MarketRegime.Ranging,
+            Confidence = 0.9m,
+            ADX = 12m,
+            ATR = 0.001m,
+            BollingerBandWidth = 0.002m,
+            DetectedAt = now.AddDays(-1),
+            IsDeleted = false,
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions()); // default: feature off
+
+        await worker.RunAsync(CancellationToken.None);
+
+        var alert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey.StartsWith("MLConformalBreaker:"));
+        var payload = JsonSerializer.Deserialize<MLConformalBreakerAlertPayload>(alert.ConditionJson);
+        Assert.NotNull(payload);
+        Assert.Null(payload!.WorstRegime);
+        Assert.Null(payload.WorstRegimeCoverage);
+        Assert.Null(payload.WorstRegimeSampleCount);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(8)]
+    public async Task RunAsync_ParallelEvaluation_ProducesSameTripSetAsSequential(int parallelism)
+    {
+        // Five models, all with 30 uncovered logs → all should trip. The set of tripped
+        // model IDs must be identical regardless of evaluation parallelism — proves the
+        // sink synchronisation doesn't lose any updates and that no race causes a
+        // missed/duplicated trip.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        for (long i = 1; i <= 5; i++)
+        {
+            var model = CreateModel(i, $"PAIR{i:D2}", isSuppressed: false);
+            db.Set<MLModel>().Add(model);
+            AddCalibration(db, model, now);
+            AddPredictionLogs(db, model, now.AddHours(-1), covered: false, startTradeSignalId: i * 1000);
+        }
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.EvaluationParallelism = parallelism;
+
+        var worker = CreateWorker(db, options);
+        await worker.RunAsync(CancellationToken.None);
+
+        var trippedIds = await db.Set<MLConformalBreakerLog>()
+            .Where(b => b.IsActive)
+            .Select(b => b.MLModelId)
+            .OrderBy(id => id)
+            .ToListAsync();
+
+        Assert.Equal(new[] { 1L, 2L, 3L, 4L, 5L }, trippedIds);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(33)]
+    public void MLConformalBreakerOptionsValidator_RejectsOutOfRangeEvaluationParallelism(int value)
+    {
+        var options = new MLConformalBreakerOptions { EvaluationParallelism = value };
+        var validator = new MLConformalBreakerOptionsValidator();
+
+        var result = validator.Validate(name: null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(result.Failures!, f => f.Contains("EvaluationParallelism"));
+    }
+
+    [Fact]
+    public async Task RunAsync_StalenessAlert_AutoResolvesOnFreshOutcomes()
+    {
+        // Pre-existing staleness alert + fresh logs (latest within StalenessHours) →
+        // alert auto-resolves.
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(1, "EURUSD", isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-1), covered: true, startTradeSignalId: 1);
+
+        db.Set<Alert>().Add(new Alert
+        {
+            Id = 8888,
+            AlertType = AlertType.MLMonitoringStale,
+            DeduplicationKey = "ml-conformal-stale:1",
+            Symbol = "EURUSD",
+            Severity = AlertSeverity.Medium,
+            CooldownSeconds = 3600,
+            ConditionJson = "{}",
+            IsActive = true,
+            LastTriggeredAt = now.AddHours(-50),
+            IsDeleted = false
+        });
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.StalenessHours = 48;
+
+        var worker = CreateWorker(db, options);
+        await worker.RunAsync(CancellationToken.None);
+
+        var staleAlert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == "ml-conformal-stale:1");
+        Assert.False(staleAlert.IsActive);
+        Assert.NotNull(staleAlert.AutoResolvedAt);
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()
@@ -955,7 +1503,12 @@ public class MLConformalBreakerWorkerTest
                 triggerRunLength,
                 useWilsonCoverageFloor,
                 wilsonConfidenceLevel,
-                statisticalAlpha));
+                statisticalAlpha,
+                TimeDecayHalfLifeDays: 0,
+                BootstrapResamples: 0,
+                RegressionGuardK: 0.0,
+                ModelId: 0,
+                NowUtc: DateTime.UtcNow));
 
     private static MLConformalBreakerWorker CreateWorker(
         WriteApplicationDbContext db,
@@ -988,6 +1541,8 @@ public class MLConformalBreakerWorkerTest
                 Mock.Of<ILogger<MLConformalBreakerStateStore>>(),
                 new TradingMetrics(new TestMeterFactory()),
                 timeProvider),
+            new MLConformalChronicTripAlertUpserter(),
+            new MLConformalRegimeResolver(),
             distributedLock,
             timeProvider);
     }

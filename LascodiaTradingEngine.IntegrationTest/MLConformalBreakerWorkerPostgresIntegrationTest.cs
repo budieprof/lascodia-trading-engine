@@ -146,48 +146,39 @@ public class MLConformalBreakerWorkerPostgresIntegrationTest : IClassFixture<Pos
     }
 
     [Fact]
-    public async Task UpsertChronicTripAlertAsync_TwoConcurrentInvocations_ProduceExactlyOneAlertOnPostgres()
+    public async Task ChronicTripAlertUpserter_ConcurrentInvocations_ProduceExactlyOneAlertOnPostgres()
     {
         await EnsureMigratedAsync();
 
         var nowUtc = DateTime.UtcNow;
         const long modelId = 4242;
-        var context = new MLConformalBreakerWorker.ModelContext("CADCHF", Timeframe.H1);
+        const string symbol = "CADCHF";
         var dedupKey = $"ml-conformal-chronic-trip:{modelId}";
 
-        var settings = new MLConformalBreakerWorker.MLConformalBreakerWorkerSettings(
-            InitialDelay: TimeSpan.Zero,
-            PollInterval: TimeSpan.FromHours(24),
-            PollJitterSeconds: 0,
-            MaxLogs: 200,
-            MinLogs: 30,
-            ConsecutiveUncoveredTrigger: 3,
-            CoverageTolerance: 0.05,
-            MaxSuspensionBars: 96,
-            ModelBatchSize: 250,
-            MaxCycleModels: 10000,
-            MaxCalibrationAgeDays: 30,
-            RequireCalibrationAfterModelActivation: true,
-            LockTimeoutSeconds: 5,
-            ThresholdMismatchEpsilon: 0.000001,
-            UseWilsonCoverageFloor: true,
-            WilsonConfidenceLevel: 0.95,
-            StatisticalAlpha: 0.01,
-            MaxAlertsPerCycle: 50,
-            ChronicTripThreshold: 4);
+        IMLConformalChronicTripAlertUpserter upserter = new MLConformalChronicTripAlertUpserter();
 
-        // Two parallel invocations of the atomic upsert with the same dedup key. The
+        // Concurrent invocations of the atomic upsert with the same dedup key. The
         // INSERT ... ON CONFLICT (DeduplicationKey) WHERE ... DO UPDATE statement is
         // serialized by Postgres' partial unique index — exactly one INSERT can succeed,
-        // the other becomes a DO UPDATE on the row that won. Either way, the row count
-        // for that dedup key must remain 1.
+        // the others become DO UPDATEs on the row that won. The row count for that
+        // dedup key must remain 1.
         async Task RunOneAsync(int streak)
         {
             await using var ctx = CreateContext();
-            await MLConformalBreakerWorker.UpsertChronicTripAlertAsync(
-                ctx, dedupKey, context, modelId, streak, settings, nowUtc, CancellationToken.None);
+            await upserter.UpsertAsync(
+                ctx,
+                new ChronicTripAlertContext(
+                    DeduplicationKey: dedupKey,
+                    Symbol: symbol,
+                    Timeframe: Timeframe.H1,
+                    ModelId: modelId,
+                    ConsecutiveTripStreak: streak,
+                    ChronicTripThreshold: 4,
+                    CooldownSeconds: 3600,
+                    EvaluatedAtUtc: nowUtc),
+                CancellationToken.None);
             // No SaveChangesAsync needed — the atomic SQL committed implicitly. The
-            // post-fetch Apply* path is skipped on Postgres precisely because the SQL
+            // post-fetch field-apply is skipped on Postgres precisely because the SQL
             // already wrote the latest fields.
         }
 
@@ -206,7 +197,7 @@ public class MLConformalBreakerWorkerPostgresIntegrationTest : IClassFixture<Pos
         Assert.True(alerts[0].IsActive);
         Assert.Equal(AlertType.MLModelDegraded, alerts[0].AlertType);
         Assert.Equal(AlertSeverity.High, alerts[0].Severity);
-        Assert.Equal(context.Symbol, alerts[0].Symbol);
+        Assert.Equal(symbol, alerts[0].Symbol);
         // ConditionJson reflects whichever invocation won the last DO UPDATE — all four
         // are valid latest-writer outcomes; only the dedup-key uniqueness matters here.
         Assert.False(string.IsNullOrEmpty(alerts[0].ConditionJson));
@@ -239,7 +230,9 @@ public class MLConformalBreakerWorkerPostgresIntegrationTest : IClassFixture<Pos
             new MLConformalCalibrationReader(),
             new MLConformalBreakerStateStore(
                 NullLogger<MLConformalBreakerStateStore>.Instance,
-                metrics));
+                metrics),
+            new MLConformalChronicTripAlertUpserter(),
+            new MLConformalRegimeResolver());
 
         await worker.RunAsync(CancellationToken.None);
     }

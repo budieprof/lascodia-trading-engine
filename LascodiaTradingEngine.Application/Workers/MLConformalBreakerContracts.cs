@@ -52,13 +52,30 @@ public readonly record struct ConformalCoverageEvaluationOptions(
     int TriggerRunLength,
     bool UseWilsonCoverageFloor,
     double WilsonConfidenceLevel,
-    double StatisticalAlpha);
+    double StatisticalAlpha,
+    int TimeDecayHalfLifeDays,
+    int BootstrapResamples,
+    double RegressionGuardK,
+    long ModelId,
+    DateTime NowUtc);
 
-public readonly record struct ConformalObservation(bool WasCovered, DateTime? OutcomeRecordedAt)
+public readonly record struct ConformalObservation(
+    bool WasCovered,
+    DateTime? OutcomeRecordedAt,
+    global::LascodiaTradingEngine.Domain.Enums.MarketRegime? Regime)
 {
+    public ConformalObservation(bool wasCovered, DateTime? outcomeRecordedAt)
+        : this(wasCovered, outcomeRecordedAt, null) { }
+
     internal ConformalObservation(bool wasCovered)
-        : this(wasCovered, null) { }
+        : this(wasCovered, null, null) { }
 }
+
+/// <summary>Per-regime coverage breakdown — diagnostic-only, doesn't affect trip semantics.</summary>
+public readonly record struct RegimeCoverageBreakdown(
+    int SampleCount,
+    int CoveredCount,
+    double EmpiricalCoverage);
 
 public readonly record struct ConformalCoverageEvaluation(
     int SampleCount,
@@ -72,10 +89,40 @@ public readonly record struct ConformalCoverageEvaluation(
     double CoverageLowerBound,
     double CoverageUpperBound,
     double CoveragePValue,
-    DateTime? LastEvaluatedOutcomeAt)
+    DateTime? LastEvaluatedOutcomeAt,
+    double TimeDecayWeightedCoverage,
+    double CoverageStderr,
+    int BootstrapResamplesUsed,
+    IReadOnlyDictionary<global::LascodiaTradingEngine.Domain.Enums.MarketRegime, RegimeCoverageBreakdown> RegimeBreakdown)
 {
     internal static ConformalCoverageEvaluation Empty(int sampleCount) =>
-        new(sampleCount, 0, 0.0, 0, false, false, false, MLConformalBreakerTripReason.Unknown, 0.0, 1.0, 1.0, null);
+        new(sampleCount, 0, 0.0, 0, false, false, false, MLConformalBreakerTripReason.Unknown,
+            0.0, 1.0, 1.0, null, 0.0, 0.0, 0,
+            new Dictionary<global::LascodiaTradingEngine.Domain.Enums.MarketRegime, RegimeCoverageBreakdown>());
+
+    /// <summary>
+    /// The regime with the lowest empirical coverage in the evaluation window. Returns
+    /// <c>null</c> when per-regime decomposition is disabled or no observation carried a
+    /// regime tag. Used by the worker to enrich trip alerts so operators can see which
+    /// market regime is driving the coverage failure.
+    /// </summary>
+    public (global::LascodiaTradingEngine.Domain.Enums.MarketRegime Regime, RegimeCoverageBreakdown Breakdown)? WorstRegime()
+    {
+        if (RegimeBreakdown.Count == 0) return null;
+        global::LascodiaTradingEngine.Domain.Enums.MarketRegime worst = default;
+        RegimeCoverageBreakdown worstBreakdown = default;
+        bool any = false;
+        foreach (var (regime, breakdown) in RegimeBreakdown)
+        {
+            if (!any || breakdown.EmpiricalCoverage < worstBreakdown.EmpiricalCoverage)
+            {
+                worst = regime;
+                worstBreakdown = breakdown;
+                any = true;
+            }
+        }
+        return any ? (worst, worstBreakdown) : null;
+    }
 }
 
 public readonly record struct BreakerTripCandidate(
@@ -134,4 +181,7 @@ public sealed record MLConformalBreakerAlertPayload(
     double CoverageUpperBound,
     double CoveragePValue,
     DateTime? LastEvaluatedOutcomeAt,
-    DateTime ResumeAt);
+    DateTime ResumeAt,
+    string? WorstRegime = null,
+    double? WorstRegimeCoverage = null,
+    int? WorstRegimeSampleCount = null);

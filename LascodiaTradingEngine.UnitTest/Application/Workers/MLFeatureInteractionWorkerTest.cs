@@ -1,6 +1,7 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
@@ -78,6 +79,23 @@ public class MLFeatureInteractionWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_SkipsAllWork_WhenDisabledByConfig()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLFeatureInteraction:Enabled", "off", ConfigDataType.Bool);
+        var model = await AddModelAsync(db);
+        AddInteractionLogs(db, model, 140, rawMode: RawFeatureMode.Valid, shapMode: ShapFeatureMode.Zero);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("disabled", result.SkippedReason);
+        Assert.Empty(await db.Set<MLFeatureInteractionAudit>().ToListAsync());
+    }
+
+    [Fact]
     public async Task RunCycleAsync_FallsBackToShapWhenRawRowsAreMalformed()
     {
         await using var db = CreateDbContext();
@@ -140,6 +158,53 @@ public class MLFeatureInteractionWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_SoftDeletesStalePairAudits_WhenCurrentModelHasNoSignificantPairs()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLFeatureInteraction:MinEffectSize", "1", ConfigDataType.Decimal);
+
+        var oldModel = await AddModelAsync(db);
+        oldModel.IsActive = false;
+        oldModel.Status = MLModelStatus.Superseded;
+        db.Set<MLFeatureInteractionAudit>().Add(new MLFeatureInteractionAudit
+        {
+            MLModelId = oldModel.Id,
+            Symbol = oldModel.Symbol,
+            Timeframe = oldModel.Timeframe,
+            FeatureIndexA = 0,
+            FeatureNameA = "A",
+            FeatureIndexB = 1,
+            FeatureNameB = "B",
+            FeatureSchemaVersion = 1,
+            BaseFeatureCount = 3,
+            SampleCount = 100,
+            Method = "Old",
+            Rank = 1,
+            IsIncludedAsFeature = true,
+            ComputedAt = DateTime.UtcNow.AddDays(-1)
+        });
+
+        var currentModel = await AddModelAsync(db);
+        AddInteractionLogs(db, currentModel, 140, rawMode: RawFeatureMode.Valid, shapMode: ShapFeatureMode.Zero);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.ModelsProcessed);
+        Assert.Equal(0, result.AuditsWritten);
+        Assert.Equal(1, result.StaleAuditsDeleted);
+
+        var allAudits = await db.Set<MLFeatureInteractionAudit>()
+            .IgnoreQueryFilters()
+            .ToListAsync();
+
+        Assert.Single(allAudits);
+        Assert.True(allAudits[0].IsDeleted);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_ClampsUnsafeMinSamplesConfig()
     {
         await using var db = CreateDbContext();
@@ -155,6 +220,61 @@ public class MLFeatureInteractionWorkerTest
         Assert.Empty(await db.Set<MLFeatureInteractionAudit>().ToListAsync());
     }
 
+    [Fact]
+    public async Task RunCycleAsync_ReturnsLockBusy_WhenDistributedLockIsHeldElsewhere()
+    {
+        await using var db = CreateDbContext();
+        var model = await AddModelAsync(db);
+        AddInteractionLogs(db, model, 140, rawMode: RawFeatureMode.Valid, shapMode: ShapFeatureMode.Zero);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, new BusyDistributedLock());
+
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("lock_busy", result.SkippedReason);
+        Assert.Empty(await db.Set<MLFeatureInteractionAudit>().ToListAsync());
+    }
+
+    [Fact]
+    public async Task LoadConfigAsync_NormalizesUnsafeEngineConfigValues()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLFeatureInteraction:Enabled", "no", ConfigDataType.Bool);
+        AddConfig(db, "MLFeatureInteraction:InitialDelaySeconds", "-1", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:PollIntervalSeconds", "1", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:TopK", "0", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:IncludedTopN", "99", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:MinSamples", "1", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:MaxLogsPerModel", "1", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:MaxFeatures", "1", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:MaxModelsPerCycle", "0", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:MinEffectSize", "NaN", ConfigDataType.Decimal);
+        AddConfig(db, "MLFeatureInteraction:MaxQValue", "2", ConfigDataType.Decimal);
+        AddConfig(db, "MLFeatureInteraction:LockTimeoutSeconds", "-1", ConfigDataType.Int);
+        AddConfig(db, "MLFeatureInteraction:DbCommandTimeoutSeconds", "9999", ConfigDataType.Int);
+        await db.SaveChangesAsync();
+
+        var config = await MLFeatureInteractionWorker.LoadConfigAsync(
+            db,
+            new MLFeatureInteractionOptions(),
+            CancellationToken.None);
+
+        Assert.False(config.Enabled);
+        Assert.Equal(TimeSpan.Zero, config.InitialDelay);
+        Assert.Equal(7 * 24 * 60 * 60, config.PollSeconds);
+        Assert.Equal(5, config.TopK);
+        Assert.Equal(3, config.IncludedTopN);
+        Assert.Equal(100, config.MinSamples);
+        Assert.Equal(1_000, config.MaxLogsPerModel);
+        Assert.Equal(MLFeatureHelper.FeatureCountV7, config.MaxFeatures);
+        Assert.Equal(256, config.MaxModelsPerCycle);
+        Assert.Equal(0.001, config.MinEffectSize);
+        Assert.Equal(0.20, config.MaxQValue);
+        Assert.Equal(0, config.LockTimeoutSeconds);
+        Assert.Equal(30, config.DbCommandTimeoutSeconds);
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()
@@ -165,7 +285,9 @@ public class MLFeatureInteractionWorkerTest
         return new WriteApplicationDbContext(options, new HttpContextAccessor());
     }
 
-    private static MLFeatureInteractionWorker CreateWorker(WriteApplicationDbContext db)
+    private static MLFeatureInteractionWorker CreateWorker(
+        WriteApplicationDbContext db,
+        IDistributedLock? distributedLock = null)
     {
         var readContext = new Mock<IReadApplicationDbContext>();
         readContext.Setup(c => c.GetDbContext()).Returns(db);
@@ -180,7 +302,8 @@ public class MLFeatureInteractionWorkerTest
 
         return new MLFeatureInteractionWorker(
             provider.GetRequiredService<IServiceScopeFactory>(),
-            Mock.Of<ILogger<MLFeatureInteractionWorker>>());
+            Mock.Of<ILogger<MLFeatureInteractionWorker>>(),
+            distributedLock);
     }
 
     private static async Task<MLModel> AddModelAsync(WriteApplicationDbContext db)
@@ -275,5 +398,14 @@ public class MLFeatureInteractionWorkerTest
         None,
         Valid,
         Zero
+    }
+
+    private sealed class BusyDistributedLock : IDistributedLock
+    {
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+            => Task.FromResult<IAsyncDisposable?>(null);
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+            => Task.FromResult<IAsyncDisposable?>(null);
     }
 }

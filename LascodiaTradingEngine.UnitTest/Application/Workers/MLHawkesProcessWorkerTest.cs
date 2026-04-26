@@ -124,7 +124,7 @@ public class MLHawkesProcessWorkerTest
         AddConfig(db, "MLHawkes:MaxKernelAgeHours", "24", ConfigDataType.Int);
         db.Set<MLHawkesKernelParams>().Add(new MLHawkesKernelParams
         {
-            Symbol = "EURUSD",
+            Symbol = "eurusd",
             Timeframe = Timeframe.H1,
             Mu = 0.1,
             Alpha = 0.5,
@@ -241,6 +241,99 @@ public class MLHawkesProcessWorkerTest
         Assert.Equal(25, kernel.FitSamples);
     }
 
+    [Fact]
+    public async Task RunCycleAsync_SkipsWhenDisabledByRuntimeConfig()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLHawkes:Enabled", "false", ConfigDataType.Bool);
+        AddConfig(db, "MLHawkes:PollIntervalSeconds", "900", ConfigDataType.Int);
+        var strategy = AddStrategy(db, "EURUSD", Timeframe.H1);
+        AddSignals(db, strategy, "EURUSD", 40);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        int pollSeconds = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(900, pollSeconds);
+        Assert.Empty(await db.Set<MLHawkesKernelParams>().ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_UsesLatestCaseInsensitiveInvariantRuntimeConfig()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLHawkes:MinimumFitSamples", "20", ConfigDataType.Int, DateTime.UtcNow.AddMinutes(-4));
+        AddConfig(db, "MLHawkes:OptimisationSweeps", "10", ConfigDataType.Int, DateTime.UtcNow.AddMinutes(-3));
+        AddConfig(db, "MLHawkes:SuppressMultiplier", "1.50", ConfigDataType.Decimal, DateTime.UtcNow.AddMinutes(-2));
+        AddConfig(db, "mlhawkes:suppressmultiplier", "3.25", ConfigDataType.Decimal, DateTime.UtcNow.AddMinutes(-1));
+        var strategy = AddStrategy(db, "EURUSD", Timeframe.H1);
+        AddSignals(db, strategy, "EURUSD", 40);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var kernel = Assert.Single(await db.Set<MLHawkesKernelParams>().ToListAsync());
+        Assert.Equal(3.25, kernel.SuppressMultiplier, 2);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_RotatesMaxPairsByOldestExistingFit()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLHawkes:MaxPairsPerCycle", "1", ConfigDataType.Int);
+        AddConfig(db, "MLHawkes:OptimisationSweeps", "10", ConfigDataType.Int);
+        var eur = AddStrategy(db, "EURUSD", Timeframe.H1);
+        var gbp = AddStrategy(db, "GBPUSD", Timeframe.H1);
+        AddSignals(db, eur, "EURUSD", 40);
+        AddSignals(db, gbp, "GBPUSD", 40);
+        var eurFitAt = DateTime.UtcNow.AddDays(-1);
+        var gbpFitAt = DateTime.UtcNow.AddDays(-10);
+        db.Set<MLHawkesKernelParams>().AddRange(
+            CreateKernel("EURUSD", Timeframe.H1, eurFitAt),
+            CreateKernel("GBPUSD", Timeframe.H1, gbpFitAt));
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var kernels = await db.Set<MLHawkesKernelParams>().OrderBy(k => k.Symbol).ToListAsync();
+        var eurKernel = Assert.Single(kernels, k => k.Symbol == "EURUSD");
+        var gbpKernel = Assert.Single(kernels, k => k.Symbol == "GBPUSD");
+        Assert.Equal(eurFitAt, eurKernel.FittedAt);
+        Assert.True(gbpKernel.FittedAt > gbpFitAt);
+        Assert.Equal(40, gbpKernel.FitSamples);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_DoesNotFitPausedStrategyFromNonLiveModel()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLHawkes:MinimumFitSamples", "20", ConfigDataType.Int);
+        AddConfig(db, "MLHawkes:OptimisationSweeps", "10", ConfigDataType.Int);
+        var strategy = AddStrategy(db, "EURUSD", Timeframe.H1, StrategyStatus.Paused);
+        AddSignals(db, strategy, "EURUSD", 40);
+        db.Set<MLModel>().Add(new MLModel
+        {
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            IsActive = true,
+            Status = MLModelStatus.Training,
+            ModelVersion = "test",
+            FilePath = "test-model.json"
+        });
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLHawkesKernelParams>().ToListAsync());
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()
@@ -272,14 +365,18 @@ public class MLHawkesProcessWorkerTest
             distributedLock);
     }
 
-    private static Strategy AddStrategy(WriteApplicationDbContext db, string symbol, Timeframe timeframe)
+    private static Strategy AddStrategy(
+        WriteApplicationDbContext db,
+        string symbol,
+        Timeframe timeframe,
+        StrategyStatus status = StrategyStatus.Active)
     {
         var strategy = new Strategy
         {
             Name = $"{symbol}-{timeframe}",
             Symbol = symbol,
             Timeframe = timeframe,
-            Status = StrategyStatus.Active
+            Status = status
         };
         db.Set<Strategy>().Add(strategy);
         return strategy;
@@ -308,15 +405,28 @@ public class MLHawkesProcessWorkerTest
         WriteApplicationDbContext db,
         string key,
         string value,
-        ConfigDataType dataType)
+        ConfigDataType dataType,
+        DateTime? lastUpdatedAt = null)
         => db.Set<EngineConfig>().Add(new EngineConfig
         {
             Key = key,
             Value = value,
             DataType = dataType,
             IsHotReloadable = true,
-            LastUpdatedAt = DateTime.UtcNow
+            LastUpdatedAt = lastUpdatedAt ?? DateTime.UtcNow
         });
+
+    private static MLHawkesKernelParams CreateKernel(string symbol, Timeframe timeframe, DateTime fittedAt)
+        => new()
+        {
+            Symbol = symbol,
+            Timeframe = timeframe,
+            Mu = 0.1,
+            Alpha = 0.1,
+            Beta = 0.5,
+            FitSamples = 20,
+            FittedAt = fittedAt
+        };
 
     private sealed class TestDistributedLock : IDistributedLock
     {

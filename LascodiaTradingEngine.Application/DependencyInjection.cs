@@ -187,6 +187,97 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLEwmaAccuracyOptions>>().Value);
 
+        services.RemoveAll<MLFeatureConsensusOptions>();
+        services.AddSingleton<IValidateOptions<MLFeatureConsensusOptions>, MLFeatureConsensusOptionsValidator>();
+        services.AddOptions<MLFeatureConsensusOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeatureConsensusOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeatureConsensusOptions>>().Value);
+
+        services.RemoveAll<MLFeatureDataFreshnessOptions>();
+        services.AddSingleton<IValidateOptions<MLFeatureDataFreshnessOptions>, MLFeatureDataFreshnessOptionsValidator>();
+        services.AddOptions<MLFeatureDataFreshnessOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeatureDataFreshnessOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeatureDataFreshnessOptions>>().Value);
+
+        services.RemoveAll<MLFeatureImportanceTrendOptions>();
+        services.AddSingleton<IValidateOptions<MLFeatureImportanceTrendOptions>, MLFeatureImportanceTrendOptionsValidator>();
+        services.AddOptions<MLFeatureImportanceTrendOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeatureImportanceTrendOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeatureImportanceTrendOptions>>().Value);
+
+        services.RemoveAll<MLFeatureInteractionOptions>();
+        services.AddSingleton<IValidateOptions<MLFeatureInteractionOptions>, MLFeatureInteractionOptionsValidator>();
+        services.AddOptions<MLFeatureInteractionOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeatureInteractionOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeatureInteractionOptions>>().Value);
+
+        services.RemoveAll<MLFeaturePsiOptions>();
+        services.AddSingleton<IValidateOptions<MLFeaturePsiOptions>, MLFeaturePsiOptionsValidator>();
+        services.AddOptions<MLFeaturePsiOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeaturePsiOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeaturePsiOptions>>().Value);
+
+        services.RemoveAll<MLFeatureRankShiftOptions>();
+        services.AddSingleton<IValidateOptions<MLFeatureRankShiftOptions>, MLFeatureRankShiftOptionsValidator>();
+        services.AddOptions<MLFeatureRankShiftOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeatureRankShiftOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeatureRankShiftOptions>>().Value);
+
+        services.RemoveAll<MLFeatureStalenessOptions>();
+        services.AddSingleton<IValidateOptions<MLFeatureStalenessOptions>, MLFeatureStalenessOptionsValidator>();
+        services.AddOptions<MLFeatureStalenessOptions>()
+            .Bind(configuration.GetSection(nameof(MLFeatureStalenessOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLFeatureStalenessOptions>>().Value);
+
+        services.RemoveAll<MLHorizonAccuracyOptions>();
+        services.AddSingleton<IValidateOptions<MLHorizonAccuracyOptions>, MLHorizonAccuracyOptionsValidator>();
+        services.AddOptions<MLHorizonAccuracyOptions>()
+            .Bind(configuration.GetSection(nameof(MLHorizonAccuracyOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLHorizonAccuracyOptions>>().Value);
+
+        services.RemoveAll<MLInferenceWarmupOptions>();
+        services.AddSingleton<IValidateOptions<MLInferenceWarmupOptions>, MLInferenceWarmupOptionsValidator>();
+        services.AddOptions<MLInferenceWarmupOptions>()
+            .Bind(configuration.GetSection(nameof(MLInferenceWarmupOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLInferenceWarmupOptions>>().Value);
+
+        services.RemoveAll<MLIsotonicRecalibrationOptions>();
+        services.AddSingleton<IValidateOptions<MLIsotonicRecalibrationOptions>, MLIsotonicRecalibrationOptionsValidator>();
+        services.AddOptions<MLIsotonicRecalibrationOptions>()
+            .Bind(configuration.GetSection(nameof(MLIsotonicRecalibrationOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLIsotonicRecalibrationOptions>>().Value);
+
+        services.RemoveAll<MLKellyFractionOptions>();
+        services.AddSingleton<IValidateOptions<MLKellyFractionOptions>, MLKellyFractionOptionsValidator>();
+        services.AddOptions<MLKellyFractionOptions>()
+            .Bind(configuration.GetSection(nameof(MLKellyFractionOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLKellyFractionOptions>>().Value);
+
+        services.RemoveAll<MLMetricsExportOptions>();
+        services.AddSingleton<IValidateOptions<MLMetricsExportOptions>, MLMetricsExportOptionsValidator>();
+        services.AddOptions<MLMetricsExportOptions>()
+            .Bind(configuration.GetSection(nameof(MLMetricsExportOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLMetricsExportOptions>>().Value);
+
+        services.RemoveAll<MLHawkesProcessOptions>();
+        services.AddSingleton<IValidateOptions<MLHawkesProcessOptions>, MLHawkesProcessOptionsValidator>();
+        services.AddOptions<MLHawkesProcessOptions>()
+            .Bind(configuration.GetSection(nameof(MLHawkesProcessOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLHawkesProcessOptions>>().Value);
+
         services.RemoveAll<CorrelationMatrixOptions>();
         services.AddSingleton<IValidateOptions<CorrelationMatrixOptions>, CorrelationMatrixOptionsValidator>();
         services.AddOptions<CorrelationMatrixOptions>()
@@ -306,6 +397,10 @@ public static class DependencyInjection
         services.AddSingleton<IMLConformalPredictionLogReader, MLConformalPredictionLogReader>();
         services.AddSingleton<IMLConformalCalibrationReader, MLConformalCalibrationReader>();
         services.AddSingleton<IMLConformalBreakerStateStore, MLConformalBreakerStateStore>();
+        services.AddSingleton<IMLConformalChronicTripAlertUpserter, MLConformalChronicTripAlertUpserter>();
+        services.AddSingleton<IMLConformalRegimeResolver, MLConformalRegimeResolver>();
+        services.AddSingleton<IMLCalibrationSignalEvaluator, MLCalibrationSignalEvaluator>();
+        services.AddSingleton<IMLCalibratedEdgeEvaluator, MLCalibratedEdgeEvaluator>();
 
         // ── Portfolio-level optimisation (daily Kelly / HRP) ───────────────────
         // Computes per-strategy allocation weights from realised returns and

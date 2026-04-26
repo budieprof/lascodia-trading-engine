@@ -243,4 +243,62 @@ public class MLCpcOptions : ConfigurationOption<MLCpcOptions>
     /// not pass unnoticed.
     /// </summary>
     public int SystemicPauseAlertHours { get; set; } = 24;
+
+    /// <summary>
+    /// Maximum random delay (in seconds) added to <see cref="PollIntervalSeconds"/> after each
+    /// cycle. Prevents two replicas that started at the same moment from polling in lockstep
+    /// and racing on every per-candidate distributed lock. Default 300s spreads pollers
+    /// across a 5-minute window. Set to 0 to disable.
+    /// </summary>
+    public int PollJitterSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// When the cycle throws, the next poll interval grows by
+    /// <c>2^min(consecutiveFailures, FailureBackoffCapShift)</c>. Caps the maximum doubling
+    /// so a long outage still polls at a finite rate. Default 6 → 64× the base interval at
+    /// most. Set to 0 to disable backoff entirely.
+    /// </summary>
+    public int FailureBackoffCapShift { get; set; } = 6;
+
+    /// <summary>
+    /// When <c>true</c>, the worker acquires a singleton distributed lock at the start of
+    /// each cycle so only one replica performs candidate selection + candle loading +
+    /// per-candidate work per cycle. Other replicas skip and retry on the next poll.
+    /// Default <c>true</c> — without it, multiple replicas redundantly load candles and
+    /// race on per-candidate locks. Disable only if you have exactly one replica.
+    /// </summary>
+    public bool UseCycleLock { get; set; } = true;
+
+    /// <summary>
+    /// Maximum seconds to wait for the cycle-level distributed lock when
+    /// <see cref="UseCycleLock"/> is true. Default 0 — try once and skip the cycle if
+    /// another replica holds the lock; the next poll re-attempts after jitter.
+    /// </summary>
+    public int CycleLockTimeoutSeconds { get; set; } = 0;
+
+    /// <summary>
+    /// Number of consecutive cycles in which every attempted candidate fails (or is
+    /// rejected) — despite candidates being available — before the worker raises an
+    /// aggregate <c>SystemicMLDegradation</c> alert. The per-pair consecutive-failure
+    /// alert exists for individual offenders; this fires when fleet-wide training is
+    /// failing, which usually points to data, infrastructure, or trainer regressions.
+    /// </summary>
+    public int FleetSystemicConsecutiveZeroPromotionCycles { get; set; } = 6;
+
+    /// <summary>
+    /// When <c>true</c>, the worker reads per-context override keys from <c>EngineConfig</c>
+    /// before each cycle and uses them in place of the global defaults for these training
+    /// knobs: <c>MinCandles</c>, <c>MaxAcceptableLoss</c>, <c>MinImprovement</c>,
+    /// <c>MaxValidationLoss</c>, <c>MinValidationSequences</c>. The override hierarchy is
+    /// checked in this order (first hit wins):
+    /// <list type="number">
+    ///   <item><c>MLCpc:Override:Symbol:{symbol}:Timeframe:{timeframe}:Regime:{regime}:{Knob}</c></item>
+    ///   <item><c>MLCpc:Override:Symbol:{symbol}:Timeframe:{timeframe}:{Knob}</c></item>
+    ///   <item><c>MLCpc:Override:Symbol:{symbol}:{Knob}</c></item>
+    ///   <item><c>MLCpc:Override:Timeframe:{timeframe}:{Knob}</c></item>
+    /// </list>
+    /// Override keys with unrecognised knob suffixes are logged once per cycle so typos
+    /// surface in dashboards.
+    /// </summary>
+    public bool OverridesEnabled { get; set; } = true;
 }

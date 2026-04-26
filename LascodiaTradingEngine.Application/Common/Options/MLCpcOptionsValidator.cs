@@ -73,6 +73,14 @@ public class MLCpcOptionsValidator : IValidateOptions<MLCpcOptions>
             errors.Add("MLCpcOptions.ConfigurationDriftAlertCycles must be >= 1.");
         if (o.SystemicPauseAlertHours < 1)
             errors.Add("MLCpcOptions.SystemicPauseAlertHours must be >= 1.");
+        if (o.PollJitterSeconds < 0 || o.PollJitterSeconds > 86_400)
+            errors.Add("MLCpcOptions.PollJitterSeconds must be in [0, 86400].");
+        if (o.FailureBackoffCapShift < 0 || o.FailureBackoffCapShift > 16)
+            errors.Add("MLCpcOptions.FailureBackoffCapShift must be in [0, 16].");
+        if (o.CycleLockTimeoutSeconds < 0 || o.CycleLockTimeoutSeconds > 300)
+            errors.Add("MLCpcOptions.CycleLockTimeoutSeconds must be in [0, 300].");
+        if (o.FleetSystemicConsecutiveZeroPromotionCycles < 1)
+            errors.Add("MLCpcOptions.FleetSystemicConsecutiveZeroPromotionCycles must be >= 1.");
 
         return errors.Count > 0
             ? ValidateOptionsResult.Fail(errors)

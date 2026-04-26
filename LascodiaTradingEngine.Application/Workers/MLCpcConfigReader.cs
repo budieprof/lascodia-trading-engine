@@ -52,7 +52,13 @@ public sealed record MLCpcRuntimeConfig(
     double  MaxAdversarialValidationAuc,
     int     MinAdversarialValidationSamples,
     int     ConfigurationDriftAlertCycles,
-    int     SystemicPauseAlertHours);
+    int     SystemicPauseAlertHours,
+    int     PollJitterSeconds,
+    int     FailureBackoffCapShift,
+    bool    UseCycleLock,
+    int     CycleLockTimeoutSeconds,
+    int     FleetSystemicConsecutiveZeroPromotionCycles,
+    bool    OverridesEnabled);
 
 public sealed class MLCpcConfigReader(MLCpcOptions options)
 {
@@ -95,6 +101,12 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
     private const string CK_MinAdversarialValidationSamples = "MLCpc:MinAdversarialValidationSamples";
     private const string CK_ConfigurationDriftAlertCycles  = "MLCpc:ConfigurationDriftAlertCycles";
     private const string CK_SystemicPauseAlertHours        = "MLCpc:SystemicPauseAlertHours";
+    private const string CK_PollJitterSeconds              = "MLCpc:PollJitterSeconds";
+    private const string CK_FailureBackoffCapShift         = "MLCpc:FailureBackoffCapShift";
+    private const string CK_UseCycleLock                   = "MLCpc:UseCycleLock";
+    private const string CK_CycleLockTimeoutSeconds        = "MLCpc:CycleLockTimeoutSeconds";
+    private const string CK_FleetSystemicConsecutiveZeroPromotionCycles = "MLCpc:FleetSystemicConsecutiveZeroPromotionCycles";
+    private const string CK_OverridesEnabled              = "MLCpc:OverridesEnabled";
     private const string CK_SystemicPause                 = "MLTraining:SystemicPauseActive";
 
     public async Task<MLCpcRuntimeConfig> LoadAsync(DbContext ctx, CancellationToken ct)
@@ -207,6 +219,20 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
         int systemicPauseAlertHours = Math.Max(
             1,
             await GetConfigAsync(ctx, CK_SystemicPauseAlertHours, options.SystemicPauseAlertHours, ct));
+        int pollJitterSeconds = Math.Clamp(
+            await GetConfigAsync(ctx, CK_PollJitterSeconds, options.PollJitterSeconds, ct),
+            0, 86_400);
+        int failureBackoffCapShift = Math.Clamp(
+            await GetConfigAsync(ctx, CK_FailureBackoffCapShift, options.FailureBackoffCapShift, ct),
+            0, 16);
+        bool useCycleLock = await GetConfigAsync(ctx, CK_UseCycleLock, options.UseCycleLock, ct);
+        int cycleLockTimeoutSeconds = Math.Clamp(
+            await GetConfigAsync(ctx, CK_CycleLockTimeoutSeconds, options.CycleLockTimeoutSeconds, ct),
+            0, 300);
+        int fleetSystemicConsecutiveZeroPromotionCycles = Math.Max(
+            1,
+            await GetConfigAsync(ctx, CK_FleetSystemicConsecutiveZeroPromotionCycles, options.FleetSystemicConsecutiveZeroPromotionCycles, ct));
+        bool overridesEnabled = await GetConfigAsync(ctx, CK_OverridesEnabled, options.OverridesEnabled, ct);
 
         return new MLCpcRuntimeConfig(
             PollSeconds: pollSecs,
@@ -248,7 +274,13 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
             MaxAdversarialValidationAuc: maxAdversarialValidationAuc,
             MinAdversarialValidationSamples: minAdversarialValidationSamples,
             ConfigurationDriftAlertCycles: configurationDriftAlertCycles,
-            SystemicPauseAlertHours: systemicPauseAlertHours);
+            SystemicPauseAlertHours: systemicPauseAlertHours,
+            PollJitterSeconds: pollJitterSeconds,
+            FailureBackoffCapShift: failureBackoffCapShift,
+            UseCycleLock: useCycleLock,
+            CycleLockTimeoutSeconds: cycleLockTimeoutSeconds,
+            FleetSystemicConsecutiveZeroPromotionCycles: fleetSystemicConsecutiveZeroPromotionCycles,
+            OverridesEnabled: overridesEnabled);
     }
 
     private static async Task<T> GetConfigAsync<T>(

@@ -142,4 +142,12 @@ public sealed partial class CpcPretrainerWorker
     private void LogFailureAuditPersistFailed(CpcPairCandidate _, Exception ex)
         => LogFailureAuditPersistFailedCore(ex);
 
+    [LoggerMessage(EventId = 4324, Level = LogLevel.Debug,
+        Message = "CpcPretrainerWorker: another replica holds the cycle-level lock — skipping cycle.")]
+    private partial void LogCycleLockBusy();
+
+    [LoggerMessage(EventId = 4325, Level = LogLevel.Warning,
+        Message = "CpcPretrainerWorker: ignoring override key with unrecognised knob suffix: {Key}. Valid suffixes: MinCandles, MaxAcceptableLoss, MinImprovement, MaxValidationLoss, MinValidationSequences.")]
+    private partial void LogOverrideKeyUnrecognised(string key);
+
 }

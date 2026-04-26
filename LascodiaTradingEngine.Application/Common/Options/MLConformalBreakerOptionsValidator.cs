@@ -43,6 +43,8 @@ public class MLConformalBreakerOptionsValidator : IValidateOptions<MLConformalBr
             errors.Add("MLConformalBreakerOptions.BackfillBatchSize must be >= 1.");
         if (o.BackfillPollIntervalMinutes < 1)
             errors.Add("MLConformalBreakerOptions.BackfillPollIntervalMinutes must be >= 1.");
+        if (o.EvaluationParallelism < 0 || o.EvaluationParallelism > 32)
+            errors.Add("MLConformalBreakerOptions.EvaluationParallelism must be between 0 and 32 (0 means auto-detect cores).");
 
         return errors.Count > 0
             ? ValidateOptionsResult.Fail(errors)

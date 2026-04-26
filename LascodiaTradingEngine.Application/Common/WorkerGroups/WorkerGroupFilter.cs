@@ -93,6 +93,7 @@ public static class WorkerGroupFilter
         typeof(MLEnsembleDiversityRecoveryWorker),
         typeof(MLErgodicityWorker),
         typeof(MLEwmaAccuracyWorker),
+        typeof(MLFeatureDataFreshnessWorker),
         typeof(MLFeatureImportanceTrendWorker),
         typeof(MLFeatureInteractionWorker),
         typeof(MLFeaturePsiWorker),

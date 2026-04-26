@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -11,7 +12,6 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
-using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -54,13 +54,15 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// dashboard unnoticed. Distinct alert type so dashboards can route "model is degrading"
 /// and "we cannot evaluate the model anymore" to different operator queues.
 /// </remarks>
-public sealed class MLCalibratedEdgeWorker : BackgroundService
+public sealed partial class MLCalibratedEdgeWorker : BackgroundService
 {
     internal const string WorkerName = nameof(MLCalibratedEdgeWorker);
 
     private const string DistributedLockKey = "workers:ml-calibrated-edge:cycle";
+    private const string ModelLockKeyPrefix = "workers:ml-calibrated-edge:model:";
     private const string AlertDeduplicationPrefix = "ml-calibrated-edge:";
     private const string StaleMonitoringDeduplicationPrefix = "ml-calibrated-edge-stale:";
+    private const string ChronicAlertDeduplicationPrefix = "ml-calibrated-edge-chronic:";
     private const int AlertConditionMaxLength = 1000;
     private const string DriftTriggerType = "CalibratedEdge";
 
@@ -68,6 +70,26 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
     // surface) but should not preempt manual or strategy-driven training. Priority 2 sits
     // above background retrains (5+) and below explicit operator queues (1).
     private const int AutoDegradingRetrainPriority = 2;
+
+    // Knob names that are overridable per (Symbol, Timeframe[, Regime]) or per Model:{id}.
+    // The override-token validator flags any override key whose final segment isn't in
+    // this set so operators learn about typos like "WarnEvPipps" instead of seeing the
+    // row silently fall through every tier.
+    private static readonly string[] ValidOverrideKnobs =
+    [
+        "WarnEvPips",
+        "MinSamples",
+        "MaxResolvedPerModel",
+        "TrainingDataWindowDays",
+        "MinTimeBetweenRetrainsHours",
+        "ConsecutiveSkipAlertThreshold",
+        "MaxRetrainsPerCycle",
+        "MaxAlertsPerCycle",
+        "RegressionGuardK",
+        "BootstrapResamples",
+        "ChronicCriticalThreshold",
+        "SuppressRetrainOnChronic",
+    ];
 
     private const string CK_Enabled = "MLEdge:Enabled";
     private const string CK_PollSecs = "MLEdge:PollIntervalSeconds";
@@ -80,6 +102,13 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
     private const string CK_TrainingDataWindowDays = "MLTraining:TrainingDataWindowDays";
     private const string CK_MaxRetrainsPerCycle = "MLEdge:MaxRetrainsPerCycle";
     private const string CK_ConsecutiveSkipAlertThreshold = "MLEdge:ConsecutiveSkipAlertThreshold";
+    private const string CK_MaxDegreeOfParallelism = "MLEdge:MaxDegreeOfParallelism";
+    private const string CK_LongCycleWarnSeconds = "MLEdge:LongCycleWarnSeconds";
+    private const string CK_ChronicCriticalThreshold = "MLEdge:ChronicCriticalThreshold";
+    private const string CK_SuppressRetrainOnChronic = "MLEdge:SuppressRetrainOnChronic";
+    private const string CK_MaxAlertsPerCycle = "MLEdge:MaxAlertsPerCycle";
+    private const string CK_RegressionGuardK = "MLEdge:RegressionGuardK";
+    private const string CK_BootstrapResamples = "MLEdge:BootstrapResamples";
 
     private const int DefaultPollSeconds = 60 * 60;
     private const int MinPollSeconds = 60;
@@ -121,6 +150,48 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
     private const int MinConsecutiveSkipAlertThreshold = 1;
     private const int MaxConsecutiveSkipAlertThreshold = 1000;
 
+    // Bounded in-process concurrency for per-model evaluation. Default 1 preserves
+    // historical strictly-sequential semantics; bumping fans out to N concurrent
+    // (model, lock-acquire, query, audit-flush) chains, each in its own DI scope.
+    private const int DefaultMaxDegreeOfParallelism = 1;
+    private const int MinMaxDegreeOfParallelism = 1;
+    private const int MaxMaxDegreeOfParallelism = 16;
+
+    // Wall-clock cycle warning threshold. Cycle-level distributed lock is held for
+    // the duration of one cycle; if cycle wall-time approaches the lock TTL the
+    // lock can be re-acquired by another replica before this one finishes.
+    private const int DefaultLongCycleWarnSeconds = 300;
+    private const int MinLongCycleWarnSeconds = 0;
+    private const int MaxLongCycleWarnSeconds = 24 * 60 * 60;
+
+    // Number of consecutive Critical-state cycles before a model is flagged as a
+    // retirement candidate. At that point a separate alert fires and (when
+    // SuppressRetrainOnChronic is true, default) further auto-retraining is blocked
+    // so the pipeline doesn't burn cycles on a model that won't converge.
+    private const int DefaultChronicCriticalThreshold = 4;
+    private const int MinChronicCriticalThreshold = 1;
+    private const int MaxChronicCriticalThreshold = 1000;
+
+    // Per-cycle trip-alert dispatch cap. Protects against alert storms during
+    // fleet-wide events (label pipeline outage, prediction-log outage). 0 disables
+    // the budget. Auto-resolves are NOT counted — recovery signals always reach
+    // operators.
+    private const int DefaultMaxAlertsPerCycle = 50;
+    private const int MinMaxAlertsPerCycle = 0;
+    private const int MaxMaxAlertsPerCycle = 10_000;
+
+    // K-sigma significance bar on the EV signal. With non-zero bootstrap stderr this
+    // gates Critical state on `EV + K·stderr ≤ 0` — i.e. EV negative WITH confidence.
+    // Default 1.0 (one-sigma); set ~3.0 for stricter Bonferroni-like coverage. Auto-
+    // bypassed when bootstrap is disabled (BootstrapResamples = 0) or stderr lands at 0.
+    private const double DefaultRegressionGuardK = 1.0;
+    private const double MinRegressionGuardK = 0.0;
+    private const double MaxRegressionGuardK = 5.0;
+
+    private const int DefaultBootstrapResamples = 200;
+    private const int MinBootstrapResamples = 0;
+    private const int MaxBootstrapResamples = 5_000;
+
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
 
@@ -130,24 +201,20 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
     private readonly TimeProvider _timeProvider;
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly IDistributedLock? _distributedLock;
+    private readonly IMLCalibratedEdgeEvaluator _evaluator;
 
     private int _consecutiveFailures;
     private bool _missingDistributedLockWarningEmitted;
+
+    // Hashed signature of the unmatched-tokens set last reported by the override-key
+    // validator. Same dedup primitive as MLCalibrationMonitorWorker. 0 = empty/clean.
+    private long _lastUnmatchedTokensSignature;
 
     private readonly record struct ActiveModelCandidate(
         long Id,
         string Symbol,
         Timeframe Timeframe,
         LearnerArchitecture LearnerArchitecture);
-
-    private readonly record struct LiveEdgeSummary(
-        int ResolvedCount,
-        double ExpectedValuePips,
-        double WinRate,
-        double MeanProbabilityGap,
-        double MeanAbsMagnitudePips,
-        DateTime OldestOutcomeAt,
-        DateTime NewestOutcomeAt);
 
     private readonly record struct ModelEvaluationOutcome(
         bool Evaluated,
@@ -165,21 +232,16 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
 
     private sealed class CycleContext
     {
-        public required Dictionary<long, List<MLModelPredictionLog>> LogsByModelId { get; init; }
+        public required IReadOnlyDictionary<long, List<MLModelPredictionLog>> LogsByModelId { get; init; }
         public required Dictionary<long, int> SkipStreaksByModelId { get; init; }
         public required HashSet<long> LegacyAliasModelIds { get; init; }
         public required HashSet<long> ActiveStaleMonitoringAlertModelIds { get; init; }
         public required RetrainBudget RetrainBudget { get; init; }
     }
 
-    private sealed class RetrainBudget
+    private sealed class RetrainBudget(int maxRetrains)
     {
-        private int _remaining;
-
-        public RetrainBudget(int capacity)
-        {
-            _remaining = capacity;
-        }
+        private int _remaining = Math.Max(0, maxRetrains);
 
         public bool HasCapacity => _remaining > 0;
 
@@ -193,13 +255,53 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Mutable per-cycle state shared by every iteration of the parallel model loop.
+    /// Wrapped in one heap object so the parallel lambda captures `ctx` instead of N
+    /// individual locals; counters atomic-incremented through `ref ctx.Field`.
+    /// </summary>
+    /// <remarks>
+    /// Public mutable fields are deliberate — the only way to provide stable addresses
+    /// for <c>Interlocked.Increment(ref ctx.Field)</c> from outside. Class is private
+    /// and scoped to one in-flight cycle (cycles are serialised by the cycle-level
+    /// distributed lock), so the open-mutable shape never escapes.
+    /// </remarks>
+    private sealed class CycleIteration
+    {
+        public required MLCalibratedEdgeWorkerSettings Settings;
+        public DateTime NowUtc;
+        public required IReadOnlyDictionary<long, List<MLModelPredictionLog>> LogsByModelId;
+        public required IReadOnlyDictionary<long, int> SkipStreaksByModelId;
+        public required IReadOnlySet<long> LegacyAliasModelIds;
+        public ConcurrentDictionary<long, byte> ActiveStaleMonitoringAlertModelIds = new();
+        public required IReadOnlyDictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>> OverridesByContext;
+
+        // Counters mutated atomically by Interlocked through `ref ctx.Field`.
+        public int EvaluatedModels;
+        public int WarningModels;
+        public int CriticalModels;
+        public int RetrainingQueued;
+        public int RetrainBackpressureSkipped;
+        public int DispatchedAlerts;
+        public int ResolvedAlerts;
+        public int StaleMonitoringAlerts;
+        public int FailedModels;
+        public int RemainingModels;
+
+        // Per-cycle retrain budget (existing behaviour) and alert budget (new).
+        public int RemainingRetrainBudget;
+        public int RemainingAlertBudget;
+        public int AlertsSuppressedByBudget;
+    }
+
     public MLCalibratedEdgeWorker(
         IServiceScopeFactory scopeFactory,
         ILogger<MLCalibratedEdgeWorker> logger,
         TradingMetrics? metrics = null,
         TimeProvider? timeProvider = null,
         IWorkerHealthMonitor? healthMonitor = null,
-        IDistributedLock? distributedLock = null)
+        IDistributedLock? distributedLock = null,
+        IMLCalibratedEdgeEvaluator? evaluator = null)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
@@ -207,6 +309,9 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         _timeProvider = timeProvider ?? TimeProvider.System;
         _healthMonitor = healthMonitor;
         _distributedLock = distributedLock;
+        // Default to the standard evaluator when DI doesn't supply one. Tests that
+        // construct the worker directly inherit the production math without ceremony.
+        _evaluator = evaluator ?? new MLCalibratedEdgeEvaluator();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -248,8 +353,23 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
                     _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
                     _metrics?.WorkerCycleDurationMs.Record(
                         durationMs,
-                        new KeyValuePair<string, object?>("worker", WorkerName));
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("parallelism", result.Settings.MaxDegreeOfParallelism));
                     _metrics?.MLCalibratedEdgeCycleDurationMs.Record(durationMs);
+
+                    // Long-cycle guard: warn when wall-time approaches the lock TTL window.
+                    // The cycle-level distributed lock is held for the entire cycle, so a
+                    // long cycle risks the lock expiring and another replica re-acquiring
+                    // before this one finishes. The duration histogram with the parallelism
+                    // tag is the source-of-truth alerting signal; this log is the operator's
+                    // prompt to verify the IDistributedLock TTL is at least this long.
+                    int warnSec = result.Settings.LongCycleWarnSeconds;
+                    if (warnSec > 0 && durationMs > warnSec * 1000L)
+                    {
+                        _logger.LogWarning(
+                            "{Worker}: cycle wall-time {DurationMs}ms exceeded LongCycleWarnSeconds={WarnSec}s. Verify the IDistributedLock TTL is at least this long; otherwise another replica may re-acquire the cycle lock mid-flight.",
+                            WorkerName, durationMs, warnSec);
+                    }
 
                     if (result.SkippedReason is { Length: > 0 })
                     {
@@ -442,90 +562,59 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         var legacyAliasModelIds = ResolveLegacyAliasModelIds(models);
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
 
+        // Single broad-prefix scan over override rows; bucket per (Symbol, Timeframe)
+        // in-memory and run the override-token validator over the same list.
+        var allOverrideRows = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(c => c.Key.StartsWith("MLEdge:Override:"))
+            .Select(c => new KeyValuePair<string, string>(c.Key, c.Value))
+            .ToListAsync(ct);
+        ValidateOverrideTokens(allOverrideRows);
+        var overridesByContext = BucketOverridesByContext(models, allOverrideRows);
+
         var logsByModelId = await BatchLoadResolvedLogsAsync(db, models, settings, nowUtc, ct);
         var skipStreaks = await BatchLoadSkipStreaksAsync(db, models, ct);
         var activeStaleAlertModelIds = await BatchLoadActiveStaleMonitoringAlertModelIdsAsync(db, models, ct);
 
-        var cycleCtx = new CycleContext
+        var ctx = new CycleIteration
         {
+            Settings = settings,
+            NowUtc = nowUtc,
             LogsByModelId = logsByModelId,
             SkipStreaksByModelId = skipStreaks,
             LegacyAliasModelIds = legacyAliasModelIds,
-            ActiveStaleMonitoringAlertModelIds = activeStaleAlertModelIds,
-            RetrainBudget = new RetrainBudget(settings.MaxRetrainsPerCycle),
+            OverridesByContext = overridesByContext,
+            RemainingModels = models.Count,
+            RemainingRetrainBudget = settings.MaxRetrainsPerCycle,
+            // 0 = "disabled" (effectively unlimited budget); int.MaxValue removes the
+            // gate without branching at the dispatcher call site.
+            RemainingAlertBudget = settings.MaxAlertsPerCycle > 0
+                ? settings.MaxAlertsPerCycle
+                : int.MaxValue,
         };
+        foreach (var id in activeStaleAlertModelIds) ctx.ActiveStaleMonitoringAlertModelIds.TryAdd(id, 0);
 
-        int evaluatedModels = 0;
-        int warningModels = 0;
-        int criticalModels = 0;
-        int retrainingQueued = 0;
-        int retrainBackpressureSkipped = 0;
-        int dispatchedAlerts = 0;
-        int resolvedAlerts = 0;
-        int staleMonitoringAlerts = 0;
-        int failedModels = 0;
+        int parallelism = Math.Clamp(settings.MaxDegreeOfParallelism, 1, MaxMaxDegreeOfParallelism);
 
-        foreach (var model in models)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            try
+        await Parallel.ForEachAsync(
+            models,
+            new ParallelOptions
             {
-                var outcome = await EvaluateModelAsync(
-                    serviceProvider,
-                    writeContext,
-                    db,
-                    model,
-                    settings,
-                    cycleCtx,
-                    nowUtc,
-                    ct);
+                MaxDegreeOfParallelism = parallelism,
+                CancellationToken = ct,
+            },
+            async (model, modelCt) => await EvaluateOneIterationAsync(ctx, model, modelCt))
+            .ConfigureAwait(false);
 
-                if (!outcome.Evaluated)
-                {
-                    _metrics?.MLCalibratedEdgeModelsSkipped.Add(
-                        1,
-                        new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
-                        new KeyValuePair<string, object?>("symbol", model.Symbol),
-                        new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
-                    if (outcome.StaleMonitoringAlertDispatched)
-                        staleMonitoringAlerts++;
-                    continue;
-                }
-
-                evaluatedModels++;
-
-                if (outcome.AlertState == MLCalibratedEdgeAlertState.Warning)
-                    warningModels++;
-                else if (outcome.AlertState == MLCalibratedEdgeAlertState.Critical)
-                    criticalModels++;
-
-                if (outcome.RetrainingQueued)
-                    retrainingQueued++;
-                if (outcome.RetrainBackpressureSkipped)
-                    retrainBackpressureSkipped++;
-                if (outcome.AlertDispatched)
-                    dispatchedAlerts++;
-                if (outcome.AlertResolved)
-                    resolvedAlerts++;
-            }
-            catch (Exception ex)
-            {
-                failedModels++;
-                _metrics?.MLCalibratedEdgeModelsSkipped.Add(
-                    1,
-                    new KeyValuePair<string, object?>("reason", "model_error"),
-                    new KeyValuePair<string, object?>("symbol", model.Symbol),
-                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
-                _logger.LogWarning(
-                    ex,
-                    "{Worker}: failed to evaluate live edge for model {ModelId} ({Symbol}/{Timeframe}).",
-                    WorkerName,
-                    model.Id,
-                    model.Symbol,
-                    model.Timeframe);
-            }
-        }
+        int evaluatedModels = ctx.EvaluatedModels;
+        int warningModels = ctx.WarningModels;
+        int criticalModels = ctx.CriticalModels;
+        int retrainingQueued = ctx.RetrainingQueued;
+        int retrainBackpressureSkipped = ctx.RetrainBackpressureSkipped;
+        int dispatchedAlerts = ctx.DispatchedAlerts;
+        int resolvedAlerts = ctx.ResolvedAlerts;
+        int staleMonitoringAlerts = ctx.StaleMonitoringAlerts;
+        int failedModels = ctx.FailedModels;
 
         return new MLCalibratedEdgeCycleResult(
             settings,
@@ -651,32 +740,131 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         return modelIds;
     }
 
+    /// <summary>
+    /// Per-iteration entry point invoked by the parallel loop. Owns one DI scope per
+    /// iteration so the model evaluation never crosses an EF state boundary, and
+    /// re-throws cancellation cleanly so shutdown doesn't masquerade as model failure.
+    /// </summary>
+    private async ValueTask EvaluateOneIterationAsync(
+        CycleIteration ctx, ActiveModelCandidate model, CancellationToken modelCt)
+    {
+        await using var modelScope = _scopeFactory.CreateAsyncScope();
+        var modelWriteCtx = modelScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var modelDb = modelWriteCtx.GetDbContext();
+
+        try
+        {
+            // Refresh the worker heartbeat before each model evaluation. Long cycles
+            // (large fleet / DOP=1) would otherwise leave the health monitor without
+            // a signal until cycle end.
+            _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+            var outcome = await EvaluateModelAsync(
+                modelScope.ServiceProvider, modelWriteCtx, modelDb, model, ctx, modelCt);
+
+            if (outcome.Evaluated)
+            {
+                Interlocked.Increment(ref ctx.EvaluatedModels);
+                if (outcome.AlertState == MLCalibratedEdgeAlertState.Warning)
+                    Interlocked.Increment(ref ctx.WarningModels);
+                else if (outcome.AlertState == MLCalibratedEdgeAlertState.Critical)
+                    Interlocked.Increment(ref ctx.CriticalModels);
+                if (outcome.RetrainingQueued) Interlocked.Increment(ref ctx.RetrainingQueued);
+                if (outcome.RetrainBackpressureSkipped) Interlocked.Increment(ref ctx.RetrainBackpressureSkipped);
+                if (outcome.AlertDispatched) Interlocked.Increment(ref ctx.DispatchedAlerts);
+                if (outcome.AlertResolved) Interlocked.Increment(ref ctx.ResolvedAlerts);
+            }
+            else
+            {
+                _metrics?.MLCalibratedEdgeModelsSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                if (outcome.StaleMonitoringAlertDispatched)
+                    Interlocked.Increment(ref ctx.StaleMonitoringAlerts);
+            }
+        }
+        catch (OperationCanceledException) when (modelCt.IsCancellationRequested)
+        {
+            // Shutdown propagation, not a model failure. Re-throw so Parallel.ForEachAsync
+            // surfaces it and the ExecuteAsync loop honours stoppingToken.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref ctx.FailedModels);
+            _metrics?.MLCalibratedEdgeModelsSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "model_error"),
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                new KeyValuePair<string, object?>("exception_type", ex.GetType().Name));
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to evaluate live edge for model {ModelId} ({Symbol}/{Timeframe}).",
+                WorkerName,
+                model.Id,
+                model.Symbol,
+                model.Timeframe);
+        }
+        finally
+        {
+            int remaining = Interlocked.Decrement(ref ctx.RemainingModels);
+            _healthMonitor?.RecordBacklogDepth(WorkerName, remaining);
+        }
+    }
+
     private async Task<ModelEvaluationOutcome> EvaluateModelAsync(
         IServiceProvider serviceProvider,
         IWriteApplicationDbContext writeContext,
         DbContext db,
         ActiveModelCandidate model,
-        MLCalibratedEdgeWorkerSettings settings,
-        CycleContext cycleCtx,
-        DateTime nowUtc,
+        CycleIteration ctx,
         CancellationToken ct)
     {
-        cycleCtx.LogsByModelId.TryGetValue(model.Id, out var resolvedLogs);
+        // Apply per-context overrides (9-tier hierarchy: Model:{id} → 4 regime-scoped
+        // tiers (when applicable; this worker has no regime concept yet) → 4 regime-
+        // agnostic tiers → defaults). Only the regime-agnostic + Model:{id} tiers
+        // apply here today; the helper supports the regime form for forward compat.
+        var overrides = ctx.OverridesByContext.TryGetValue((model.Symbol, model.Timeframe), out var ctxOverrides)
+            ? ctxOverrides
+            : new Dictionary<string, string>();
+        var settings = ApplyPerContextOverrides(ctx.Settings, overrides, model.Symbol, model.Timeframe, modelId: model.Id);
+        var nowUtc = ctx.NowUtc;
+
+        ctx.LogsByModelId.TryGetValue(model.Id, out var resolvedLogs);
 
         if (resolvedLogs is null || resolvedLogs.Count == 0)
             return await HandleSkipAsync(
-                serviceProvider, writeContext, db, model, settings, cycleCtx, "no_recent_resolved_predictions", nowUtc, ct);
+                serviceProvider, writeContext, db, model, settings, ctx, "no_recent_resolved_predictions", nowUtc, ct);
 
-        var informativeLogs = resolvedLogs
-            .Where(IsEdgeInformative)
-            .ToList();
+        var informativeLogs = new List<MLModelPredictionLog>(resolvedLogs.Count);
+        foreach (var log in resolvedLogs)
+        {
+            if (_evaluator.IsEdgeInformative(log)) informativeLogs.Add(log);
+        }
 
         if (informativeLogs.Count < settings.MinSamples)
             return await HandleSkipAsync(
-                serviceProvider, writeContext, db, model, settings, cycleCtx, "insufficient_informative_history", nowUtc, ct);
+                serviceProvider, writeContext, db, model, settings, ctx, "insufficient_informative_history", nowUtc, ct);
 
-        var summary = ComputeLiveEdge(informativeLogs);
-        var alertState = ResolveAlertState(summary.ExpectedValuePips, settings.WarnExpectedValuePips);
+        var samples = new List<CalibratedEdgeSample>(informativeLogs.Count);
+        foreach (var log in informativeLogs)
+        {
+            if (_evaluator.TryCreateSample(log, out var sample)) samples.Add(sample);
+        }
+
+        if (samples.Count < settings.MinSamples)
+            return await HandleSkipAsync(
+                serviceProvider, writeContext, db, model, settings, ctx, "insufficient_informative_history", nowUtc, ct);
+
+        var summary = _evaluator.ComputeSummary(samples, settings.BootstrapResamples, model.Id);
+        var alertState = _evaluator.ResolveAlertState(
+            summary.ExpectedValuePips,
+            summary.EvStderr,
+            settings.WarnExpectedValuePips,
+            settings.RegressionGuardK);
         string stateTag = alertState switch
         {
             MLCalibratedEdgeAlertState.Critical => "critical",
@@ -699,8 +887,15 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
             new KeyValuePair<string, object?>("symbol", model.Symbol),
             new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
 
-        bool writeLegacyAlias = cycleCtx.LegacyAliasModelIds.Contains(model.Id);
+        bool writeLegacyAlias = ctx.LegacyAliasModelIds.Contains(model.Id);
         await PersistSummaryAsync(db, model, summary, writeLegacyAlias, resetSkipStreak: true, nowUtc, ct);
+
+        // Track per-model consecutive Critical-state cycles. Returns the new streak
+        // length (0 if state isn't Critical). When the threshold is crossed, dispatches
+        // a retirement-candidate alert; recovery to non-Critical resets and auto-resolves.
+        int chronicStreak = await TrackChronicCriticalAndAlertIfNeededAsync(
+            serviceProvider, writeContext, db, model, settings, alertState, summary, nowUtc, ct);
+        bool inChronicState = chronicStreak >= settings.ChronicCriticalThreshold;
 
         bool retrainingQueued = false;
         bool retrainBackpressureSkipped = false;
@@ -709,8 +904,22 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
 
         if (alertState == MLCalibratedEdgeAlertState.Critical)
         {
-            if (!cycleCtx.RetrainBudget.HasCapacity)
+            // Chronic-tripper retrain suppression: model has been Critical for ≥
+            // ChronicCriticalThreshold cycles, repeated retraining is unlikely to
+            // recover, so block further automatic retrains until operator intervenes.
+            if (settings.SuppressRetrainOnChronic && inChronicState)
             {
+                retrainBackpressureSkipped = true;
+                _metrics?.MLCalibratedEdgeRetrainingQueued.Add(
+                    0,
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                    new KeyValuePair<string, object?>("outcome", "chronic_suppressed"));
+            }
+            else if (Interlocked.Decrement(ref ctx.RemainingRetrainBudget) < 0)
+            {
+                // Restore the budget so other models still see capacity correctly.
+                Interlocked.Increment(ref ctx.RemainingRetrainBudget);
                 retrainBackpressureSkipped = true;
                 _metrics?.MLCalibratedEdgeRetrainingQueued.Add(
                     0,
@@ -724,12 +933,17 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
                     db, model, settings, summary, nowUtc, ct);
                 if (retrainingQueued)
                 {
-                    cycleCtx.RetrainBudget.TryConsume();
                     _metrics?.MLCalibratedEdgeRetrainingQueued.Add(
                         1,
                         new KeyValuePair<string, object?>("symbol", model.Symbol),
                         new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
                         new KeyValuePair<string, object?>("outcome", "queued"));
+                }
+                else
+                {
+                    // Didn't actually queue (active run, cooldown, race) — restore the
+                    // budget consumption so it's available for a later model this cycle.
+                    Interlocked.Increment(ref ctx.RemainingRetrainBudget);
                 }
             }
         }
@@ -744,6 +958,7 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
                 settings,
                 summary,
                 alertState,
+                ctx,
                 nowUtc,
                 ct);
 
@@ -771,13 +986,13 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
             }
         }
 
-        if (cycleCtx.ActiveStaleMonitoringAlertModelIds.Contains(model.Id))
+        if (ctx.ActiveStaleMonitoringAlertModelIds.ContainsKey(model.Id))
         {
             bool staleResolved = await ResolveAlertAsync(
                 serviceProvider, writeContext, db, model, StaleMonitoringDeduplicationPrefix, nowUtc, ct);
             if (staleResolved)
             {
-                cycleCtx.ActiveStaleMonitoringAlertModelIds.Remove(model.Id);
+                ctx.ActiveStaleMonitoringAlertModelIds.TryRemove(model.Id, out _);
                 _metrics?.MLCalibratedEdgeAlertTransitions.Add(
                     1,
                     new KeyValuePair<string, object?>("transition", "stale_monitoring_resolved"));
@@ -814,13 +1029,12 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         DbContext db,
         ActiveModelCandidate model,
         MLCalibratedEdgeWorkerSettings settings,
-        CycleContext cycleCtx,
+        CycleIteration ctx,
         string skipReason,
         DateTime nowUtc,
         CancellationToken ct)
     {
-        int newStreak = cycleCtx.SkipStreaksByModelId.GetValueOrDefault(model.Id) + 1;
-        cycleCtx.SkipStreaksByModelId[model.Id] = newStreak;
+        int newStreak = ctx.SkipStreaksByModelId.TryGetValue(model.Id, out var existing) ? existing + 1 : 1;
 
         await EngineConfigUpsert.BatchUpsertAsync(
             db,
@@ -852,50 +1066,6 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         }
 
         return ModelEvaluationOutcome.Skipped(skipReason, staleAlertDispatched);
-    }
-
-    private static LiveEdgeSummary ComputeLiveEdge(IReadOnlyList<MLModelPredictionLog> logs)
-    {
-        double evSum = 0.0;
-        double winSum = 0.0;
-        double gapSum = 0.0;
-        double magnitudeSum = 0.0;
-        DateTime oldestOutcomeAt = DateTime.MaxValue;
-        DateTime newestOutcomeAt = DateTime.MinValue;
-
-        foreach (var log in logs)
-        {
-            double threshold = MLFeatureHelper.ResolveLoggedDecisionThreshold(log, 0.5);
-            double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, threshold);
-            bool predictedBuy = pBuy >= threshold;
-            bool actualBuy = log.ActualDirection == TradeDirection.Buy;
-            bool correct = predictedBuy == actualBuy;
-            double probabilityGap = Math.Abs(pBuy - threshold);
-            double magnitudePips = Math.Abs((double)log.ActualMagnitudePips!.Value);
-            double signedEdge = (correct ? 1.0 : -1.0) * probabilityGap * magnitudePips;
-
-            evSum += signedEdge;
-            gapSum += probabilityGap;
-            magnitudeSum += magnitudePips;
-            if (correct)
-                winSum += 1.0;
-
-            DateTime outcomeAt = log.OutcomeRecordedAt ?? log.PredictedAt;
-            if (outcomeAt < oldestOutcomeAt)
-                oldestOutcomeAt = outcomeAt;
-            if (outcomeAt > newestOutcomeAt)
-                newestOutcomeAt = outcomeAt;
-        }
-
-        double divisor = logs.Count;
-        return new LiveEdgeSummary(
-            ResolvedCount: logs.Count,
-            ExpectedValuePips: evSum / divisor,
-            WinRate: winSum / divisor,
-            MeanProbabilityGap: gapSum / divisor,
-            MeanAbsMagnitudePips: magnitudeSum / divisor,
-            OldestOutcomeAt: oldestOutcomeAt,
-            NewestOutcomeAt: newestOutcomeAt);
     }
 
     private static Task PersistSummaryAsync(
@@ -1064,6 +1234,7 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
         MLCalibratedEdgeWorkerSettings settings,
         LiveEdgeSummary summary,
         MLCalibratedEdgeAlertState alertState,
+        CycleIteration? ctx,
         DateTime nowUtc,
         CancellationToken ct)
     {
@@ -1073,7 +1244,7 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
                                            && candidate.IsActive
                                            && candidate.DeduplicationKey == deduplicationKey, ct);
 
-        AlertSeverity severity = DetermineSeverity(alertState, summary, settings);
+        AlertSeverity severity = _evaluator.DetermineSeverity(alertState, summary, settings.WarnExpectedValuePips);
         DateTime? previousTriggeredAt = alert?.LastTriggeredAt;
         AlertSeverity? previousSeverity = alert?.Severity;
         string conditionJson = Truncate(BuildEdgeAlertConditionJson(model, settings, summary, alertState, nowUtc), AlertConditionMaxLength);
@@ -1127,6 +1298,20 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
             : $"ML calibrated edge is marginal for model {model.Id} ({model.Symbol}/{model.Timeframe}): EV={summary.ExpectedValuePips:F4} below warning floor {settings.WarnExpectedValuePips:F4}, winRate={summary.WinRate:P1}, meanGap={summary.MeanProbabilityGap:F4}, n={summary.ResolvedCount}.";
 
         var dispatcher = serviceProvider.GetRequiredService<IAlertDispatcher>();
+
+        // Per-cycle alert budget: the Alert row is already upserted (so dashboards see
+        // the state) but dispatching the notification is rate-limited to protect
+        // against alert storms during fleet-wide degradation events. Auto-resolves
+        // are exempt — recovery signals always reach operators.
+        if (ctx is not null && Interlocked.Decrement(ref ctx.RemainingAlertBudget) < 0)
+        {
+            Interlocked.Increment(ref ctx.AlertsSuppressedByBudget);
+            _metrics?.MLCalibratedEdgeCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "alert_budget_exhausted"));
+            return false;
+        }
+
         try
         {
             await dispatcher.DispatchAsync(alert, message, ct);
@@ -1333,6 +1518,13 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
             CK_TrainingDataWindowDays,
             CK_MaxRetrainsPerCycle,
             CK_ConsecutiveSkipAlertThreshold,
+            CK_MaxDegreeOfParallelism,
+            CK_LongCycleWarnSeconds,
+            CK_ChronicCriticalThreshold,
+            CK_SuppressRetrainOnChronic,
+            CK_MaxAlertsPerCycle,
+            CK_RegressionGuardK,
+            CK_BootstrapResamples,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -1378,39 +1570,26 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
             ConsecutiveSkipAlertThreshold: ClampInt(
                 GetInt(values, CK_ConsecutiveSkipAlertThreshold, DefaultConsecutiveSkipAlertThreshold),
                 DefaultConsecutiveSkipAlertThreshold, MinConsecutiveSkipAlertThreshold, MaxConsecutiveSkipAlertThreshold),
-            CooldownSeconds: Math.Max(1, cooldownSeconds));
-    }
-
-    private static MLCalibratedEdgeAlertState ResolveAlertState(double expectedValuePips, double warnExpectedValuePips)
-    {
-        if (expectedValuePips <= 0.0)
-            return MLCalibratedEdgeAlertState.Critical;
-
-        return warnExpectedValuePips > 0.0 && expectedValuePips < warnExpectedValuePips
-            ? MLCalibratedEdgeAlertState.Warning
-            : MLCalibratedEdgeAlertState.None;
-    }
-
-    private static AlertSeverity DetermineSeverity(
-        MLCalibratedEdgeAlertState alertState,
-        LiveEdgeSummary summary,
-        MLCalibratedEdgeWorkerSettings settings)
-    {
-        if (alertState == MLCalibratedEdgeAlertState.Critical)
-            return AlertSeverity.Critical;
-
-        if (summary.ExpectedValuePips <= settings.WarnExpectedValuePips * 0.5)
-            return AlertSeverity.High;
-
-        return AlertSeverity.Medium;
-    }
-
-    private static bool IsEdgeInformative(MLModelPredictionLog log)
-    {
-        return log.ServedCalibratedProbability.HasValue
-            || log.CalibratedProbability.HasValue
-            || log.RawProbability.HasValue
-            || log.DecisionThresholdUsed.HasValue;
+            CooldownSeconds: Math.Max(1, cooldownSeconds),
+            MaxDegreeOfParallelism: ClampInt(
+                GetInt(values, CK_MaxDegreeOfParallelism, DefaultMaxDegreeOfParallelism),
+                DefaultMaxDegreeOfParallelism, MinMaxDegreeOfParallelism, MaxMaxDegreeOfParallelism),
+            LongCycleWarnSeconds: ClampIntAllowingZero(
+                GetInt(values, CK_LongCycleWarnSeconds, DefaultLongCycleWarnSeconds),
+                DefaultLongCycleWarnSeconds, MinLongCycleWarnSeconds, MaxLongCycleWarnSeconds),
+            ChronicCriticalThreshold: ClampInt(
+                GetInt(values, CK_ChronicCriticalThreshold, DefaultChronicCriticalThreshold),
+                DefaultChronicCriticalThreshold, MinChronicCriticalThreshold, MaxChronicCriticalThreshold),
+            SuppressRetrainOnChronic: GetBool(values, CK_SuppressRetrainOnChronic, true),
+            MaxAlertsPerCycle: ClampIntAllowingZero(
+                GetInt(values, CK_MaxAlertsPerCycle, DefaultMaxAlertsPerCycle),
+                DefaultMaxAlertsPerCycle, MinMaxAlertsPerCycle, MaxMaxAlertsPerCycle),
+            RegressionGuardK: ClampDoubleAllowingZero(
+                GetDouble(values, CK_RegressionGuardK, DefaultRegressionGuardK),
+                DefaultRegressionGuardK, MinRegressionGuardK, MaxRegressionGuardK),
+            BootstrapResamples: ClampIntAllowingZero(
+                GetInt(values, CK_BootstrapResamples, DefaultBootstrapResamples),
+                DefaultBootstrapResamples, MinBootstrapResamples, MaxBootstrapResamples));
     }
 
     private static string SkipStreakKey(long modelId)
@@ -1430,6 +1609,18 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
             NumberStyles.Integer,
             CultureInfo.InvariantCulture,
             out modelId);
+    }
+
+    private static async Task<int?> LoadExistingIntConfigAsync(DbContext db, string key, CancellationToken ct)
+    {
+        var entry = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(config => config.Key == key, ct);
+
+        return entry?.Value is not null
+            && int.TryParse(entry.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
     }
 
     private static bool GetBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
@@ -1533,7 +1724,14 @@ internal sealed record MLCalibratedEdgeWorkerSettings(
     int MinTimeBetweenRetrainsHours,
     int MaxRetrainsPerCycle,
     int ConsecutiveSkipAlertThreshold,
-    int CooldownSeconds);
+    int CooldownSeconds,
+    int MaxDegreeOfParallelism,
+    int LongCycleWarnSeconds,
+    int ChronicCriticalThreshold,
+    bool SuppressRetrainOnChronic,
+    int MaxAlertsPerCycle,
+    double RegressionGuardK,
+    int BootstrapResamples);
 
 internal sealed record MLCalibratedEdgeCycleResult(
     MLCalibratedEdgeWorkerSettings Settings,
@@ -1565,7 +1763,7 @@ internal sealed record MLCalibratedEdgeCycleResult(
             FailedModelCount: 0);
 }
 
-internal enum MLCalibratedEdgeAlertState
+public enum MLCalibratedEdgeAlertState
 {
     None = 0,
     Warning = 1,

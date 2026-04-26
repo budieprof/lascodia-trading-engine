@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -25,7 +26,23 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// per-regime breakdown, fleet-level dampening, and per-decision audit logging via
 /// <see cref="MLCalibrationLog"/>.
 /// </summary>
-public sealed class MLCalibrationMonitorWorker : BackgroundService
+/// <remarks>
+/// <para><b>File layout (partial-class split).</b></para>
+/// <list type="bullet">
+///   <item><c>MLCalibrationMonitorWorker.cs</c> — cycle orchestration, settings, persist, alerts, retraining, fleet alert, this docblock.</item>
+///   <item><c>MLCalibrationMonitorWorker.Overrides.cs</c> — per-context override loading, resolution, application, validation.</item>
+///   <item><c>MLCalibrationMonitorWorker.Signals.cs</c> — sample creation, calibration math, signal/severity classification.</item>
+///   <item><c>MLCalibrationMonitorWorker.Bootstrap.cs</c> — bootstrap-stderr cache + computation.</item>
+///   <item><c>MLCalibrationMonitorWorker.Audit.cs</c> — audit pipeline + diagnostics builders.</item>
+/// </list>
+/// <para>
+/// All five files share one <c>sealed partial class</c>. Field declarations and the
+/// <c>CycleIteration</c> nested class live in this file. Add new helpers to the partial
+/// whose concern matches; resist creating a sixth file unless a clearly distinct concern
+/// emerges.
+/// </para>
+/// </remarks>
+public sealed partial class MLCalibrationMonitorWorker : BackgroundService
 {
     internal const string WorkerName = nameof(MLCalibrationMonitorWorker);
 
@@ -67,8 +84,24 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const string CK_MinSamplesForTimeDecay = "MLCalibration:MinSamplesForTimeDecay";
     private const string CK_TrendSmoothingWindow = "MLCalibration:TrendSmoothingWindow";
     private const string CK_StaleSkipAlertThreshold = "MLCalibration:StaleSkipAlertThreshold";
+    private const string CK_ChronicCriticalThreshold = "MLCalibration:ChronicCriticalThreshold";
+    private const string CK_SuppressRetrainOnChronic = "MLCalibration:SuppressRetrainOnChronic";
+    private const string CK_MaxAlertsPerCycle = "MLCalibration:MaxAlertsPerCycle";
+    private const string ChronicAlertDeduplicationPrefix = "ml-calibration-monitor-chronic:";
     private const string CK_MaxDegreeOfParallelism = "MLCalibration:MaxDegreeOfParallelism";
     private const string CK_LongCycleWarnSeconds = "MLCalibration:LongCycleWarnSeconds";
+    private const string CK_AuditFlushMode = "MLCalibration:AuditFlushMode";
+    private const AuditFlushMode DefaultAuditFlushMode = AuditFlushMode.PerModel;
+    // Operator-facing wire-format aliases. Add an alias by extending the source dict;
+    // legacy values continue to resolve. Case-insensitive comparison so "Cycle" /
+    // "CYCLE" / "cycle" all work. FrozenDictionary trades higher init cost for faster
+    // lookup — appropriate for a read-only table consulted on every settings load.
+    private static readonly FrozenDictionary<string, AuditFlushMode> AuditFlushModeAliases =
+        new Dictionary<string, AuditFlushMode>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["per_model"] = AuditFlushMode.PerModel,
+            ["cycle"] = AuditFlushMode.Cycle,
+        }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
     private const string StaleAlertDeduplicationPrefix = "ml-calibration-monitor-stale:";
 
     private const int DefaultPollSeconds = 60 * 60;
@@ -182,6 +215,22 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private const int MinLongCycleWarnSeconds = 0;
     private const int MaxLongCycleWarnSeconds = 24 * 60 * 60;
 
+    // Number of consecutive Critical-state cycles before a model is flagged as a
+    // retirement candidate (chronic-tripper). At that point a separate alert fires and
+    // SuppressRetrainOnChronic (default true) blocks further automatic retrains so the
+    // pipeline doesn't burn cycles re-training a model that won't converge.
+    private const int DefaultChronicCriticalThreshold = 4;
+    private const int MinChronicCriticalThreshold = 1;
+    private const int MaxChronicCriticalThreshold = 1000;
+
+    // Maximum trip-alert dispatches per cycle. Protects against alert storms during
+    // fleet-wide events (data outage, label-pipeline failure). 0 disables the budget.
+    // Auto-resolve dispatches are NOT counted against this budget — recovery signals
+    // should always reach operators.
+    private const int DefaultMaxAlertsPerCycle = 50;
+    private const int MinMaxAlertsPerCycle = 0;
+    private const int MaxMaxAlertsPerCycle = 10_000;
+
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(30);
 
@@ -192,10 +241,35 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly IDistributedLock? _distributedLock;
     private readonly IAlertDispatcher? _alertDispatcher;
+    private readonly IMLCalibrationSignalEvaluator _signalEvaluator;
 
     private int _consecutiveFailures;
     private bool _missingDistributedLockWarningEmitted;
-    private int _overrideRegimeValidationDone;
+    // Hashed signature of the unmatched-tokens (regime + knob) set last reported. Used
+    // to dedup the per-cycle validator's Warning logs: same signature = same situation
+    // = no log. 0 is reserved for the empty (clean) state. Resets to 0 on worker
+    // restart so operators see the typo on first cycle after restart even if the same
+    // set was reported before. Hashed (vs. joined-string) to avoid per-cycle string
+    // allocation in the steady state where the set rarely changes.
+    private long _lastUnmatchedTokensSignature;
+
+    // FNV-1a signature of the last unrecognized MLCalibration:AuditFlushMode value
+    // observed. Symmetric with `_lastUnmatchedTokensSignature`: same dedup primitive
+    // serves both validators. 0 = "no unknown value ever seen" (or recovered).
+    private long _lastUnknownAuditFlushModeSignature;
+
+    // Knob names that are overridable per (Symbol, Timeframe[, Regime]). The validator
+    // flags any override key whose final segment isn't in this set so operators learn
+    // about typos like `MaxEcce` instead of seeing the row silently fall through every
+    // tier. Update this set whenever a new knob is added to ApplyPerContextOverrides.
+    private static readonly string[] ValidOverrideKnobs =
+    [
+        "MaxEce",
+        "DegradationDelta",
+        "RegressionGuardK",
+        "BootstrapCacheStaleHours",
+        "RetrainOnBaselineCritical",
+    ];
 
     private readonly record struct ActiveModelCandidate(
         long Id,
@@ -205,33 +279,9 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         byte[]? ModelBytes,
         uint RowVersion);
 
-    private readonly record struct CalibrationSample(
-        double Confidence,
-        bool Correct,
-        DateTime OutcomeAt,
-        DateTime PredictedAt);
-
-    private readonly record struct CalibrationSummary(
-        int ResolvedCount,
-        double CurrentEce,
-        double Accuracy,
-        double MeanConfidence,
-        DateTime OldestOutcomeAt,
-        DateTime NewestOutcomeAt,
-        int[] BinCounts,
-        double[] BinAccuracy,
-        double[] BinMeanConfidence,
-        double EceStderr);
-
-    private readonly record struct CalibrationSignals(
-        double? PreviousEce,
-        double? BaselineEce,
-        double TrendDelta,
-        double BaselineDelta,
-        bool ThresholdExceeded,
-        bool TrendExceeded,
-        bool BaselineExceeded,
-        bool TrendStderrPasses);
+    // CalibrationSample / CalibrationSummary / CalibrationSignals live in
+    // MLCalibrationSignalTypes.cs (internal namespace types) so IMLCalibrationSignalEvaluator
+    // can return them without leaking through worker-private scope.
 
     private readonly record struct RegimeSlice(
         DateTime DetectedAt,
@@ -249,6 +299,46 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             => new(false, MLCalibrationMonitorAlertState.None, false, false, false, reason);
     }
 
+    /// <summary>
+    /// Mutable per-cycle state shared by every iteration of the parallel model loop.
+    /// Wrapped in one heap object so the parallel lambda captures `ctx` instead of N
+    /// individual locals; counters are atomic-incremented through `ref ctx.Field`.
+    /// </summary>
+    /// <remarks>
+    /// Public mutable fields are deliberate — they're the only way to provide stable
+    /// addresses for <c>Interlocked.Increment(ref ctx.Field)</c> from the iteration
+    /// body. Wrapping them in property accessors that internally Interlocked would
+    /// produce uglier call sites without changing semantics. The class is private and
+    /// scoped to one in-flight cycle (cycles are serialised by the cycle-level
+    /// distributed lock), so the open-mutable shape never escapes the worker.
+    /// </remarks>
+    private sealed class CycleIteration
+    {
+        public required MLCalibrationMonitorWorkerSettings Settings;
+        public DateTime NowUtc;
+        public required IReadOnlyDictionary<long, DateTime?> LastNewestOutcome;
+        public required IReadOnlyDictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>> OverridesByContext;
+        public ConcurrentBag<MLCalibrationLog>? CycleAuditCollector;
+
+        // Counters mutated atomically by Interlocked through `ref ctx.Field`.
+        public int EvaluatedModels;
+        public int WarningModels;
+        public int CriticalModels;
+        public int RetrainingQueued;
+        public int DispatchedAlerts;
+        public int ResolvedAlerts;
+        public int FailedModels;
+        public int RemainingModels;
+
+        // Alert budget counter for the per-cycle dispatch cap. Initialised to
+        // settings.MaxAlertsPerCycle (or int.MaxValue when MaxAlertsPerCycle = 0).
+        // Each trip-alert dispatch atomically decrements; when the result drops below
+        // zero, downstream skips the dispatcher.DispatchAsync call but still upserts
+        // the Alert row so dashboards see the state. Auto-resolves never consume budget.
+        public int RemainingAlertBudget;
+        public int AlertsSuppressedByBudget;
+    }
+
     public MLCalibrationMonitorWorker(
         IServiceScopeFactory scopeFactory,
         ILogger<MLCalibrationMonitorWorker> logger,
@@ -256,7 +346,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         TimeProvider? timeProvider = null,
         IWorkerHealthMonitor? healthMonitor = null,
         IDistributedLock? distributedLock = null,
-        IAlertDispatcher? alertDispatcher = null)
+        IAlertDispatcher? alertDispatcher = null,
+        IMLCalibrationSignalEvaluator? signalEvaluator = null)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
@@ -265,6 +356,10 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         _healthMonitor = healthMonitor;
         _distributedLock = distributedLock;
         _alertDispatcher = alertDispatcher;
+        // Default to the standard evaluator when DI doesn't supply one. Tests that
+        // construct the worker directly inherit the production math without ceremony;
+        // tests of the evaluator itself can construct it standalone.
+        _signalEvaluator = signalEvaluator ?? new MLCalibrationSignalEvaluator();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -511,35 +606,62 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             return MLCalibrationMonitorCycleResult.Skipped(settings, "no_active_models");
         }
 
-        // Once-per-process audit of override-key regime tokens. Helps operators catch typos
-        // early instead of having keys silently fall through tiers. Gated via Interlocked
-        // CompareExchange so concurrent first cycles still run it once.
-        if (Interlocked.CompareExchange(ref _overrideRegimeValidationDone, 1, 0) == 0)
-        {
-            await ValidateOverrideRegimeNamesAsync(db, ct);
-        }
+        // Single round-trip for everything override-related. Both the per-cycle token
+        // validator (regime + knob typos) and the per-context bucketer operate on this
+        // pre-loaded list in-memory, so the cycle pays one query instead of two.
+        var allOverrideRows = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(c => c.Key.StartsWith("MLCalibration:Override:"))
+            .Select(c => new KeyValuePair<string, string>(c.Key, c.Value))
+            .ToListAsync(ct);
+
+        // Per-cycle audit of override-key tokens (regime names + knob names). Catches
+        // typos that operators introduce mid-flight, dedup'd via a hashed signature so
+        // a persistent unmatched set logs once and transitions re-log.
+        ValidateOverrideTokens(allOverrideRows);
 
         // Pre-load per-model latest NewestOutcomeAt across all prior cycles. Survives restarts
         // and is shared across replicas via the audit table.
         var modelIds = models.Select(model => model.Id).ToList();
         var lastNewestOutcome = await LoadLastNewestOutcomeMapAsync(db, modelIds, ct);
 
-        // Pre-load per-context overrides once per unique (Symbol, Timeframe) so parallel
-        // model iterations share a single read. With one model per pair (typical) this is
-        // identical to the previous per-model load; with multiple variants per pair it
-        // collapses N reads to one. The dict is immutable plain data and safe to share.
-        var overridesByContext = await LoadOverridesByContextAsync(db, models, ct);
+        // Per-context buckets for parallel iterations to share. With one model per pair
+        // (typical) this is identical to the previous per-model load; with multiple
+        // variants per pair it collapses N reads to one. The bucket dicts are immutable
+        // plain data and safe to share.
+        var overridesByContext = BucketOverridesByContext(models, allOverrideRows);
 
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
         int parallelism = Math.Clamp(settings.MaxDegreeOfParallelism, 1, MaxMaxDegreeOfParallelism);
 
-        // Per-model evaluation runs under bounded parallelism. Each iteration owns its
-        // DI scope (and therefore its own DbContext), so EF state never crosses the
-        // boundary. Outcome aggregation happens after the loop from a thread-safe bag;
-        // counters that need to fire mid-iteration use Interlocked.
-        var outcomes = new ConcurrentBag<ModelEvaluationOutcome>();
-        int failedModels = 0;
+        // All per-iteration mutable state and shared inputs go into one heap object so
+        // the parallel loop's lambda captures only `this` and `ctx` (not 12 separate
+        // locals). Counters are atomic-incremented through `ref ctx.Field`. Cycle-level
+        // audit collector is non-null only when AuditFlushMode = Cycle (then iterations
+        // transfer their audits to it; a single DI scope flushes after the loop).
+        var ctx = new CycleIteration
+        {
+            Settings = settings,
+            NowUtc = nowUtc,
+            LastNewestOutcome = lastNewestOutcome,
+            OverridesByContext = overridesByContext,
+            CycleAuditCollector = settings.AuditFlushMode == AuditFlushMode.Cycle
+                ? new ConcurrentBag<MLCalibrationLog>()
+                : null,
+            RemainingModels = models.Count,
+            // Budget = MaxAlertsPerCycle, with 0 meaning "disabled" (effectively
+            // unlimited). int.MaxValue removes the gate without branching at the
+            // call site.
+            RemainingAlertBudget = settings.MaxAlertsPerCycle > 0
+                ? settings.MaxAlertsPerCycle
+                : int.MaxValue,
+        };
 
+        // The lambda captures `this` and `ctx` only — two refs vs. the twelve before
+        // CycleIteration consolidated state. A true method-group reference would require
+        // ctx to be a closure-free instance member, which would unsafely couple cycles
+        // (cycles are serialised by the cycle lock today, but storing per-cycle state
+        // on the worker would conflate that boundary). Two captures is the floor.
         await Parallel.ForEachAsync(
             models,
             new ParallelOptions
@@ -547,84 +669,23 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 MaxDegreeOfParallelism = parallelism,
                 CancellationToken = ct,
             },
-            async (model, modelCt) =>
-            {
-                lastNewestOutcome.TryGetValue(model.Id, out var lastSeen);
-                var overrides = overridesByContext[(model.Symbol, model.Timeframe)];
+            async (model, modelCt) => await EvaluateOneIterationAsync(ctx, model, modelCt))
+            .ConfigureAwait(false);
 
-                await using var modelScope = _scopeFactory.CreateAsyncScope();
-                var modelWriteCtx = modelScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var modelDb = modelWriteCtx.GetDbContext();
+        var cycleAuditCollector = ctx.CycleAuditCollector;
+        int evaluatedModels = ctx.EvaluatedModels;
+        int warningModels = ctx.WarningModels;
+        int criticalModels = ctx.CriticalModels;
+        int retrainingQueued = ctx.RetrainingQueued;
+        int dispatchedAlerts = ctx.DispatchedAlerts;
+        int resolvedAlerts = ctx.ResolvedAlerts;
+        int failedModels = ctx.FailedModels;
 
-                try
-                {
-                    // Refresh the worker heartbeat before each model evaluation. Long
-                    // cycles (large fleet / DOP=1) would otherwise leave the health
-                    // monitor without a signal until the cycle ends.
-                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
-
-                    var outcome = await EvaluateModelWithLockAsync(
-                        modelScope.ServiceProvider,
-                        modelWriteCtx,
-                        modelDb,
-                        model,
-                        settings,
-                        overrides,
-                        lastSeen,
-                        nowUtc,
-                        modelCt);
-
-                    outcomes.Add(outcome);
-
-                    if (!outcome.Evaluated)
-                    {
-                        _metrics?.MLCalibrationMonitorModelsSkipped.Add(
-                            1,
-                            new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
-                            new KeyValuePair<string, object?>("symbol", model.Symbol),
-                            new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
-                    }
-                }
-                catch (OperationCanceledException) when (modelCt.IsCancellationRequested)
-                {
-                    // Shutdown propagation, not a model failure. Re-throw so
-                    // Parallel.ForEachAsync surfaces it; the ExecuteAsync loop will
-                    // honour stoppingToken and exit cleanly.
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref failedModels);
-                    _metrics?.WorkerErrors.Add(
-                        1,
-                        new KeyValuePair<string, object?>("worker", WorkerName),
-                        new KeyValuePair<string, object?>("reason", "ml_calibration_monitor_model"),
-                        new KeyValuePair<string, object?>("exception_type", ex.GetType().Name));
-                    _logger.LogWarning(
-                        ex,
-                        "{Worker}: failed to evaluate calibration for model {ModelId} ({Symbol}/{Timeframe}).",
-                        WorkerName,
-                        model.Id,
-                        model.Symbol,
-                        model.Timeframe);
-                }
-            }).ConfigureAwait(false);
-
-        int evaluatedModels = 0;
-        int warningModels = 0;
-        int criticalModels = 0;
-        int retrainingQueued = 0;
-        int dispatchedAlerts = 0;
-        int resolvedAlerts = 0;
-        foreach (var outcome in outcomes)
+        // One flush of every iteration's audits when AuditFlushMode = Cycle. Pass the
+        // bag directly; FlushAuditsAsync enumerates it as a snapshot.
+        if (cycleAuditCollector is { IsEmpty: false })
         {
-            if (!outcome.Evaluated) continue;
-            evaluatedModels++;
-            if (outcome.AlertState == MLCalibrationMonitorAlertState.Warning) warningModels++;
-            else if (outcome.AlertState == MLCalibrationMonitorAlertState.Critical) criticalModels++;
-            if (outcome.RetrainingQueued) retrainingQueued++;
-            if (outcome.AlertDispatched) dispatchedAlerts++;
-            if (outcome.AlertResolved) resolvedAlerts++;
+            await FlushAuditsAsync(cycleAuditCollector, ct);
         }
 
         bool fleetAlertDispatched = false;
@@ -671,6 +732,84 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         return rows.ToDictionary(row => row.ModelId, row => row.MaxAt);
     }
 
+    private async ValueTask EvaluateOneIterationAsync(
+        CycleIteration ctx, ActiveModelCandidate model, CancellationToken modelCt)
+    {
+        ctx.LastNewestOutcome.TryGetValue(model.Id, out var lastSeen);
+        var overrides = ctx.OverridesByContext[(model.Symbol, model.Timeframe)];
+
+        await using var modelScope = _scopeFactory.CreateAsyncScope();
+        var modelWriteCtx = modelScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var modelDb = modelWriteCtx.GetDbContext();
+
+        try
+        {
+            // Refresh the worker heartbeat before each model evaluation. Long cycles
+            // (large fleet / DOP=1) would otherwise leave the health monitor without
+            // a signal until cycle end.
+            _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+            var outcome = await EvaluateModelWithLockAsync(
+                modelScope.ServiceProvider,
+                modelWriteCtx,
+                modelDb,
+                model,
+                ctx.Settings,
+                overrides,
+                ctx,
+                lastSeen,
+                ctx.NowUtc,
+                modelCt);
+
+            if (outcome.Evaluated)
+            {
+                Interlocked.Increment(ref ctx.EvaluatedModels);
+                if (outcome.AlertState == MLCalibrationMonitorAlertState.Warning)
+                    Interlocked.Increment(ref ctx.WarningModels);
+                else if (outcome.AlertState == MLCalibrationMonitorAlertState.Critical)
+                    Interlocked.Increment(ref ctx.CriticalModels);
+                if (outcome.RetrainingQueued) Interlocked.Increment(ref ctx.RetrainingQueued);
+                if (outcome.AlertDispatched) Interlocked.Increment(ref ctx.DispatchedAlerts);
+                if (outcome.AlertResolved) Interlocked.Increment(ref ctx.ResolvedAlerts);
+            }
+            else
+            {
+                _metrics?.MLCalibrationMonitorModelsSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", outcome.SkipReason ?? "skipped"),
+                    new KeyValuePair<string, object?>("symbol", model.Symbol),
+                    new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+            }
+        }
+        catch (OperationCanceledException) when (modelCt.IsCancellationRequested)
+        {
+            // Shutdown propagation, not a model failure. Re-throw so Parallel.ForEachAsync
+            // surfaces it and the ExecuteAsync loop honours stoppingToken.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref ctx.FailedModels);
+            _metrics?.WorkerErrors.Add(
+                1,
+                new KeyValuePair<string, object?>("worker", WorkerName),
+                new KeyValuePair<string, object?>("reason", "ml_calibration_monitor_model"),
+                new KeyValuePair<string, object?>("exception_type", ex.GetType().Name));
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to evaluate calibration for model {ModelId} ({Symbol}/{Timeframe}).",
+                WorkerName,
+                model.Id,
+                model.Symbol,
+                model.Timeframe);
+        }
+        finally
+        {
+            int remaining = Interlocked.Decrement(ref ctx.RemainingModels);
+            _healthMonitor?.RecordBacklogDepth(WorkerName, remaining);
+        }
+    }
+
     private async Task<ModelEvaluationOutcome> EvaluateModelWithLockAsync(
         IServiceProvider serviceProvider,
         IWriteApplicationDbContext writeContext,
@@ -678,6 +817,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         ActiveModelCandidate model,
         MLCalibrationMonitorWorkerSettings settings,
         IReadOnlyDictionary<string, string> overrides,
+        CycleIteration? ctx,
         DateTime? lastSeenOutcomeAt,
         DateTime nowUtc,
         CancellationToken ct)
@@ -699,7 +839,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         try
         {
             return await EvaluateModelAsync(serviceProvider, writeContext, db, model, settings,
-                overrides, lastSeenOutcomeAt, nowUtc, ct);
+                overrides, ctx, lastSeenOutcomeAt, nowUtc, ct);
         }
         finally
         {
@@ -715,10 +855,12 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         ActiveModelCandidate model,
         MLCalibrationMonitorWorkerSettings settings,
         IReadOnlyDictionary<string, string> overrides,
+        CycleIteration? ctx,
         DateTime? lastSeenOutcomeAt,
         DateTime nowUtc,
         CancellationToken ct)
     {
+        var cycleAuditCollector = ctx?.CycleAuditCollector;
         // Audit rows accumulate locally and flush in a dedicated DI scope at the end. Keeps
         // audit IO from implicitly committing pending changes on the snapshot scope and gives
         // operators a durable trail regardless of failure mode. Capacity = 1 global + one per
@@ -736,7 +878,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         // regime-scoped tiers first when a regime is supplied (here, null for the global
         // path), then the four regime-agnostic tiers
         // (Symbol+TF → Symbol-only → TF-only → fleet-wide).
-        settings = ApplyPerContextOverrides(settings, overrides, model.Symbol, model.Timeframe);
+        settings = ApplyPerContextOverrides(settings, overrides, model.Symbol, model.Timeframe, regime: null, modelId: model.Id);
 
         try
         {
@@ -802,9 +944,13 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 new KeyValuePair<string, object?>("outcome", globalBootstrapCacheHit ? "hit" : "miss"),
                 new KeyValuePair<string, object?>("scope", "global"),
                 new KeyValuePair<string, object?>("symbol", model.Symbol),
-                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()));
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                // Symmetric with the regime-scope path so dashboards grouping on `regime`
+                // see a uniform schema: global lookups land in a dedicated bucket instead
+                // of an unlabeled phantom one.
+                new KeyValuePair<string, object?>("regime", "global"));
 
-            var summary = ComputeCalibrationSummary(
+            var summary = _signalEvaluator.ComputeSummary(
                 samples, settings.BootstrapResamples, nowUtc,
                 settings.TimeDecayHalfLifeDays, settings.MinSamplesForTimeDecay,
                 cachedStderr, model.Id);
@@ -823,7 +969,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 db, model.Id, regime: null, settings.TrendSmoothingWindow, ct)
                 ?? await LoadExistingMetricAsync(db, $"MLCalibration:Model:{model.Id}:CurrentEce", ct);
             double? baselineEce = TryResolveBaselineEce(model.ModelBytes);
-            var signals = BuildSignals(
+            var signals = _signalEvaluator.BuildSignals(
                 summary.CurrentEce,
                 summary.EceStderr,
                 previousEce,
@@ -831,7 +977,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 settings.MaxEce,
                 settings.DegradationDelta,
                 settings.RegressionGuardK);
-            var alertState = ResolveAlertState(summary.CurrentEce, signals, settings);
+            var alertState = _signalEvaluator.ResolveAlertState(
+                summary.CurrentEce, signals, settings.MaxEce, settings.DegradationDelta);
 
             string stateTag = alertState switch
             {
@@ -890,11 +1037,28 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             //   Operators who believe their training-time baseline is stale (e.g. labels were
             //   later corrected) can flip RetrainOnBaselineCritical = true (globally or per
             //   Symbol/Timeframe via the MLCalibration:Override:{Symbol}:{Timeframe}: pattern).
+            // Update chronic-critical streak counter and dispatch retirement-candidate
+            // alert if the threshold is crossed. Returns the new streak (0 if alertState
+            // isn't Critical). Recovery to non-Critical resets the counter and
+            // auto-resolves any active chronic alert.
+            int chronicStreak = await TrackChronicCriticalAndAlertIfNeededAsync(
+                serviceProvider, writeContext, db, model, settings, alertState, summary, signals, nowUtc, ct);
+            bool inChronicState = chronicStreak >= settings.ChronicCriticalThreshold;
+
             bool retrainEligible =
                 (signals.ThresholdExceeded && summary.CurrentEce > settings.MaxEce * SevereThresholdMultiplier) ||
                 (signals.TrendExceeded && signals.TrendDelta > settings.DegradationDelta * SevereThresholdMultiplier) ||
                 (settings.RetrainOnBaselineCritical && signals.BaselineExceeded
                     && signals.BaselineDelta > settings.DegradationDelta * SevereThresholdMultiplier);
+
+            // Chronic-tripper retrain suppression: if the model has been Critical for
+            // ≥ChronicCriticalThreshold cycles, repeated retraining is unlikely to recover.
+            // SuppressRetrainOnChronic (default true) blocks the queue so the pipeline
+            // doesn't burn capacity on a model that's a retirement candidate.
+            if (settings.SuppressRetrainOnChronic && inChronicState)
+            {
+                retrainEligible = false;
+            }
 
             if (alertState == MLCalibrationMonitorAlertState.Critical && retrainEligible)
             {
@@ -914,7 +1078,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             {
                 alertDispatched = await UpsertAndDispatchAlertAsync(
                     serviceProvider, writeContext, db, model, settings, summary, signals,
-                    alertState, nowUtc, ct);
+                    alertState, ctx, nowUtc, ct);
 
                 if (alertDispatched)
                 {
@@ -999,7 +1163,23 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         finally
         {
             if (pendingAudits.Count > 0)
-                await FlushAuditsAsync(pendingAudits, ct);
+            {
+                if (cycleAuditCollector is not null)
+                {
+                    // Cycle mode: hand off to the shared collector. The cycle's outer
+                    // RunCycleCoreAsync flushes the entire batch in one round-trip after
+                    // the parallel loop completes. Fewer DI scopes per cycle; trade-off
+                    // is that an audit-flush failure loses *all* audit rows for the
+                    // cycle instead of just one model's.
+                    foreach (var entry in pendingAudits) cycleAuditCollector.Add(entry);
+                }
+                else
+                {
+                    // Default: per-model flush. Each model owns its own DI scope so an
+                    // individual flush failure is contained to one model's audit rows.
+                    await FlushAuditsAsync(pendingAudits, ct);
+                }
+            }
         }
     }
 
@@ -1045,7 +1225,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             // row like `*:*:Regime:HighVolatility:DegradationDelta` tightens that knob in
             // exactly the regimes operators care about, without affecting the global path.
             var regimeSettings = ApplyPerContextOverrides(
-                settings, overrides, model.Symbol, model.Timeframe, regime);
+                settings, overrides, model.Symbol, model.Timeframe, regime, model.Id);
 
             // Per-regime stderr is cached under its own scope key so each regime amortises
             // bootstrap CPU separately. RowVersion check ensures a model swap invalidates
@@ -1061,7 +1241,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
                 new KeyValuePair<string, object?>("regime", regime.ToString()));
 
-            var regimeSummary = ComputeCalibrationSummary(
+            var regimeSummary = _signalEvaluator.ComputeSummary(
                 regimeSamples, regimeSettings.BootstrapResamples, nowUtc,
                 regimeSettings.TimeDecayHalfLifeDays, regimeSettings.MinSamplesForTimeDecay,
                 regimeCachedStderr, model.Id);
@@ -1076,7 +1256,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             // first cycle for a given regime, in which case the trend signal stays inert.
             double? regimePreviousEce = await LoadSmoothedPreviousEceAsync(
                 db, model.Id, regime, regimeSettings.TrendSmoothingWindow, ct);
-            var regimeSignals = BuildSignals(
+            var regimeSignals = _signalEvaluator.BuildSignals(
                 regimeSummary.CurrentEce,
                 regimeSummary.EceStderr,
                 previousEce: regimePreviousEce,
@@ -1084,7 +1264,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 regimeSettings.MaxEce,
                 regimeSettings.DegradationDelta,
                 regimeSettings.RegressionGuardK);
-            var regimeState = ResolveAlertState(regimeSummary.CurrentEce, regimeSignals, regimeSettings);
+            var regimeState = _signalEvaluator.ResolveAlertState(
+                regimeSummary.CurrentEce, regimeSignals, regimeSettings.MaxEce, regimeSettings.DegradationDelta);
 
             string regimeOutcome = regimeState switch
             {
@@ -1109,275 +1290,10 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         }
     }
 
-    private static Dictionary<MarketRegimeEnum, List<CalibrationSample>> AssignRegimes(
-        List<CalibrationSample> chronological, List<RegimeSlice> ascendingTimeline)
-    {
-        var groups = new Dictionary<MarketRegimeEnum, List<CalibrationSample>>();
-        if (ascendingTimeline.Count == 0) return groups;
-
-        // Binary search per sample to find the regime that was active at PredictedAt.
-        var detectedAtArray = ascendingTimeline.Select(slice => slice.DetectedAt).ToArray();
-
-        foreach (var sample in chronological)
-        {
-            int idx = Array.BinarySearch(detectedAtArray, sample.PredictedAt);
-            if (idx < 0) idx = ~idx - 1;
-            if (idx < 0) continue;
-
-            var regime = ascendingTimeline[idx].Regime;
-            if (!groups.TryGetValue(regime, out var bucket))
-            {
-                bucket = [];
-                groups[regime] = bucket;
-            }
-            bucket.Add(sample);
-        }
-
-        return groups;
-    }
-
-    private static bool TryCreateCalibrationSample(
-        MLModelPredictionLog log,
-        out CalibrationSample sample)
-    {
-        sample = default;
-
-        bool? correct = log.DirectionCorrect;
-        if (!correct.HasValue && log.ActualDirection.HasValue)
-            correct = log.ActualDirection.Value == log.PredictedDirection;
-
-        if (!correct.HasValue)
-            return false;
-
-        double confidence;
-        if (HasExplicitProbability(log))
-        {
-            double threshold = MLFeatureHelper.ResolveLoggedDecisionThreshold(log, 0.5);
-            double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, threshold);
-            confidence = log.PredictedDirection == TradeDirection.Buy
-                ? pBuy
-                : 1.0 - pBuy;
-        }
-        else
-        {
-            // Legacy logs: ConfidenceScore is the predicted-class confidence by convention
-            // (matches how scorers populate the field). Direct assignment is correct.
-            confidence = (double)log.ConfidenceScore;
-        }
-
-        if (!double.IsFinite(confidence))
-            return false;
-
-        sample = new CalibrationSample(
-            Confidence: Math.Clamp(confidence, 0.0, 1.0),
-            Correct: correct.Value,
-            OutcomeAt: log.OutcomeRecordedAt ?? log.PredictedAt,
-            PredictedAt: log.PredictedAt);
-        return true;
-    }
-
-    private static CalibrationSummary ComputeCalibrationSummary(
-        IReadOnlyList<CalibrationSample> samples,
-        int bootstrapResamples,
-        DateTime nowUtc,
-        double timeDecayHalfLifeDays,
-        int minSamplesForTimeDecay,
-        double? cachedStderr,
-        long modelId)
-    {
-        // Time decay is auto-disabled below MinSamplesForTimeDecay so the tilt cannot
-        // dominate floating-point noise on small samples.
-        double effectiveHalfLife = samples.Count >= minSamplesForTimeDecay
-            ? timeDecayHalfLifeDays
-            : 0.0;
-
-        var binCounts = new double[NumBins];
-        var binCorrect = new double[NumBins];
-        var binConfidenceSum = new double[NumBins];
-
-        double correctSum = 0.0;
-        double confidenceSum = 0.0;
-        double totalWeight = 0.0;
-        DateTime oldestOutcomeAt = DateTime.MaxValue;
-        DateTime newestOutcomeAt = DateTime.MinValue;
-
-        foreach (var sample in samples)
-        {
-            double weight = ComputeTimeDecayWeight(sample.OutcomeAt, nowUtc, effectiveHalfLife);
-            if (!double.IsFinite(weight) || weight <= 0) continue;
-
-            int bin = Math.Clamp((int)(sample.Confidence * NumBins), 0, NumBins - 1);
-            binCounts[bin] += weight;
-            binConfidenceSum[bin] += sample.Confidence * weight;
-            confidenceSum += sample.Confidence * weight;
-            totalWeight += weight;
-
-            if (sample.Correct)
-            {
-                binCorrect[bin] += weight;
-                correctSum += weight;
-            }
-
-            if (sample.OutcomeAt < oldestOutcomeAt) oldestOutcomeAt = sample.OutcomeAt;
-            if (sample.OutcomeAt > newestOutcomeAt) newestOutcomeAt = sample.OutcomeAt;
-        }
-
-        double ece = ComputeEceFromBins(binCounts, binCorrect, binConfidenceSum, totalWeight);
-
-        var binAccuracy = new double[NumBins];
-        var binMeanConfidence = new double[NumBins];
-        var binCountsForAudit = new int[NumBins];
-        for (int i = 0; i < NumBins; i++)
-        {
-            // Round effective counts for the audit-log integer bin counts; the weighted ECE
-            // calculation above uses the doubles directly.
-            binCountsForAudit[i] = (int)Math.Round(binCounts[i]);
-            if (binCounts[i] <= 0) continue;
-            binAccuracy[i] = binCorrect[i] / binCounts[i];
-            binMeanConfidence[i] = binConfidenceSum[i] / binCounts[i];
-        }
-
-        // Bootstrap caching: calibration drifts on the scale of days, not hours; recomputing
-        // the stderr every cycle wastes CPU. The caller supplies the cached value when fresh
-        // (within BootstrapCacheStaleHours); we recompute only when the cache is stale or
-        // missing.
-        double eceStderr = cachedStderr
-            ?? ComputeBootstrapEceStderr(samples, bootstrapResamples, nowUtc, effectiveHalfLife, modelId);
-
-        return new CalibrationSummary(
-            ResolvedCount: samples.Count,
-            CurrentEce: ece,
-            Accuracy: totalWeight > 0 ? correctSum / totalWeight : 0,
-            MeanConfidence: totalWeight > 0 ? confidenceSum / totalWeight : 0,
-            OldestOutcomeAt: oldestOutcomeAt,
-            NewestOutcomeAt: newestOutcomeAt,
-            BinCounts: binCountsForAudit,
-            BinAccuracy: binAccuracy,
-            BinMeanConfidence: binMeanConfidence,
-            EceStderr: eceStderr);
-    }
-
-    private static double ComputeTimeDecayWeight(DateTime outcomeAt, DateTime nowUtc, double halfLifeDays)
-    {
-        if (halfLifeDays <= 0) return 1.0;
-        double ageDays = Math.Max(0, (nowUtc - outcomeAt).TotalDays);
-        return Math.Pow(0.5, ageDays / halfLifeDays);
-    }
-
-    private static double ComputeEceFromBins(
-        double[] binCounts, double[] binCorrect, double[] binConfidenceSum, double total)
-    {
-        if (total <= 0) return 0.0;
-        double ece = 0.0;
-        for (int i = 0; i < binCounts.Length; i++)
-        {
-            if (binCounts[i] <= 0) continue;
-            double accuracy = binCorrect[i] / binCounts[i];
-            double meanConfidence = binConfidenceSum[i] / binCounts[i];
-            ece += (binCounts[i] / total) * Math.Abs(accuracy - meanConfidence);
-        }
-        return ece;
-    }
-
-    private static double ComputeBootstrapEceStderr(
-        IReadOnlyList<CalibrationSample> samples,
-        int resamples,
-        DateTime nowUtc,
-        double effectiveHalfLifeDays,
-        long modelId)
-    {
-        if (resamples <= 0 || samples.Count < 2) return 0.0;
-
-        // Deterministic, fixed-mix seed: FNV-1a 64 over (modelId, count, firstTick, lastTick)
-        // folded to int. Identical inputs reproduce the same stderr across runs and replicas.
-        // We avoid HashCode.Combine here because that uses a process-randomized seed, which
-        // would make two replicas of the same model disagree on a cold-cache stderr.
-        // Including modelId in the mix prevents collisions between two models that happen to
-        // share sample-boundary timestamps.
-        long seed;
-        unchecked
-        {
-            seed = 1469598103934665603L; // FNV-1a 64-bit offset basis
-            const long fnvPrime = 1099511628211L;
-            seed = (seed ^ modelId) * fnvPrime;
-            seed = (seed ^ samples.Count) * fnvPrime;
-            seed = (seed ^ samples[0].OutcomeAt.Ticks) * fnvPrime;
-            seed = (seed ^ samples[^1].OutcomeAt.Ticks) * fnvPrime;
-        }
-        var rng = new Random(unchecked((int)(seed ^ (seed >> 32))));
-
-        var binCounts = new double[NumBins];
-        var binCorrect = new double[NumBins];
-        var binConfidenceSum = new double[NumBins];
-
-        double sum = 0.0;
-        double sumSq = 0.0;
-
-        int n = samples.Count;
-        for (int r = 0; r < resamples; r++)
-        {
-            Array.Clear(binCounts);
-            Array.Clear(binCorrect);
-            Array.Clear(binConfidenceSum);
-            double total = 0.0;
-
-            for (int i = 0; i < n; i++)
-            {
-                var sample = samples[rng.Next(n)];
-                double weight = ComputeTimeDecayWeight(sample.OutcomeAt, nowUtc, effectiveHalfLifeDays);
-                if (!double.IsFinite(weight) || weight <= 0) continue;
-
-                int bin = Math.Clamp((int)(sample.Confidence * NumBins), 0, NumBins - 1);
-                binCounts[bin] += weight;
-                binConfidenceSum[bin] += sample.Confidence * weight;
-                total += weight;
-                if (sample.Correct) binCorrect[bin] += weight;
-            }
-
-            double ece = ComputeEceFromBins(binCounts, binCorrect, binConfidenceSum, total);
-            sum += ece;
-            sumSq += ece * ece;
-        }
-
-        double mean = sum / resamples;
-        double variance = (sumSq / resamples) - (mean * mean);
-        if (variance < 0 || !double.IsFinite(variance)) variance = 0;
-        return Math.Sqrt(variance);
-    }
-
-    private static CalibrationSignals BuildSignals(
-        double currentEce,
-        double eceStderr,
-        double? previousEce,
-        double? baselineEce,
-        double maxEce,
-        double degradationDelta,
-        double regressionGuardK)
-    {
-        double trendDelta = previousEce.HasValue ? currentEce - previousEce.Value : 0.0;
-        double baselineDelta = baselineEce.HasValue ? currentEce - baselineEce.Value : 0.0;
-        bool thresholdExceeded = maxEce > 0.0 && currentEce > maxEce;
-
-        // Trend signal must clear BOTH the absolute degradation delta AND the K-sigma stderr
-        // bar. With non-zero stderr this rejects single-cycle drift inside the noise band.
-        // With zero stderr (small samples, perfectly homogeneous outcomes) the K-sigma bar
-        // collapses to the absolute delta.
-        bool trendDeltaExceeded = degradationDelta > 0.0 && previousEce.HasValue && trendDelta > degradationDelta;
-        bool trendStderrPasses = trendDelta > regressionGuardK * eceStderr;
-        bool trendExceeded = trendDeltaExceeded && trendStderrPasses;
-
-        bool baselineExceeded = degradationDelta > 0.0 && baselineEce.HasValue && baselineDelta > degradationDelta;
-
-        return new CalibrationSignals(
-            previousEce,
-            baselineEce,
-            trendDelta,
-            baselineDelta,
-            thresholdExceeded,
-            trendExceeded,
-            baselineExceeded,
-            trendStderrPasses);
-    }
+    // Calibration math (sample creation, regime assignment, summary, time decay, ECE,
+    // signals, alert state, severity, baseline lookup) lives in
+    // MLCalibrationMonitorWorker.Signals.cs.
+    // Bootstrap stderr cache + computation live in MLCalibrationMonitorWorker.Bootstrap.cs.
 
     /// <summary>
     /// Persists the four current-state keys this worker writes to <c>EngineConfig</c>.
@@ -1523,6 +1439,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         CalibrationSummary summary,
         CalibrationSignals signals,
         MLCalibrationMonitorAlertState alertState,
+        CycleIteration? ctx,
         DateTime nowUtc,
         CancellationToken ct)
     {
@@ -1532,7 +1449,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                                            && candidate.IsActive
                                            && candidate.DeduplicationKey == deduplicationKey, ct);
 
-        AlertSeverity severity = DetermineSeverity(alertState, summary, signals, settings);
+        AlertSeverity severity = _signalEvaluator.DetermineSeverity(
+            alertState, summary, signals, settings.MaxEce, settings.DegradationDelta);
         DateTime? previousTriggeredAt = alert?.LastTriggeredAt;
         AlertSeverity? previousSeverity = alert?.Severity;
 
@@ -1595,6 +1513,18 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
 
         var dispatcher = ResolveAlertDispatcher(serviceProvider);
         if (dispatcher is null) return false;
+
+        // Per-cycle alert budget: the Alert row is already upserted (so dashboards see
+        // the state) but dispatching the notification is rate-limited to protect against
+        // alert storms during fleet-wide degradation events. Auto-resolves are exempt.
+        if (ctx is not null && Interlocked.Decrement(ref ctx.RemainingAlertBudget) < 0)
+        {
+            Interlocked.Increment(ref ctx.AlertsSuppressedByBudget);
+            _metrics?.MLCalibrationMonitorCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "alert_budget_exhausted"));
+            return false;
+        }
 
         try
         {
@@ -1800,6 +1730,171 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             ct);
     }
 
+    /// <summary>
+    /// Tracks per-model consecutive Critical-state cycles and dispatches a one-time
+    /// chronic-tripper alert when the streak hits <c>ChronicCriticalThreshold</c>.
+    /// Returns the new streak length (0 if state isn't Critical). Operators see the
+    /// alert as a signal to retire / replace the model rather than keep retraining.
+    /// Symmetric with Conformal worker's chronic-trip flow.
+    /// </summary>
+    private async Task<int> TrackChronicCriticalAndAlertIfNeededAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        MLCalibrationMonitorWorkerSettings settings,
+        MLCalibrationMonitorAlertState alertState,
+        CalibrationSummary summary,
+        CalibrationSignals signals,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string counterKey = $"MLCalibration:Model:{model.Id}:ConsecutiveCriticalCycles";
+        int previous = (int)(await LoadExistingMetricAsync(db, counterKey, ct) ?? 0);
+
+        if (alertState != MLCalibrationMonitorAlertState.Critical)
+        {
+            // Recovery path: counter resets, active chronic alert auto-resolves.
+            if (previous > 0)
+            {
+                await EngineConfigUpsert.UpsertAsync(
+                    db, counterKey, "0",
+                    ConfigDataType.Int,
+                    "Consecutive cycles where this model's calibration was Critical.",
+                    isHotReloadable: false, ct);
+
+                if (previous >= settings.ChronicCriticalThreshold)
+                {
+                    await TryAutoResolveChronicAlertAsync(serviceProvider, writeContext, db, model, nowUtc, ct);
+                }
+            }
+            return 0;
+        }
+
+        int next = previous + 1;
+        await EngineConfigUpsert.UpsertAsync(
+            db, counterKey, next.ToString(CultureInfo.InvariantCulture),
+            ConfigDataType.Int,
+            "Consecutive cycles where this model's calibration was Critical.",
+            isHotReloadable: false, ct);
+
+        // Threshold cross: dispatch the retirement-candidate alert exactly once. Earlier
+        // cycles below threshold and later cycles above it both no-op the alert path.
+        if (previous < settings.ChronicCriticalThreshold && next >= settings.ChronicCriticalThreshold)
+        {
+            await DispatchChronicAlertAsync(serviceProvider, writeContext, db, model, settings, summary, signals, next, nowUtc, ct);
+        }
+        return next;
+    }
+
+    private async Task DispatchChronicAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        MLCalibrationMonitorWorkerSettings settings,
+        CalibrationSummary summary,
+        CalibrationSignals signals,
+        int streak,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        var dispatcher = ResolveAlertDispatcher(serviceProvider);
+        if (dispatcher is null) return;
+
+        try
+        {
+            string dedupKey = ChronicAlertDeduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture);
+            bool exists = await db.Set<Alert>()
+                .AnyAsync(a => a.DeduplicationKey == dedupKey && a.IsActive && !a.IsDeleted, ct);
+            if (exists) return;
+
+            int cooldownSec = await AlertCooldownDefaults.GetCooldownAsync(
+                db, AlertCooldownDefaults.CK_MLEscalation, AlertCooldownDefaults.Default_MLEscalation, ct);
+
+            string conditionJson = JsonSerializer.Serialize(new
+            {
+                detector = "MLCalibrationMonitor",
+                kind = "chronic_critical",
+                modelId = model.Id,
+                symbol = model.Symbol,
+                timeframe = model.Timeframe.ToString(),
+                consecutiveCriticalCycles = streak,
+                threshold = settings.ChronicCriticalThreshold,
+                currentEce = Math.Round(summary.CurrentEce, 6),
+                trendDelta = Math.Round(signals.TrendDelta, 6),
+                baselineDelta = Math.Round(signals.BaselineDelta, 6),
+                detectedAt = nowUtc.ToString("O", CultureInfo.InvariantCulture)
+            });
+
+            var alert = new Alert
+            {
+                AlertType = AlertType.MLModelDegraded,
+                Severity = AlertSeverity.Critical,
+                DeduplicationKey = dedupKey,
+                CooldownSeconds = cooldownSec,
+                ConditionJson = Truncate(conditionJson, AlertConditionMaxLength),
+                Symbol = model.Symbol,
+                IsActive = true,
+            };
+
+            db.Set<Alert>().Add(alert);
+            await writeContext.SaveChangesAsync(ct);
+
+            string message = string.Format(
+                CultureInfo.InvariantCulture,
+                "MLCalibrationMonitor: model {0} ({1}/{2}) has been Critical for {3} consecutive cycles (threshold {4}). Repeated retraining is unlikely to recover; the model is a retirement candidate.",
+                model.Id, model.Symbol, model.Timeframe, streak, settings.ChronicCriticalThreshold);
+
+            await dispatcher.DispatchAsync(alert, message, ct);
+
+            _metrics?.MLCalibrationMonitorAlertsDispatched.Add(
+                1,
+                new KeyValuePair<string, object?>("symbol", model.Symbol),
+                new KeyValuePair<string, object?>("timeframe", model.Timeframe.ToString()),
+                new KeyValuePair<string, object?>("state", "chronic"));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "{Worker}: failed to dispatch chronic-critical alert for model {ModelId}.",
+                WorkerName, model.Id);
+        }
+    }
+
+    private async Task TryAutoResolveChronicAlertAsync(
+        IServiceProvider serviceProvider,
+        IWriteApplicationDbContext writeContext,
+        DbContext db,
+        ActiveModelCandidate model,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        string dedupKey = ChronicAlertDeduplicationPrefix + model.Id.ToString(CultureInfo.InvariantCulture);
+        var alert = await db.Set<Alert>()
+            .FirstOrDefaultAsync(a => a.DeduplicationKey == dedupKey && a.IsActive && !a.IsDeleted, ct);
+        if (alert is null) return;
+
+        var dispatcher = ResolveAlertDispatcher(serviceProvider);
+        if (dispatcher is not null && alert.LastTriggeredAt.HasValue)
+        {
+            try
+            {
+                await dispatcher.TryAutoResolveAsync(alert, conditionStillActive: false, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "{Worker}: failed to auto-resolve chronic-critical alert for model {ModelId}.",
+                    WorkerName, model.Id);
+            }
+        }
+
+        alert.IsActive = false;
+        alert.AutoResolvedAt ??= nowUtc;
+        await writeContext.SaveChangesAsync(ct);
+    }
+
     private async Task<bool> RaiseFleetDegradationAlertAsync(
         int evaluated, int warningCount, int criticalCount, double ratio, DateTime nowUtc, CancellationToken ct)
     {
@@ -1874,6 +1969,8 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             CK_TrendSmoothingWindow, CK_StaleSkipAlertThreshold,
             CK_BootstrapCacheStaleHours, CK_RetrainOnBaselineCritical,
             CK_MaxDegreeOfParallelism, CK_LongCycleWarnSeconds,
+            CK_AuditFlushMode,
+            CK_ChronicCriticalThreshold, CK_SuppressRetrainOnChronic, CK_MaxAlertsPerCycle,
         ];
 
         var values = await db.Set<EngineConfig>()
@@ -1940,79 +2037,80 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 DefaultMaxDegreeOfParallelism, MinMaxDegreeOfParallelism, MaxMaxDegreeOfParallelism),
             LongCycleWarnSeconds: ClampIntAllowingZero(
                 GetInt(values, CK_LongCycleWarnSeconds, DefaultLongCycleWarnSeconds),
-                DefaultLongCycleWarnSeconds, MinLongCycleWarnSeconds, MaxLongCycleWarnSeconds));
+                DefaultLongCycleWarnSeconds, MinLongCycleWarnSeconds, MaxLongCycleWarnSeconds),
+            AuditFlushMode: ParseAuditFlushMode(GetString(values, CK_AuditFlushMode, defaultValue: null)),
+            ChronicCriticalThreshold: ClampInt(
+                GetInt(values, CK_ChronicCriticalThreshold, DefaultChronicCriticalThreshold),
+                DefaultChronicCriticalThreshold, MinChronicCriticalThreshold, MaxChronicCriticalThreshold),
+            SuppressRetrainOnChronic: GetBool(values, CK_SuppressRetrainOnChronic, true),
+            MaxAlertsPerCycle: ClampIntAllowingZero(
+                GetInt(values, CK_MaxAlertsPerCycle, DefaultMaxAlertsPerCycle),
+                DefaultMaxAlertsPerCycle, MinMaxAlertsPerCycle, MaxMaxAlertsPerCycle));
     }
 
-    private static MLCalibrationMonitorAlertState ResolveAlertState(
-        double currentEce,
-        CalibrationSignals signals,
-        MLCalibrationMonitorWorkerSettings settings)
+    private static string? GetString(IReadOnlyDictionary<string, string> values, string key, string? defaultValue)
+        => values.TryGetValue(key, out var raw) && !string.IsNullOrWhiteSpace(raw) ? raw : defaultValue;
+
+    private AuditFlushMode ParseAuditFlushMode(string? raw)
     {
-        if ((settings.MaxEce > 0.0 && signals.ThresholdExceeded && currentEce > settings.MaxEce * SevereThresholdMultiplier) ||
-            (settings.DegradationDelta > 0.0 && signals.TrendExceeded && signals.TrendDelta > settings.DegradationDelta * SevereThresholdMultiplier) ||
-            (settings.DegradationDelta > 0.0 && signals.BaselineExceeded && signals.BaselineDelta > settings.DegradationDelta * SevereThresholdMultiplier))
+        if (raw is null)
         {
-            return MLCalibrationMonitorAlertState.Critical;
+            ResetUnknownAuditFlushModeStateOnRecovery();
+            return DefaultAuditFlushMode;
+        }
+        if (AuditFlushModeAliases.TryGetValue(raw, out var mode))
+        {
+            ResetUnknownAuditFlushModeStateOnRecovery();
+            return mode;
         }
 
-        return signals.ThresholdExceeded || signals.TrendExceeded || signals.BaselineExceeded
-            ? MLCalibrationMonitorAlertState.Warning
-            : MLCalibrationMonitorAlertState.None;
+        // Unknown value (e.g., operator typed "Cycel"). Default to PerModel and emit a
+        // one-time Warning per distinct unknown value so silent fall-through doesn't
+        // hide a misconfiguration. Dedup uses an FNV-1a signature symmetric with the
+        // override-tokens validator (_lastUnmatchedTokensSignature): persistent same-
+        // value typo isn't re-logged; transitions re-log the new state. Recovery to a
+        // known alias (above) resets the signature so a re-introduced typo logs again.
+        long signature = FnvHashFold(FnvHashChars(raw, FnvOffsetBasis));
+        if (signature != _lastUnknownAuditFlushModeSignature)
+        {
+            _lastUnknownAuditFlushModeSignature = signature;
+            _logger.LogWarning(
+                "{Worker}: AuditFlushMode value '{Raw}' is not recognized (expected one of {Aliases}). Falling back to {Default}.",
+                WorkerName, raw, string.Join(", ", AuditFlushModeAliases.Keys), DefaultAuditFlushMode);
+        }
+        return DefaultAuditFlushMode;
     }
 
-    private static AlertSeverity DetermineSeverity(
-        MLCalibrationMonitorAlertState alertState,
-        CalibrationSummary summary,
-        CalibrationSignals signals,
-        MLCalibrationMonitorWorkerSettings settings)
+    private void ResetUnknownAuditFlushModeStateOnRecovery()
     {
-        if (alertState == MLCalibrationMonitorAlertState.Critical)
-            return AlertSeverity.Critical;
-
-        if ((settings.MaxEce > 0.0 && summary.CurrentEce >= settings.MaxEce * 1.25) ||
-            (settings.DegradationDelta > 0.0 && Math.Max(signals.TrendDelta, signals.BaselineDelta) >= settings.DegradationDelta * 1.5))
-        {
-            return AlertSeverity.High;
-        }
-
-        return AlertSeverity.Medium;
+        if (_lastUnknownAuditFlushModeSignature == 0) return;
+        _lastUnknownAuditFlushModeSignature = 0;
+        _logger.LogInformation(
+            "{Worker}: AuditFlushMode value now resolves to a recognized alias; previously reported typo appears to have been corrected.",
+            WorkerName);
     }
 
-    private static bool HasExplicitProbability(MLModelPredictionLog log)
-        => log.ServedCalibratedProbability.HasValue
-        || log.CalibratedProbability.HasValue
-        || log.RawProbability.HasValue;
+    // Shared FNV-1a 64-bit primitives for dedup signatures. Two callers:
+    //   - ParseAuditFlushMode: hashes a single raw string.
+    //   - ComputeUnmatchedSignature (Overrides.cs): folds a sorted set of strings,
+    //     separator-delimited, by chaining FnvHashChars over each entry + a "|".
+    // Reserve 0 for the empty/clean state; FnvHashFold nudges 0 to 1 if FNV ever lands there.
+    private const long FnvOffsetBasis = 1469598103934665603L;
+    private const long FnvPrime = 1099511628211L;
 
-    private static double? TryResolveBaselineEce(byte[]? modelBytes, MarketRegimeEnum? regime = null)
+    private static long FnvHashChars(string s, long state)
     {
-        if (modelBytes is not { Length: > 0 })
-            return null;
-
-        try
+        unchecked
         {
-            var snapshot = JsonSerializer.Deserialize<ModelSnapshot>(modelBytes);
-            if (snapshot is null) return null;
-
-            // Per-regime baseline takes precedence when training populated it; otherwise the
-            // global ECE is the honest fallback. Operators see the same baseline for the
-            // global row and any regimes the training pipeline didn't measure.
-            if (regime is not null && snapshot.RegimeEce is { Count: > 0 } regimeMap &&
-                regimeMap.TryGetValue(regime.Value.ToString(), out double regimeEce) &&
-                double.IsFinite(regimeEce) && regimeEce >= 0.0)
-            {
-                return regimeEce;
-            }
-
-            if (!double.IsFinite(snapshot.Ece) || snapshot.Ece < 0.0)
-                return null;
-
-            return snapshot.Ece;
-        }
-        catch
-        {
-            return null;
+            foreach (char c in s) state = (state ^ c) * FnvPrime;
+            return state;
         }
     }
+
+    private static long FnvHashFold(long state) => state == 0 ? 1 : state;
+
+    // ResolveAlertState / DetermineSeverity / HasExplicitProbability / TryResolveBaselineEce
+    // live in MLCalibrationMonitorWorker.Signals.cs.
 
     private static string BuildDeduplicationKey(long modelId)
         => AlertDeduplicationPrefix + modelId.ToString(CultureInfo.InvariantCulture);
@@ -2053,377 +2151,12 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
     /// retrain promotion) so the caller recomputes. Per-regime cache lives under
     /// <c>:Regime:{name}:</c> keys keyed identically to the global path.
     /// </summary>
-    private static async Task<double?> LoadFreshBootstrapStderrAsync(
-        DbContext db,
-        long modelId,
-        MarketRegimeEnum? regime,
-        uint currentRowVersion,
-        DateTime nowUtc,
-        int staleHours,
-        CancellationToken ct)
-    {
-        if (staleHours <= 0) return null;
+    // LoadFreshBootstrapStderrAsync + AppendBootstrapCacheSpecs live in
+    // MLCalibrationMonitorWorker.Bootstrap.cs.
 
-        // Use the integer enum value, not the string name — renaming a regime enum member
-        // (e.g. Trending → TrendingUp) keeps the underlying integer stable so cached entries
-        // survive the rename. Stable across enum reordering only if the int values are
-        // explicit; the codebase's MarketRegime is explicitly numbered for this reason.
-        string scope = regime is null
-            ? $"MLCalibration:Model:{modelId}"
-            : $"MLCalibration:Model:{modelId}:Regime:{(int)regime.Value}";
-
-        string stderrKey = $"{scope}:EceStderr";
-        string computedAtKey = $"{scope}:EceStderrComputedAt";
-        string rowVersionKey = $"{scope}:EceStderrModelRowVersion";
-
-        var rows = await db.Set<EngineConfig>()
-            .AsNoTracking()
-            .Where(c => c.Key == stderrKey || c.Key == computedAtKey || c.Key == rowVersionKey)
-            .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
-
-        // RowVersion check: invalidate cache when model bytes change (champion swap, retrain
-        // promotion). A wall-clock-fresh cache from a stale snapshot is worse than no cache.
-        if (!rows.TryGetValue(rowVersionKey, out var rvRaw) ||
-            !uint.TryParse(rvRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var cachedRowVersion) ||
-            cachedRowVersion != currentRowVersion)
-        {
-            return null;
-        }
-
-        // RoundtripKind on its own is sufficient for ISO-8601 "O" format strings written by
-        // PersistBootstrapCacheAsync; combining with AssumeUniversal throws ArgumentException.
-        if (!rows.TryGetValue(computedAtKey, out var atRaw) ||
-            !DateTime.TryParse(atRaw, CultureInfo.InvariantCulture,
-                DateTimeStyles.RoundtripKind, out var computedAt))
-        {
-            return null;
-        }
-
-        if ((nowUtc - computedAt.ToUniversalTime()).TotalHours > staleHours)
-            return null;
-
-        if (!rows.TryGetValue(stderrKey, out var stderrRaw) ||
-            !double.TryParse(stderrRaw, NumberStyles.Float | NumberStyles.AllowThousands,
-                CultureInfo.InvariantCulture, out var stderr) ||
-            !double.IsFinite(stderr) || stderr < 0)
-        {
-            return null;
-        }
-
-        return stderr;
-    }
-
-    /// <summary>
-    /// Appends bootstrap-cache specs (stderr, computed-at, RowVersion fingerprint) to the
-    /// caller-supplied accumulator. Caller flushes the full set in one batched upsert at the
-    /// end of the cycle, so a model with N matched regimes produces a single round-trip
-    /// instead of (1 + N) per-scope round-trips.
-    /// </summary>
-    private static void AppendBootstrapCacheSpecs(
-        List<EngineConfigUpsertSpec> pending,
-        long modelId,
-        MarketRegimeEnum? regime,
-        double stderr,
-        uint rowVersion,
-        DateTime nowUtc)
-    {
-        // Use the integer enum value, not the string name — renaming a regime enum member
-        // (e.g. Trending → TrendingUp) keeps the underlying integer stable so cached entries
-        // survive the rename. Stable across enum reordering only if the int values are
-        // explicit; the codebase's MarketRegime is explicitly numbered for this reason.
-        string scope = regime is null
-            ? $"MLCalibration:Model:{modelId}"
-            : $"MLCalibration:Model:{modelId}:Regime:{(int)regime.Value}";
-
-        pending.Add(new($"{scope}:EceStderr",
-            stderr.ToString("F6", CultureInfo.InvariantCulture),
-            ConfigDataType.Decimal,
-            "Bootstrap-derived ECE stderr cached for the trend-signal stderr gate.",
-            false));
-        pending.Add(new($"{scope}:EceStderrComputedAt",
-            nowUtc.ToString("O", CultureInfo.InvariantCulture),
-            ConfigDataType.String,
-            "UTC timestamp when the bootstrap-derived ECE stderr was last recomputed.",
-            false));
-        pending.Add(new($"{scope}:EceStderrModelRowVersion",
-            rowVersion.ToString(CultureInfo.InvariantCulture),
-            ConfigDataType.Int,
-            "MLModel.RowVersion at the time the cached stderr was computed; mismatches invalidate the cache.",
-            false));
-    }
-
-    /// <summary>
-    /// Loads every per-context override row that could apply to <paramref name="symbol"/>/
-    /// <paramref name="timeframe"/> in a single round-trip. The four base wildcard tiers
-    /// (<c>{symbol}:{tf}</c>, <c>{symbol}:*</c>, <c>*:{tf}</c>, <c>*:*</c>) are OR'd into
-    /// one prefix scan; this also captures any regime-scoped variants that share those
-    /// base prefixes (e.g. <c>{symbol}:{tf}:Regime:HighVolatility:{knob}</c>). Caller
-    /// resolves precedence in memory via <see cref="ResolveOverride{T}"/>.
-    /// </summary>
-    internal static async Task<IReadOnlyDictionary<string, string>> LoadAllPerContextOverridesAsync(
-        DbContext db, string symbol, Timeframe timeframe, CancellationToken ct)
-    {
-        string tfStr = timeframe.ToString();
-        string p1 = $"MLCalibration:Override:{symbol}:{tfStr}:";
-        string p2 = $"MLCalibration:Override:{symbol}:*:";
-        string p3 = $"MLCalibration:Override:*:{tfStr}:";
-        string p4 = "MLCalibration:Override:*:*:";
-
-        return await db.Set<EngineConfig>()
-            .AsNoTracking()
-            .Where(c => c.Key.StartsWith(p1)
-                     || c.Key.StartsWith(p2)
-                     || c.Key.StartsWith(p3)
-                     || c.Key.StartsWith(p4))
-            .ToDictionaryAsync(c => c.Key, c => c.Value, ct);
-    }
-
-    /// <summary>
-    /// Pre-loads per-context overrides once per unique <c>(Symbol, Timeframe)</c> in the
-    /// candidate set, before fanning out to parallel model evaluation. Two model variants
-    /// on the same context now share a single read instead of duplicating the prefix scan
-    /// per iteration.
-    /// </summary>
-    private static async Task<Dictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>>>
-        LoadOverridesByContextAsync(
-            DbContext db, IReadOnlyList<ActiveModelCandidate> models, CancellationToken ct)
-    {
-        var contexts = new HashSet<(string, Timeframe)>(models.Count);
-        foreach (var model in models)
-        {
-            contexts.Add((model.Symbol, model.Timeframe));
-        }
-
-        var result = new Dictionary<(string Symbol, Timeframe Timeframe), IReadOnlyDictionary<string, string>>(contexts.Count);
-        foreach (var (symbol, timeframe) in contexts)
-        {
-            result[(symbol, timeframe)] = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// Once-per-process audit of override-key regime tokens. Scans every override key with
-    /// a <c>:Regime:</c> segment and logs a warning when the segment doesn't parse to a
-    /// <see cref="MarketRegimeEnum"/> value. Catches typos like <c>Regime:HighVol:</c>
-    /// (vs. <c>HighVolatility</c>) at startup instead of having them silently fall through
-    /// override tiers.
-    /// </summary>
-    private async Task ValidateOverrideRegimeNamesAsync(DbContext db, CancellationToken ct)
-    {
-        var keys = await db.Set<EngineConfig>()
-            .AsNoTracking()
-            .Where(c => c.Key.StartsWith("MLCalibration:Override:") && c.Key.Contains(":Regime:"))
-            .Select(c => c.Key)
-            .ToListAsync(ct);
-
-        if (keys.Count == 0) return;
-
-        var unmatched = new List<string>();
-        foreach (var key in keys)
-        {
-            // Format: MLCalibration:Override:{Symbol}:{TF}:Regime:{Regime}:{Knob}
-            // Find the segment immediately after "Regime" and try to parse it.
-            var parts = key.Split(':');
-            for (int i = 0; i < parts.Length - 1; i++)
-            {
-                if (parts[i] != "Regime") continue;
-                if (!Enum.TryParse<MarketRegimeEnum>(parts[i + 1], ignoreCase: false, out _))
-                    unmatched.Add(key);
-                break;
-            }
-        }
-
-        if (unmatched.Count > 0)
-        {
-            _logger.LogWarning(
-                "{Worker}: {Count} override key(s) reference a regime name that doesn't match any MarketRegime enum value. These rows will silently fall through to the next override tier. Keys: {Keys}",
-                WorkerName, unmatched.Count, string.Join(", ", unmatched));
-        }
-    }
-
-    /// <summary>
-    /// Walks the override-precedence chain (most-specific → least-specific) for a single
-    /// setting and returns the first row that parses cleanly and clears <paramref name="validate"/>.
-    /// When <paramref name="regime"/> is non-null the four regime-scoped tiers run first
-    /// (<c>:Regime:{r}:</c> form) before the four regime-agnostic tiers, giving an 8-tier
-    /// lookup that lets operators tighten knobs only in specific regimes (e.g.
-    /// <c>*:*:Regime:HighVolatility:DegradationDelta</c>). Parsing or validation failures
-    /// fall through to the next tier, not silent acceptance of bad data.
-    /// </summary>
-    internal static T ResolveOverride<T>(
-        IReadOnlyDictionary<string, string> overrides,
-        string symbol,
-        Timeframe timeframe,
-        MarketRegimeEnum? regime,
-        string settingName,
-        Func<string, (bool ok, T value)> tryParse,
-        Func<T, bool> validate,
-        T globalDefault)
-        where T : struct
-    {
-        string tfStr = timeframe.ToString();
-        // Regime-scoped tiers first, most specific to least specific. Each tier is built and
-        // probed lazily — no upfront array allocation, and unused tiers never construct the
-        // string at all.
-        if (regime is not null)
-        {
-            string r = regime.Value.ToString();
-            if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:{tfStr}:Regime:{r}:{settingName}", tryParse, validate, out var v1)) return v1;
-            if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:*:Regime:{r}:{settingName}", tryParse, validate, out var v2)) return v2;
-            if (TryResolveTier(overrides, $"MLCalibration:Override:*:{tfStr}:Regime:{r}:{settingName}", tryParse, validate, out var v3)) return v3;
-            if (TryResolveTier(overrides, $"MLCalibration:Override:*:*:Regime:{r}:{settingName}", tryParse, validate, out var v4)) return v4;
-        }
-
-        if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:{tfStr}:{settingName}", tryParse, validate, out var v5)) return v5;
-        if (TryResolveTier(overrides, $"MLCalibration:Override:{symbol}:*:{settingName}", tryParse, validate, out var v6)) return v6;
-        if (TryResolveTier(overrides, $"MLCalibration:Override:*:{tfStr}:{settingName}", tryParse, validate, out var v7)) return v7;
-        if (TryResolveTier(overrides, "MLCalibration:Override:*:*:" + settingName, tryParse, validate, out var v8)) return v8;
-
-        return globalDefault;
-    }
-
-    private static bool TryResolveTier<T>(
-        IReadOnlyDictionary<string, string> overrides,
-        string key,
-        Func<string, (bool ok, T value)> tryParse,
-        Func<T, bool> validate,
-        out T value)
-        where T : struct
-    {
-        if (overrides.TryGetValue(key, out var raw) && raw is not null)
-        {
-            var (ok, parsed) = tryParse(raw);
-            if (ok && validate(parsed))
-            {
-                value = parsed;
-                return true;
-            }
-        }
-        value = default;
-        return false;
-    }
-
-    /// <summary>
-    /// Clones <paramref name="settings"/> with every per-context overrideable knob resolved
-    /// against <paramref name="overrides"/>. Pass a non-null <paramref name="regime"/> from
-    /// per-regime evaluation paths so regime-scoped tiers take precedence.
-    /// </summary>
-    private static MLCalibrationMonitorWorkerSettings ApplyPerContextOverrides(
-        MLCalibrationMonitorWorkerSettings settings,
-        IReadOnlyDictionary<string, string> overrides,
-        string symbol,
-        Timeframe timeframe,
-        MarketRegimeEnum? regime = null)
-    {
-        return settings with
-        {
-            MaxEce = ResolveOverride(overrides, symbol, timeframe, regime, "MaxEce",
-                TryParseFiniteDouble,
-                v => v >= MinMaxEce && v <= MaxMaxEce,
-                settings.MaxEce),
-            DegradationDelta = ResolveOverride(overrides, symbol, timeframe, regime, "DegradationDelta",
-                TryParseFiniteDouble,
-                v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
-                settings.DegradationDelta),
-            RegressionGuardK = ResolveOverride(overrides, symbol, timeframe, regime, "RegressionGuardK",
-                TryParseFiniteDouble,
-                v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
-                settings.RegressionGuardK),
-            BootstrapCacheStaleHours = ResolveOverride(overrides, symbol, timeframe, regime, "BootstrapCacheStaleHours",
-                TryParseStrictInt,
-                v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
-                settings.BootstrapCacheStaleHours),
-            RetrainOnBaselineCritical = ResolveOverride(overrides, symbol, timeframe, regime, "RetrainOnBaselineCritical",
-                TryParseBoolish,
-                _ => true,
-                settings.RetrainOnBaselineCritical),
-        };
-    }
-
-    // Shared parsers for the override resolvers — strict (no decimal-to-int truncation),
-    // invariant culture, finite-double-only.
-    private static (bool ok, int value) TryParseStrictInt(string raw)
-        => int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v)
-            ? (true, v) : (false, 0);
-
-    private static (bool ok, double value) TryParseFiniteDouble(string raw)
-        => double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands,
-                CultureInfo.InvariantCulture, out var v) && double.IsFinite(v)
-            ? (true, v) : (false, 0d);
-
-    private static (bool ok, bool value) TryParseBoolish(string raw)
-    {
-        if (bool.TryParse(raw, out var b)) return (true, b);
-        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
-            return (true, i != 0);
-        return (false, false);
-    }
-
-    /// <summary>Resolves the effective <c>BootstrapCacheStaleHours</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
-    internal static async Task<int> ResolveBootstrapCacheStaleHoursAsync(
-        DbContext db, string symbol, Timeframe timeframe, int globalDefault, CancellationToken ct,
-        MarketRegimeEnum? regime = null)
-    {
-        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
-        return ResolveOverride(
-            overrides, symbol, timeframe, regime, "BootstrapCacheStaleHours",
-            TryParseStrictInt,
-            v => v >= 0 && v <= MaxBootstrapCacheStaleHours,
-            globalDefault);
-    }
-
-    /// <summary>Resolves the effective <c>RetrainOnBaselineCritical</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
-    internal static async Task<bool> ResolveRetrainOnBaselineCriticalAsync(
-        DbContext db, string symbol, Timeframe timeframe, bool globalDefault, CancellationToken ct,
-        MarketRegimeEnum? regime = null)
-    {
-        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
-        return ResolveOverride(
-            overrides, symbol, timeframe, regime, "RetrainOnBaselineCritical",
-            TryParseBoolish,
-            _ => true,
-            globalDefault);
-    }
-
-    /// <summary>Resolves the effective <c>MaxEce</c> ceiling for a (Symbol, Timeframe[, Regime]) tuple.</summary>
-    internal static async Task<double> ResolveMaxEceAsync(
-        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct,
-        MarketRegimeEnum? regime = null)
-    {
-        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
-        return ResolveOverride(
-            overrides, symbol, timeframe, regime, "MaxEce",
-            TryParseFiniteDouble,
-            v => v >= MinMaxEce && v <= MaxMaxEce,
-            globalDefault);
-    }
-
-    /// <summary>Resolves the effective <c>DegradationDelta</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
-    internal static async Task<double> ResolveDegradationDeltaAsync(
-        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct,
-        MarketRegimeEnum? regime = null)
-    {
-        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
-        return ResolveOverride(
-            overrides, symbol, timeframe, regime, "DegradationDelta",
-            TryParseFiniteDouble,
-            v => v >= MinDegradationDelta && v <= MaxDegradationDelta,
-            globalDefault);
-    }
-
-    /// <summary>Resolves the effective <c>RegressionGuardK</c> for a (Symbol, Timeframe[, Regime]) tuple.</summary>
-    internal static async Task<double> ResolveRegressionGuardKAsync(
-        DbContext db, string symbol, Timeframe timeframe, double globalDefault, CancellationToken ct,
-        MarketRegimeEnum? regime = null)
-    {
-        var overrides = await LoadAllPerContextOverridesAsync(db, symbol, timeframe, ct);
-        return ResolveOverride(
-            overrides, symbol, timeframe, regime, "RegressionGuardK",
-            TryParseFiniteDouble,
-            v => v >= MinRegressionGuardK && v <= MaxRegressionGuardK,
-            globalDefault);
-    }
+    // Override loading, resolution, validation, and per-context application live in
+    // MLCalibrationMonitorWorker.Overrides.cs. Field declarations (_lastUnmatchedTokensSignature
+    // and ValidOverrideKnobs) stay in this file alongside the rest of the worker state.
 
     private static async Task<double?> LoadSmoothedPreviousEceAsync(
         DbContext db,
@@ -2457,115 +2190,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         return sum / rows.Count;
     }
 
-    private static void EnqueueAudit(
-        List<MLCalibrationLog> pending,
-        ActiveModelCandidate model,
-        MarketRegimeEnum? regime,
-        string outcome,
-        string reason,
-        CalibrationSummary summary,
-        CalibrationSignals signals,
-        MLCalibrationMonitorAlertState alertState,
-        DateTime? newestOutcomeAt,
-        string diagnostics,
-        DateTime evaluatedAt)
-    {
-        pending.Add(new MLCalibrationLog
-        {
-            MLModelId = model.Id,
-            Symbol = model.Symbol,
-            Timeframe = model.Timeframe,
-            Regime = regime,
-            EvaluatedAt = evaluatedAt,
-            Outcome = Truncate(outcome, 32),
-            Reason = Truncate(reason, 64),
-            ResolvedSampleCount = summary.ResolvedCount,
-            CurrentEce = summary.CurrentEce,
-            PreviousEce = signals.PreviousEce,
-            BaselineEce = signals.BaselineEce,
-            TrendDelta = signals.TrendDelta,
-            BaselineDelta = signals.BaselineDelta,
-            Accuracy = summary.Accuracy,
-            MeanConfidence = summary.MeanConfidence,
-            EceStderr = summary.EceStderr,
-            ThresholdExceeded = signals.ThresholdExceeded,
-            TrendExceeded = signals.TrendExceeded,
-            BaselineExceeded = signals.BaselineExceeded,
-            AlertState = alertState switch
-            {
-                MLCalibrationMonitorAlertState.Critical => "critical",
-                MLCalibrationMonitorAlertState.Warning => "warning",
-                _ => "none",
-            },
-            NewestOutcomeAt = newestOutcomeAt,
-            DiagnosticsJson = Truncate(diagnostics, MaxAuditDiagnosticsLength),
-        });
-    }
-
-    private async Task FlushAuditsAsync(List<MLCalibrationLog> pending, CancellationToken ct)
-    {
-        if (pending.Count == 0) return;
-
-        try
-        {
-            await using var scope = _scopeFactory.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
-            await db.Set<MLCalibrationLog>().AddRangeAsync(pending, ct);
-            await db.SaveChangesAsync(ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "{Worker}: failed to persist {Count} calibration audit row(s); rows discarded.",
-                WorkerName, pending.Count);
-        }
-        finally
-        {
-            pending.Clear();
-        }
-    }
-
-    private static string BuildDiagnostics(params (string Key, object Value)[] pairs)
-    {
-        var dict = pairs.ToDictionary(p => p.Key, p => p.Value);
-        return JsonSerializer.Serialize(dict);
-    }
-
-    private static string BuildDiagnosticsWithBins(
-        CalibrationSummary summary,
-        CalibrationSignals signals,
-        MLCalibrationMonitorWorkerSettings settings,
-        bool bootstrapCacheHit)
-    {
-        var bins = new List<object>(NumBins);
-        for (int i = 0; i < NumBins; i++)
-        {
-            bins.Add(new
-            {
-                index = i,
-                count = summary.BinCounts?[i] ?? 0,
-                accuracy = Math.Round(summary.BinAccuracy?[i] ?? 0, 6),
-                meanConfidence = Math.Round(summary.BinMeanConfidence?[i] ?? 0, 6),
-            });
-        }
-
-        return JsonSerializer.Serialize(new
-        {
-            ece = Math.Round(summary.CurrentEce, 6),
-            eceStderr = Math.Round(summary.EceStderr, 6),
-            accuracy = Math.Round(summary.Accuracy, 6),
-            meanConfidence = Math.Round(summary.MeanConfidence, 6),
-            trendDelta = Math.Round(signals.TrendDelta, 6),
-            baselineDelta = Math.Round(signals.BaselineDelta, 6),
-            regressionGuardK = Math.Round(settings.RegressionGuardK, 6),
-            trendStderrPasses = signals.TrendStderrPasses,
-            thresholdExceeded = signals.ThresholdExceeded,
-            trendExceeded = signals.TrendExceeded,
-            baselineExceeded = signals.BaselineExceeded,
-            bootstrapCacheHit,
-            bins,
-        });
-    }
+    // Audit pipeline + diagnostics builders live in MLCalibrationMonitorWorker.Audit.cs.
 
     private IAlertDispatcher? ResolveAlertDispatcher(IServiceProvider serviceProvider)
     {
@@ -2688,7 +2313,11 @@ internal sealed record MLCalibrationMonitorWorkerSettings(
     int BootstrapCacheStaleHours,
     bool RetrainOnBaselineCritical,
     int MaxDegreeOfParallelism,
-    int LongCycleWarnSeconds);
+    int LongCycleWarnSeconds,
+    AuditFlushMode AuditFlushMode,
+    int ChronicCriticalThreshold,
+    bool SuppressRetrainOnChronic,
+    int MaxAlertsPerCycle);
 
 internal sealed record MLCalibrationMonitorCycleResult(
     MLCalibrationMonitorWorkerSettings Settings,
@@ -2718,9 +2347,22 @@ internal sealed record MLCalibrationMonitorCycleResult(
             FleetAlertDispatched: false);
 }
 
-internal enum MLCalibrationMonitorAlertState
+public enum MLCalibrationMonitorAlertState
 {
     None = 0,
     Warning = 1,
     Critical = 2
+}
+
+/// <summary>
+/// How <see cref="MLCalibrationMonitorWorker"/> persists per-model audit rows.
+/// <list type="bullet">
+///   <item><description><c>PerModel</c> (default): each iteration opens its own DI scope and flushes immediately. Per-model isolation — one flush failure loses just that model's audit rows.</description></item>
+///   <item><description><c>Cycle</c>: iterations transfer audit rows to a shared bag; the cycle flushes once at end via a single DI scope. Cuts N scope+DbContext creations to one, at the cost of bundling all rows under one flush.</description></item>
+/// </list>
+/// </summary>
+internal enum AuditFlushMode
+{
+    PerModel = 0,
+    Cycle = 1,
 }

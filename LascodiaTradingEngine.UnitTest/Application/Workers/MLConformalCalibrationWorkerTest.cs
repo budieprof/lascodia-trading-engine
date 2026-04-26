@@ -2,6 +2,7 @@ using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -247,6 +248,257 @@ public sealed class MLConformalCalibrationWorkerTest
         Assert.Equal(10_000, result.Settings.MaxCycleModels);
         Assert.Equal(30, result.Settings.MaxLogAgeDays);
         Assert.Equal(30, result.Settings.MaxCalibrationAgeDays);
+        // New defaults
+        Assert.Equal(1, result.Settings.MaxDegreeOfParallelism);
+        Assert.Equal(300, result.Settings.LongCycleWarnSeconds);
+        Assert.True(result.Settings.StaleAlertEnabled);
+        Assert.Equal(5, result.Settings.StaleSkipAlertThreshold);
+    }
+
+    [Fact]
+    public async Task RunAsync_OverrideHierarchy_ModelIdTier_BeatsContextTiers()
+    {
+        // Override hierarchy: Model:{id} > Symbol:Timeframe > Symbol:* > *:Timeframe > *:* > defaults.
+        // The Model:{id} override sets MinLogs=10 — only 10 logs are seeded — so calibration
+        // succeeds for THIS model. The Symbol:Timeframe tier sets MinLogs=100, which would
+        // otherwise fail; if the resolver picked the wider tier first the test would fail.
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = $"MLConformalCalibration:Override:Model:{model.Id}:MinLogs",
+            Value = "10",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = true,
+            LastUpdatedAt = now.UtcDateTime,
+        });
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformalCalibration:Override:EURUSD:H1:MinLogs",
+            Value = "100",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = true,
+            LastUpdatedAt = now.UtcDateTime,
+        });
+
+        for (int i = 0; i < 10; i++)
+        {
+            AddResolvedLog(db, model, id: 300 + i, now.UtcDateTime.AddMinutes(-90 + i),
+                TradeDirection.Buy, servedBuyProbability: 0.90m);
+        }
+        await db.SaveChangesAsync();
+
+        // Cycle-wide MinLogs is 50 (default). Without the override the model would skip.
+        var worker = CreateWorker(
+            db,
+            new TestTimeProvider(now),
+            CreateOptions(minLogs: 50, targetCoverage: 0.60));
+
+        var result = await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.CalibrationsWritten);
+        Assert.Equal(1, result.EvaluatedModelCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_OverrideHierarchy_StarStarFallback_Applies()
+    {
+        // *:* tier applies when no narrower tier exists.
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformalCalibration:Override:*:*:TargetCoverage",
+            Value = "0.50",
+            DataType = ConfigDataType.Decimal,
+            IsHotReloadable = true,
+            LastUpdatedAt = now.UtcDateTime,
+        });
+
+        for (int i = 0; i < 10; i++)
+        {
+            AddResolvedLog(db, model, id: 400 + i, now.UtcDateTime.AddMinutes(-90 + i),
+                TradeDirection.Buy, servedBuyProbability: 0.90m);
+        }
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(
+            db,
+            new TestTimeProvider(now),
+            CreateOptions(minLogs: 10, targetCoverage: 0.95));
+
+        var result = await worker.RunAsync(CancellationToken.None);
+
+        var calibration = Assert.Single(await db.Set<MLConformalCalibration>().ToListAsync());
+        Assert.Equal(1, result.CalibrationsWritten);
+        // The *:* override pinned target coverage to 0.50, not the cycle-wide 0.95.
+        Assert.Equal(0.50, calibration.TargetCoverage, precision: 6);
+    }
+
+    [Fact]
+    public async Task RunAsync_OverrideTokenWithUnknownKnob_RowDoesNotApply()
+    {
+        // Typo on the override knob — the row falls through to the default. Without the
+        // typo this MinLogs=1000 would have prevented calibration; with the typo, the
+        // cycle-wide MinLogs=10 is what governs and calibration succeeds.
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+
+        db.Set<EngineConfig>().Add(new EngineConfig
+        {
+            Key = "MLConformalCalibration:Override:EURUSD:H1:MnLogs", // typo
+            Value = "1000",
+            DataType = ConfigDataType.Int,
+            IsHotReloadable = true,
+            LastUpdatedAt = now.UtcDateTime,
+        });
+
+        for (int i = 0; i < 10; i++)
+        {
+            AddResolvedLog(db, model, id: 500 + i, now.UtcDateTime.AddMinutes(-90 + i),
+                TradeDirection.Buy, servedBuyProbability: 0.90m);
+        }
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(
+            db,
+            new TestTimeProvider(now),
+            CreateOptions(minLogs: 10, targetCoverage: 0.60));
+
+        var result = await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.CalibrationsWritten);
+    }
+
+    [Fact]
+    public async Task RunAsync_StaleCalibrationAlert_DispatchedAfterThreshold_ResolvedOnRecovery()
+    {
+        // Drive 3 cycles with insufficient logs (StaleSkipAlertThreshold=3) so the streak
+        // counter trips and the stale-calibration alert fires. Then add enough logs so
+        // the next cycle calibrates and the alert auto-resolves.
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+        await db.SaveChangesAsync();
+
+        var dispatcher = new TestAlertDispatcher();
+        var options = CreateOptions(minLogs: 10, targetCoverage: 0.60);
+        options.StaleSkipAlertThreshold = 3;
+        var worker = CreateWorker(db, new TestTimeProvider(now), options, dispatcher: dispatcher);
+
+        // Cycles 1 and 2: not enough logs → skip with insufficient_logs
+        var c1 = await worker.RunAsync(CancellationToken.None);
+        Assert.Equal(0, c1.StaleAlertsDispatched);
+
+        var c2 = await worker.RunAsync(CancellationToken.None);
+        Assert.Equal(0, c2.StaleAlertsDispatched);
+
+        // Cycle 3: streak hits threshold → stale alert fires
+        var c3 = await worker.RunAsync(CancellationToken.None);
+        Assert.Equal(1, c3.StaleAlertsDispatched);
+
+        var staleAlert = await db.Set<Alert>()
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(a => a.DeduplicationKey == $"ml-conformal-calibration-stale:{model.Id}");
+        Assert.NotNull(staleAlert);
+        Assert.True(staleAlert!.IsActive);
+        Assert.Equal(AlertType.MLMonitoringStale, staleAlert.AlertType);
+
+        // Now add enough logs and run a recovery cycle. Cycle 4 should calibrate
+        // and auto-resolve the alert.
+        for (int i = 0; i < 10; i++)
+        {
+            AddResolvedLog(db, model, id: 600 + i, now.UtcDateTime.AddMinutes(-90 + i),
+                TradeDirection.Buy, servedBuyProbability: 0.90m);
+        }
+        await db.SaveChangesAsync();
+
+        var c4 = await worker.RunAsync(CancellationToken.None);
+        Assert.Equal(1, c4.CalibrationsWritten);
+        Assert.Equal(1, c4.StaleAlertsResolved);
+
+        var resolved = await db.Set<Alert>()
+            .IgnoreQueryFilters()
+            .FirstAsync(a => a.DeduplicationKey == $"ml-conformal-calibration-stale:{model.Id}");
+        Assert.False(resolved.IsActive);
+        Assert.NotNull(resolved.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task RunAsync_StaleAlertEnabledFalse_DoesNotDispatchAlert()
+    {
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+        await db.SaveChangesAsync();
+
+        var dispatcher = new TestAlertDispatcher();
+        var options = CreateOptions(minLogs: 10, targetCoverage: 0.60);
+        options.StaleAlertEnabled = false;
+        options.StaleSkipAlertThreshold = 1;
+        var worker = CreateWorker(db, new TestTimeProvider(now), options, dispatcher: dispatcher);
+
+        var result = await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.StaleAlertsDispatched);
+        Assert.Equal(1, result.SkippedInsufficientLogsCount);
+        var alerts = await db.Set<Alert>().IgnoreQueryFilters().ToListAsync();
+        Assert.Empty(alerts);
+    }
+
+    [Fact]
+    public async Task RunAsync_BoundedParallelism_DefaultDopOne_Succeeds()
+    {
+        // Smoke test: the new parallel path must not regress the simple DOP=1 case.
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+
+        for (int i = 0; i < 10; i++)
+        {
+            AddResolvedLog(db, model, id: 700 + i, now.UtcDateTime.AddMinutes(-90 + i),
+                TradeDirection.Buy, servedBuyProbability: 0.90m);
+        }
+        await db.SaveChangesAsync();
+
+        var options = CreateOptions(minLogs: 10, targetCoverage: 0.60);
+        options.MaxDegreeOfParallelism = 1;
+        var worker = CreateWorker(db, new TestTimeProvider(now), options);
+
+        var result = await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.CalibrationsWritten);
+        Assert.Equal(0, result.FailedModelCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_LongCycleWarnSeconds_ZeroDisablesWarn()
+    {
+        // Boundary smoke: LongCycleWarnSeconds=0 means warn disabled, settings flow through.
+        await using var db = CreateDbContext();
+        var now = new DateTimeOffset(2026, 04, 25, 12, 0, 0, TimeSpan.Zero);
+        var model = CreateModel(now.UtcDateTime.AddHours(-2));
+        db.Set<MLModel>().Add(model);
+        await db.SaveChangesAsync();
+
+        var options = CreateOptions(minLogs: 10, targetCoverage: 0.60);
+        options.LongCycleWarnSeconds = 0;
+        var worker = CreateWorker(db, new TestTimeProvider(now), options);
+
+        var result = await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.Settings.LongCycleWarnSeconds);
     }
 
     private static WriteApplicationDbContext CreateDbContext()
@@ -263,13 +515,16 @@ public sealed class MLConformalCalibrationWorkerTest
         WriteApplicationDbContext db,
         TimeProvider timeProvider,
         MLConformalCalibrationOptions options,
-        IDistributedLock? distributedLock = null)
+        IDistributedLock? distributedLock = null,
+        TestAlertDispatcher? dispatcher = null)
     {
         var writeContext = new Mock<IWriteApplicationDbContext>();
         writeContext.Setup(c => c.GetDbContext()).Returns(db);
 
         var services = new ServiceCollection();
         services.AddScoped(_ => writeContext.Object);
+        if (dispatcher is not null)
+            services.AddSingleton<IAlertDispatcher>(dispatcher);
         var provider = services.BuildServiceProvider();
 
         return new MLConformalCalibrationWorker(
@@ -371,6 +626,21 @@ public sealed class MLConformalCalibrationWorkerTest
         private sealed class Releaser : IAsyncDisposable
         {
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class TestAlertDispatcher : IAlertDispatcher
+    {
+        public Task DispatchAsync(Alert alert, string message, CancellationToken ct)
+        {
+            alert.LastTriggeredAt = DateTime.UtcNow;
+            return Task.CompletedTask;
+        }
+
+        public Task TryAutoResolveAsync(Alert alert, bool conditionStillActive, CancellationToken ct)
+        {
+            alert.AutoResolvedAt = DateTime.UtcNow;
+            return Task.CompletedTask;
         }
     }
 }

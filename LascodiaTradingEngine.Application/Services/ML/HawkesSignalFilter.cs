@@ -41,6 +41,18 @@ public sealed class HawkesSignalFilter : IHawkesSignalFilter
             .OrderByDescending(k => k.FittedAt)
             .FirstOrDefaultAsync(ct);
 
+        if (kernel is null)
+        {
+            var legacyCandidates = await db.Set<MLHawkesKernelParams>()
+                .Where(k => k.Timeframe == timeframe && !k.IsDeleted)
+                .OrderByDescending(k => k.FittedAt)
+                .Take(256)
+                .ToListAsync(ct);
+
+            kernel = legacyCandidates
+                .FirstOrDefault(k => NormalizeSymbol(k.Symbol) == normalizedSymbol);
+        }
+
         if (kernel == null) return false;   // no kernel fitted yet — allow signal
         if (DateTime.UtcNow - kernel.FittedAt > maxKernelAge)
         {
